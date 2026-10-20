@@ -208,7 +208,9 @@ async function feedOne() {
     const lowerNum = /^[a-z]{2,}[0-9]{1,7}$/.test(author);
     const oneWord = /^[a-z]{3,20}$/.test(rbase);
     const capWord = /^[A-Za-z]{3,20}$/.test(rbase);
-    const take = isSelf || (oneWord && (lowerNum || hasId)) || (capWord && hasId);
+    // Account đã có phim (hasId): chấp nhận mọi repo của account đó
+    // (kể cả tên chứa số/dấu '-'/'_'/generic) để không sót phim.
+    const take = isSelf || hasId || (oneWord && lowerNum) || (capWord && lowerNum);
     if (!take) { feedShape++; continue; }
     if (await insertAccount(db, author)) pending.inv++; // account mới = đến hạn quét ngay
     accCache.delete(author);
