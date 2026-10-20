@@ -109,6 +109,45 @@ const ADD_COLS = [
   ["repos", "has_id", "INTEGER DEFAULT 0"], ["repos", "indexed_at", "INTEGER DEFAULT 0"],
   ["repos", "worker", "TEXT"], ["repos", "entries", "INTEGER DEFAULT 0"], ["repos", "sha", "TEXT"],
   ["repos", "updated", "INTEGER DEFAULT 0"], ["repos", "prio", "INTEGER DEFAULT 0"],
+  ["repos", "junk", "INTEGER DEFAULT 0"], ["accounts", "next_scan_at", "INTEGER DEFAULT 0"],
+];
+
+// Index + trigger + counters phải tạo SAU khi đã có cột (DB import có thể thiếu cột).
+const IDX2 = [
+  `CREATE TABLE IF NOT EXISTS counters(k TEXT PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE INDEX IF NOT EXISTS idx_accounts_next ON accounts(next_scan_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_stale ON repos(junk, state, has_id DESC, indexed_at ASC)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile)`,
+];
+const TRG = [
+  `CREATE TRIGGER IF NOT EXISTS trg_rep_ins AFTER INSERT ON repos BEGIN
+     INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+     INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_rep_del AFTER DELETE ON repos BEGIN
+     INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+     INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_rep_upd AFTER UPDATE ON repos WHEN NEW.state<>OLD.state OR NEW.junk<>OLD.junk BEGIN
+     INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+     INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+     INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+     INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_acc_ins AFTER INSERT ON accounts BEGIN
+     INSERT INTO counters(k,v) VALUES('acct:t',1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+     INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_acc_del AFTER DELETE ON accounts BEGIN
+     INSERT INTO counters(k,v) VALUES('acct:t',-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+     INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_acc_upd AFTER UPDATE ON accounts WHEN NEW.junk<>OLD.junk BEGIN
+     INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+     INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+   END`,
 ];
 
 export async function ensureSchema(db) {
@@ -118,6 +157,8 @@ export async function ensureSchema(db) {
     try { const info = await db.exec(`PRAGMA table_info(${t})`); have = (info.rows || []).some((r) => r.name === c); } catch { }
     if (!have) { try { await db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${d}`); } catch { /* đã có cột */ } }
   }
+  await db.batch(IDX2.map((sql) => ({ sql })));
+  await db.batch(TRG.map((sql) => ({ sql })));
   await db.batch([
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('prio_idx_v1','1')" },
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('prio_backfill_v3','1')" },
@@ -125,6 +166,17 @@ export async function ensureSchema(db) {
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('acct_hasid_v1','1')" },
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('acct_nrepo_v1','1')" },
   ]);
+  if (!(await metaGet(db, "counters_v1"))) {
+    // Backfill 1 lần: đồng bộ repos.junk theo account junk, rồi chốt lại counters cho khớp tuyệt đối.
+    await db.exec("UPDATE repos SET junk=1 WHERE junk=0 AND account IN (SELECT username FROM accounts WHERE junk=1)");
+    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rst:'||state,COUNT(*) FROM repos GROUP BY state");
+    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rsj:'||state||':'||junk,COUNT(*) FROM repos GROUP BY state,junk");
+    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acct:t',COUNT(*) FROM accounts");
+    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acjt:'||junk,COUNT(*) FROM accounts GROUP BY junk");
+    await db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE next_scan_at=0");
+    await metaSet(db, "counters_v1", "1");
+    log("counters_v1 backfill xong");
+  }
 }
 
 export async function metaGet(db, k) { const r = await db.exec("SELECT val FROM meta WHERE key=?", [k]); return r.rows[0] ? r.rows[0].val : null; }
@@ -192,8 +244,8 @@ export async function recoverStale(db, ms = 300000) {
 export async function claimRepo(db, worker, kind = null) {
   for (let i = 0; i < 50; i++) {
     const sql = kind
-      ? "SELECT r.id,r.account,r.kind FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='new' AND r.kind=? AND (a.junk IS NULL OR a.junk=0) ORDER BY r.prio DESC, r.last_modified DESC, r.rowid LIMIT 1"
-      : "SELECT r.id,r.account,r.kind FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='new' AND r.kind IN ('dataset','bucket') AND (a.junk IS NULL OR a.junk=0) ORDER BY r.prio DESC, r.last_modified DESC, r.rowid LIMIT 1";
+      ? "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='new' AND r.kind=? AND r.junk=0 ORDER BY r.prio DESC, r.last_modified DESC, r.rowid LIMIT 1"
+      : "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='new' AND r.kind IN ('dataset','bucket') AND r.junk=0 ORDER BY r.prio DESC, r.last_modified DESC, r.rowid LIMIT 1";
     const q = await db.exec(sql, kind ? [kind] : []);
     const row = q.rows[0];
     if (!row) return null;
@@ -214,11 +266,11 @@ export async function upsertRepoMeta(db, id, account, kind, lastModified) {
   const prio = repoScore(id, account, kind, acc);
   const ex = (await db.exec("SELECT last_modified,state,prio FROM repos WHERE id=? AND kind=?", [id, kind])).rows[0];
   if (!ex) {
-    await db.exec("INSERT INTO repos(id,kind,account,last_modified,state,prio) VALUES(?,?,?,?,'new',?)", [id, kind, account, lm, prio]);
+    await db.exec("INSERT INTO repos(id,kind,account,last_modified,state,junk,prio) VALUES(?,?,?,?,'new',?,?)", [id, kind, account, lm, acc.junk ? 1 : 0, prio]);
     return true;
   }
   if (lm > (ex.last_modified || 0)) {
-    await db.exec("UPDATE repos SET last_modified=?, state='new', account=?, prio=? WHERE id=? AND kind=?", [lm, account, prio, id, kind]);
+    await db.exec("UPDATE repos SET last_modified=?, state='new', account=?, junk=?, prio=? WHERE id=? AND kind=?", [lm, account, acc.junk ? 1 : 0, prio, id, kind]);
     return true;
   }
   if (ex.state === "new" && prio > (ex.prio || 0)) await db.exec("UPDATE repos SET prio=? WHERE id=? AND kind=?", [prio, id, kind]);
@@ -229,7 +281,7 @@ const accCache = new Map();
 export async function reevalAccount(db, u) {
   const hit = await db.exec("SELECT 1 x FROM repos WHERE account=? AND has_id=1 LIMIT 1", [u]);
   if (hit.rows.length) {
-    await db.exec("UPDATE accounts SET verified=1, has_id=1 WHERE username=?", [u]);
+    await db.exec("UPDATE accounts SET verified=1, has_id=1, next_scan_at=scanned_at+43200000 WHERE username=?", [u]);
     const acc = (await db.exec("SELECT has_id,nrepo,junk FROM accounts WHERE username=?", [u])).rows[0] || {};
     const rs = (await db.exec("SELECT id,kind FROM repos WHERE account=?", [u])).rows;
     const st = rs.map((r) => ({ sql: "UPDATE repos SET prio=? WHERE id=? AND kind=?", args: [repoScore(r.id, u, r.kind, acc), r.id, r.kind] }));
@@ -237,7 +289,11 @@ export async function reevalAccount(db, u) {
     return;
   }
   const d = (await db.exec("SELECT COUNT(*) c FROM repos WHERE account=? AND state='done'", [u])).rows[0];
-  if (d && d.c >= JUNK_EMPTY) await db.exec("UPDATE accounts SET junk=1 WHERE username=?", [u]);
+  if (d && d.c >= JUNK_EMPTY) {
+    const now = Date.now();
+    await db.exec("UPDATE accounts SET junk=1, scanned_at=?, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE username=?", [now, now, u]);
+    await db.exec("UPDATE repos SET junk=1 WHERE account=? AND junk=0", [u]);
+  }
 }
 
 export async function applyGitDiff(db, repoId, kind, diff) {
@@ -305,41 +361,50 @@ export async function insertAccount(db, u) {
   const r = await db.exec("INSERT OR IGNORE INTO accounts(username,last_seen) VALUES(?,?)", [u, Date.now()]);
   return r.changes;
 }
+export const JUNK_RETRY_MS = 7776000000; // 90 ngay thu lai account junk
+export const TTL_EXPR = "CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END";
 export async function setScanned(db, u) {
-  await db.exec("UPDATE accounts SET scanned_at=? WHERE username=?", [Date.now(), u]);
+  const now = Date.now();
+  await db.exec("UPDATE accounts SET scanned_at=?, next_scan_at=? + (" + TTL_EXPR + ") WHERE username=?", [now, now, u]);
 }
-export const JUNK_RETRY_MS = 7776000000; // 90 ngày thử lại account junk
-const TTL_CASE = "((junk=0 AND scanned_at <= ? - CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END) OR (junk=1 AND scanned_at <= ? - " + JUNK_RETRY_MS + "))";
+// Adaptive: TTL đã "nướng" sẵn vào next_scan_at lúc quét -> chỉ cần index range (next_scan_at).
+export const PENDING_ROW = "SELECT username,has_id,nrepo,junk,scanned_at FROM accounts WHERE ";
 export async function pendingAccounts(db, cut, adaptive = false) {
   const sql = adaptive
-    ? "SELECT username,has_id,nrepo,junk,scanned_at FROM accounts WHERE " + TTL_CASE
-    : "SELECT username,has_id,nrepo,junk,scanned_at FROM accounts WHERE junk=0 AND scanned_at<=?";
-  return (await db.exec(sql, adaptive ? [cut, cut] : [cut])).rows;
+    ? PENDING_ROW + "next_scan_at<=? ORDER BY next_scan_at LIMIT 1000"
+    : PENDING_ROW + "junk=0 AND scanned_at<=? ORDER BY scanned_at LIMIT 1000";
+  return (await db.exec(sql, [cut])).rows;
 }
 export async function countPending(db, cut, adaptive = false) {
   const sql = adaptive
-    ? "SELECT COUNT(*) c FROM accounts WHERE " + TTL_CASE
+    ? "SELECT COUNT(*) c FROM accounts WHERE next_scan_at<=?"
     : "SELECT COUNT(*) c FROM accounts WHERE junk=0 AND scanned_at<=?";
-  return (await db.exec(sql, adaptive ? [cut, cut] : [cut])).rows[0].c;
+  return (await db.exec(sql, [cut])).rows[0].c;
 }
 export async function claimRepoStale(db, worker, cut) {
-  const row = (await db.exec("SELECT r.id,r.account,r.kind FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='done' AND r.indexed_at<=? AND (a.junk IS NULL OR a.junk=0) ORDER BY (r.nfile>0) DESC, r.indexed_at ASC LIMIT 1", [cut])).rows[0];
+  const row = (await db.exec("SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=? ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT 1", [cut])).rows[0];
   if (!row) return null;
   const u = await db.exec("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND indexed_at<=?", [worker, Date.now(), row.id, row.kind, cut]);
   return u.changes ? row : null;
 }
-export async function clearJunk(db, u) { return (await db.exec("UPDATE accounts SET junk=0 WHERE username=?", [u])).changes; }
+export async function clearJunk(db, u) {
+  const r = await db.exec("UPDATE accounts SET junk=0, next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE username=?", [u]);
+  await db.exec("UPDATE repos SET junk=0 WHERE account=? AND junk=1", [u]);
+  return r.changes;
+}
 export async function getRepoPrev(db, id, kind) {
   return (await db.exec("SELECT sha,updated FROM repos WHERE id=? AND kind=?", [id, kind])).rows[0] || {};
 }
 export async function countNew(db) {
-  return (await db.exec("SELECT COUNT(*) c FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='new' AND r.kind IN ('dataset','bucket') AND (a.junk IS NULL OR a.junk=0)")).rows[0].c;
+  const r = await db.exec("SELECT v c FROM counters WHERE k='rsj:new:0'");
+  return r.rows[0] ? r.rows[0].c : 0;
 }
 export async function stateCounts(db) {
-  return (await db.exec("SELECT state,COUNT(*) c FROM repos GROUP BY state")).rows;
+  return (await db.exec("SELECT substr(k,5) state, v c FROM counters WHERE k LIKE 'rst:%'")).rows;
 }
 export async function accountCounts(db) {
-  return (await db.exec("SELECT COUNT(*) c FROM accounts WHERE junk=0")).rows[0].c;
+  const r = await db.exec("SELECT v c FROM counters WHERE k='acjt:0'");
+  return r.rows[0] ? r.rows[0].c : 0;
 }
 
 export async function pendingAccountsAdaptive(db, now) { return pendingAccounts(db, now, true); }

@@ -110,9 +110,43 @@ export function ensureSchema(db) {
   addCol(db, "repos", "sha", "TEXT");
   addCol(db, "repos", "updated", "INTEGER DEFAULT 0");
   addCol(db, "repos", "prio", "INTEGER DEFAULT 0");
+  addCol(db, "repos", "junk", "INTEGER DEFAULT 0");
+  addCol(db, "accounts", "next_scan_at", "INTEGER DEFAULT 0");
   db.exec(`CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(state);
            CREATE INDEX IF NOT EXISTS idx_repos_account ON repos(account);
-           CREATE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path);`);
+           CREATE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path);
+           CREATE TABLE IF NOT EXISTS counters(k TEXT PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0);
+           CREATE INDEX IF NOT EXISTS idx_accounts_next ON accounts(next_scan_at);
+           CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at);
+           CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC);
+           CREATE INDEX IF NOT EXISTS idx_repos_stale ON repos(junk, state, has_id DESC, indexed_at ASC);
+           CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile);
+           CREATE TRIGGER IF NOT EXISTS trg_rep_ins AFTER INSERT ON repos BEGIN
+             INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+             INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_rep_del AFTER DELETE ON repos BEGIN
+             INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_rep_upd AFTER UPDATE ON repos WHEN NEW.state<>OLD.state OR NEW.junk<>OLD.junk BEGIN
+             INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+             INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_acc_ins AFTER INSERT ON accounts BEGIN
+             INSERT INTO counters(k,v) VALUES('acct:t',1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+             INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_acc_del AFTER DELETE ON accounts BEGIN
+             INSERT INTO counters(k,v) VALUES('acct:t',-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_acc_upd AFTER UPDATE ON accounts WHEN NEW.junk<>OLD.junk BEGIN
+             INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+           END;`);
   if (!metaGet(db, "prio_idx_v1")) {
     db.exec(`DROP INDEX IF EXISTS idx_repos_prio;
              DROP INDEX IF EXISTS idx_repos_prio_d;
@@ -140,6 +174,16 @@ export function ensureSchema(db) {
   if (!metaGet(db, "acct_nrepo_v1")) {
     db.exec("UPDATE accounts SET nrepo=(SELECT COUNT(*) FROM repos WHERE repos.account=accounts.username)");
     metaSet(db, "acct_nrepo_v1", "1");
+  }
+  if (!metaGet(db, "counters_v1")) {
+    db.exec("UPDATE repos SET junk=1 WHERE junk=0 AND account IN (SELECT username FROM accounts WHERE junk=1)");
+    db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rst:'||state,COUNT(*) FROM repos GROUP BY state");
+    db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rsj:'||state||':'||junk,COUNT(*) FROM repos GROUP BY state,junk");
+    db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acct:t',COUNT(*) FROM accounts");
+    db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acjt:'||junk,COUNT(*) FROM accounts GROUP BY junk");
+    db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE next_scan_at=0");
+    metaSet(db, "counters_v1", "1");
+    log("counters_v1 backfill xong");
   }
 }
 
@@ -291,14 +335,18 @@ export function reevalAccount(db, u) {
   retrySync(() => {
     const hit = db.prepare("SELECT 1 FROM repos WHERE account=? AND has_id=1 LIMIT 1").get(u);
     if (hit) {
-      db.prepare("UPDATE accounts SET verified=1, has_id=1 WHERE username=?").run(u);
+      db.prepare("UPDATE accounts SET verified=1, has_id=1, next_scan_at=scanned_at+43200000 WHERE username=?").run(u);
       const acc = db.prepare("SELECT has_id,nrepo,junk FROM accounts WHERE username=?").get(u) || {};
       const upd = db.prepare("UPDATE repos SET prio=? WHERE id=? AND kind=?");
       for (const r of db.prepare("SELECT id,kind FROM repos WHERE account=?").all(u)) upd.run(repoScore(r.id, u, r.kind, acc), r.id, r.kind);
       return;
     }
     const d = db.prepare("SELECT COUNT(*) c FROM repos WHERE account=? AND state='done'").get(u).c;
-    if (d >= JUNK_EMPTY) db.prepare("UPDATE accounts SET junk=1 WHERE username=?").run(u);
+    if (d >= JUNK_EMPTY) {
+      const now = Date.now();
+      db.prepare("UPDATE accounts SET junk=1, scanned_at=?, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE username=?").run(now, now, u);
+      db.prepare("UPDATE repos SET junk=1 WHERE account=? AND junk=0").run(u);
+    }
   });
 }
 
@@ -309,11 +357,11 @@ export function upsertRepoMeta(db, id, account, kind, lastModified) {
     const prio = repoScore(id, account, kind, acc);
     const ex = db.prepare("SELECT last_modified, state, prio FROM repos WHERE id=? AND kind=?").get(id, kind);
     if (!ex) {
-      db.prepare("INSERT INTO repos(id,kind,account,last_modified,state,prio) VALUES(?,?,?,?,'new',?)").run(id, kind, account, lm, prio);
+      db.prepare("INSERT INTO repos(id,kind,account,last_modified,state,junk,prio) VALUES(?,?,?,?,'new',?,?)").run(id, kind, account, lm, acc.junk ? 1 : 0, prio);
       return true;
     }
     if (lm > (ex.last_modified || 0)) {
-      db.prepare("UPDATE repos SET last_modified=?, state='new', account=?, prio=? WHERE id=? AND kind=?").run(lm, account, prio, id, kind);
+      db.prepare("UPDATE repos SET last_modified=?, state='new', account=?, junk=?, prio=? WHERE id=? AND kind=?").run(lm, account, acc.junk ? 1 : 0, prio, id, kind);
       return true;
     }
     if (ex.state === "new" && prio > (ex.prio || 0)) db.prepare("UPDATE repos SET prio=? WHERE id=? AND kind=?").run(prio, id, kind);
@@ -336,8 +384,8 @@ export function claimRepo(db, worker, kind = null) {
     // Thử nhiều lần: nếu 2 worker tranh cùng 1 row, kẻ thua phải lấy row kế tiếp
     // (không được return null ngay kẻo thoát cả vòng lặp).
     const sql = kind
-      ? "SELECT r.id,r.account,r.kind FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='new' AND r.kind=? AND (a.junk IS NULL OR a.junk=0) ORDER BY r.prio DESC, r.last_modified DESC, r.rowid LIMIT 1"
-      : "SELECT r.id,r.account,r.kind FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='new' AND r.kind IN ('dataset','bucket') AND (a.junk IS NULL OR a.junk=0) ORDER BY r.prio DESC, r.last_modified DESC, r.rowid LIMIT 1";
+      ? "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='new' AND r.kind=? AND r.junk=0 ORDER BY r.prio DESC, r.last_modified DESC, r.rowid LIMIT 1"
+      : "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='new' AND r.kind IN ('dataset','bucket') AND r.junk=0 ORDER BY r.prio DESC, r.last_modified DESC, r.rowid LIMIT 1";
     for (let i = 0; i < 200; i++) {
       const row = (kind ? db.prepare(sql).get(kind) : db.prepare(sql).get());
       if (!row) return null;
@@ -355,9 +403,9 @@ export function migrateMergeBuckets(db) {
   retrySync(() => {
     db.exec("BEGIN IMMEDIATE");
     if (!reposComposite(db)) {
-      db.exec(`CREATE TABLE repos_new(id TEXT, kind TEXT, account TEXT, size INTEGER DEFAULT 0, nfile INTEGER DEFAULT 0, last_modified INTEGER DEFAULT 0, state TEXT DEFAULT 'new', has_id INTEGER DEFAULT 0, entries INTEGER DEFAULT 0, indexed_at INTEGER DEFAULT 0, worker TEXT, prio INTEGER DEFAULT 0, PRIMARY KEY(id, kind))`);
-      db.exec(`INSERT OR IGNORE INTO repos_new(id,kind,account,size,nfile,last_modified,state,has_id,entries,indexed_at,worker,prio)
-               SELECT id,kind,account,size,nfile,last_modified,state,has_id,entries,indexed_at,worker,${cols(db, "repos").includes("prio") ? "prio" : "0"} FROM repos`);
+      db.exec(`CREATE TABLE repos_new(id TEXT, kind TEXT, account TEXT, size INTEGER DEFAULT 0, nfile INTEGER DEFAULT 0, last_modified INTEGER DEFAULT 0, state TEXT DEFAULT 'new', has_id INTEGER DEFAULT 0, entries INTEGER DEFAULT 0, indexed_at INTEGER DEFAULT 0, worker TEXT, prio INTEGER DEFAULT 0, junk INTEGER DEFAULT 0, PRIMARY KEY(id, kind))`);
+      db.exec(`INSERT OR IGNORE INTO repos_new(id,kind,account,size,nfile,last_modified,state,has_id,entries,indexed_at,worker,prio,junk)
+               SELECT id,kind,account,size,nfile,last_modified,state,has_id,entries,indexed_at,worker,${cols(db, "repos").includes("prio") ? "prio" : "0"},${cols(db, "repos").includes("junk") ? "junk" : "0"} FROM repos`);
       db.exec("DROP TABLE repos");
       db.exec("ALTER TABLE repos_new RENAME TO repos");
       db.exec("CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(state); CREATE INDEX IF NOT EXISTS idx_repos_account ON repos(account);");
@@ -416,23 +464,37 @@ export function migrateFromScan(db, p = SCAN_PATH) {
 // ---------- helper backend-agnostic cho auto.mjs ----------
 export function getAccount(db, u) { return db.prepare("SELECT has_id,junk,nrepo FROM accounts WHERE username=?").get(u) || null; }
 export function insertAccount(db, u) { return db.prepare("INSERT OR IGNORE INTO accounts(username,last_seen) VALUES(?,?)").run(u, Date.now()).changes; }
-export function setScanned(db, u) { return db.prepare("UPDATE accounts SET scanned_at=? WHERE username=?").run(Date.now(), u).changes; }
-export function pendingAccounts(db, cut) { return db.prepare("SELECT username,has_id,nrepo,scanned_at FROM accounts WHERE junk=0 AND scanned_at<=?").all(cut); }
-export function countPending(db, cut) { return db.prepare("SELECT COUNT(*) c FROM accounts WHERE junk=0 AND scanned_at<=?").get(cut).c; }
-export function countNew(db) { return db.prepare("SELECT COUNT(*) c FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='new' AND r.kind IN ('dataset','bucket') AND (a.junk IS NULL OR a.junk=0)").get().c; }
-export function stateCounts(db) { return db.prepare("SELECT state,COUNT(*) c FROM repos GROUP BY state").all(); }
-export function accountCounts(db) { return db.prepare("SELECT COUNT(*) c FROM accounts WHERE junk=0").get().c; }
+export const JUNK_RETRY_MS = 7776000000; // 90 ngay thu lai account junk
+export const TTL_EXPR = "CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END";
+export function setScanned(db, u) { const now = Date.now(); return retrySync(() => db.prepare("UPDATE accounts SET scanned_at=?, next_scan_at=? + (" + TTL_EXPR + ") WHERE username=?").run(now, now, u)).changes; }
+export function pendingAccounts(db, cut, adaptive = true) {
+  return adaptive
+    ? db.prepare("SELECT username,has_id,nrepo,junk,scanned_at FROM accounts WHERE next_scan_at<=? ORDER BY next_scan_at LIMIT 1000").all(cut)
+    : db.prepare("SELECT username,has_id,nrepo,junk,scanned_at FROM accounts WHERE junk=0 AND scanned_at<=? ORDER BY scanned_at LIMIT 1000").all(cut);
+}
+export function countPending(db, cut, adaptive = true) {
+  return adaptive
+    ? db.prepare("SELECT COUNT(*) c FROM accounts WHERE next_scan_at<=?").get(cut).c
+    : db.prepare("SELECT COUNT(*) c FROM accounts WHERE junk=0 AND scanned_at<=?").get(cut).c;
+}
+export function countNew(db) { const r = db.prepare("SELECT v c FROM counters WHERE k='rsj:new:0'").get(); return r ? r.c : 0; }
+export function stateCounts(db) { return db.prepare("SELECT substr(k,5) state, v c FROM counters WHERE k LIKE 'rst:%'").all(); }
+export function accountCounts(db) { const r = db.prepare("SELECT v c FROM counters WHERE k='acjt:0'").get(); return r ? r.c : 0; }
 export function getRepoPrev(db, id, kind) { return db.prepare("SELECT sha,updated FROM repos WHERE id=? AND kind=?").get(id, kind) || {}; }
-export const JUNK_RETRY_MS = 7776000000; // 90 ngày thử lại account junk
-const _TTL_CASE = "((junk=0 AND scanned_at <= ? - CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END) OR (junk=1 AND scanned_at <= ? - " + JUNK_RETRY_MS + "))";
-export function pendingAccountsAdaptive(db, cut) { return db.prepare("SELECT username,has_id,nrepo,junk,scanned_at FROM accounts WHERE " + _TTL_CASE).all(cut, cut); }
-export function countPendingAdaptive(db, cut) { return db.prepare("SELECT COUNT(*) c FROM accounts WHERE " + _TTL_CASE).get(cut, cut).c; }
+export function pendingAccountsAdaptive(db, cut) { return pendingAccounts(db, cut, true); }
+export function countPendingAdaptive(db, cut) { return countPending(db, cut, true); }
 export function claimRepoStale(db, worker, cut) {
   return retrySync(() => {
-    const row = db.prepare("SELECT r.id,r.account,r.kind FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='done' AND r.indexed_at<=? AND (a.junk IS NULL OR a.junk=0) ORDER BY (r.nfile>0) DESC, r.indexed_at ASC LIMIT 1").get(cut);
+    const row = db.prepare("SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=? ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT 1").get(cut);
     if (!row) return null;
     const u = db.prepare("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND indexed_at<=?").run(worker, Date.now(), row.id, row.kind, cut);
     return u.changes ? row : null;
   });
 }
-export function clearJunk(db, u) { return retrySync(() => db.prepare("UPDATE accounts SET junk=0 WHERE username=?").run(u).changes); }
+export function clearJunk(db, u) {
+  return retrySync(() => {
+    const r = db.prepare("UPDATE accounts SET junk=0, next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE username=?").run(u).changes;
+    db.prepare("UPDATE repos SET junk=0 WHERE account=? AND junk=1").run(u);
+    return r;
+  });
+}

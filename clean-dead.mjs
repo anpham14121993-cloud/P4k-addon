@@ -1,10 +1,11 @@
-// clean-dead.mjs — xoá file của repo dead (và file của account junk). Chạy định kỳ, idempotent.
+// clean-dead.mjs — xoá file còn sót của repo dead / account junk. Idempotent, chạy được định kỳ.
+// Quét theo REPO (index idx_files_repo) nên không bao giờ quét toàn bảng files (tránh đốt quota rows read).
 // Turso: TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... node clean-dead.mjs
 // Local: P4K_TURSO_LOCAL=1 P4K_DB=/path.db node clean-dead.mjs
 import { createRequire } from "node:module";
 import { tursoClient } from "./turso-http.mjs";
 const require = createRequire(import.meta.url);
-const CHUNK = parseInt(process.env.P4K_CLEAN_CHUNK || "5000", 10);
+const LIMIT = parseInt(process.env.P4K_CLEAN_CHUNK || "500", 10);
 
 let exec;
 if (process.env.P4K_TURSO_LOCAL) {
@@ -20,21 +21,22 @@ if (process.env.P4K_TURSO_LOCAL) {
   exec = (sql, args = []) => c.exec(sql, args);
 }
 
-const DEAD = "SELECT f.rowid FROM files f JOIN repos r ON r.id=f.repo_id AND r.kind=f.kind WHERE r.state='dead' LIMIT ?";
-const JUNK = "SELECT f.rowid FROM files f JOIN repos r ON r.id=f.repo_id AND r.kind=f.kind JOIN accounts a ON a.username=r.account WHERE a.junk=1 LIMIT ?";
+const DEAD = "SELECT id,kind,nfile FROM repos WHERE state='dead' AND nfile>0 LIMIT ?";
+const JUNK = "SELECT r.id,r.kind,r.nfile FROM repos r JOIN accounts a ON a.username=r.account WHERE a.junk=1 AND r.nfile>0 LIMIT ?";
 
 let dead = 0, junk = 0;
-for (;;) {
-  const r = await exec("DELETE FROM files WHERE rowid IN (" + DEAD + ")", [CHUNK]);
-  dead += r.changes;
-  console.log(`dead -${r.changes} (tong ${dead})`);
-  if (!r.changes) break;
+for (const [label, sql] of [["dead", DEAD], ["junk", JUNK]]) {
+  let removed = 0, rounds = 0;
+  for (; rounds < 20; rounds++) {
+    const rows = (await exec(sql, [LIMIT])).rows;
+    if (!rows.length) break;
+    for (const r of rows) {
+      const d = await exec("DELETE FROM files WHERE repo_id=? AND kind=?", [r.id, r.kind]);
+      const u = await exec("UPDATE repos SET nfile=0, size=0, has_id=0 WHERE id=? AND kind=? AND nfile>0", [r.id, r.kind]);
+      removed += d.changes; void u;
+    }
+    console.log(`${label} -${rows.length} repo (file -${removed})`);
+  }
+  if (label === "dead") dead = removed; else junk = removed;
 }
-for (;;) {
-  const r = await exec("DELETE FROM files WHERE rowid IN (" + JUNK + ")", [CHUNK]);
-  junk += r.changes;
-  console.log(`junk -${r.changes} (tong ${junk})`);
-  if (!r.changes) break;
-}
-const n = (await exec("SELECT COUNT(*) c FROM files")).rows[0].c;
-console.log(`DONE dead=${dead} junk=${junk} files=${n}`);
+console.log(`DONE dead_files=${dead} junk_files=${junk} rounds_ok`);

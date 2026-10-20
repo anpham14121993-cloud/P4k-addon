@@ -125,13 +125,14 @@ async function repoInfo(kind, id) {
 const TOTAL = Math.max(1, lanes.length * SLOTS_PER_TOKEN);
 const limits = { feed: 1, inv: 1, index: 1 };
 const inflight = { feed: 0, inv: 0, index: 0 };
-let pending = { inv: 0, index: 0, recheck: 0, feedPages: ENABLE_FEED ? 1 : 0 };
+let pending = { inv: 1, index: 0, recheck: 0, feedPages: ENABLE_FEED ? 1 : 0 }; // inv=1 để role inv có slot ngay, refreshInv sẽ chỉnh lại
 let staleBusy = 0;
 const stopState = { stop: false };
 const REPO_TTL_MS = process.env.P4K_REPO_TTL ? Math.max(3600e3, parseInt(process.env.P4K_REPO_TTL, 10)) : 864e5; // mặc định 1 ngày
+// pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
+// refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
+// feed thêm account mới thì +1 -> KHÔNG cần COUNT quét accounts mỗi tick.
 async function demand() {
-  const now = Date.now();
-  pending.inv = FIXED == null ? await countPendingAdaptive(db, now) : await countPending(db, FIXED, false);
   pending.index = await countNew(db);
 }
 async function rebalance() {
@@ -205,7 +206,7 @@ async function feedOne() {
     const capWord = /^[A-Za-z]{3,20}$/.test(rbase);
     const take = isSelf || (oneWord && (lowerNum || hasId)) || (capWord && hasId);
     if (!take) { feedShape++; continue; }
-    await insertAccount(db, author);
+    if (await insertAccount(db, author)) pending.inv++; // account mới = đến hạn quét ngay
     accCache.delete(author);
     if (await upsertRepoMeta(db, id, author, "dataset", x.lastModified)) feedEnq++;
   }
@@ -223,6 +224,7 @@ const invBusy = new Set();
 async function refreshInv() {
   const now = Date.now();
   const all = FIXED == null ? await pendingAccountsAdaptive(db, now) : await pendingAccounts(db, FIXED, false);
+  pending.inv = all.length >= 1000 ? Math.max(pending.inv, 5000) : all.length;
   invRows = all.filter((a) => !invBusy.has(a.username) && (!invTried.has(a.username) || invTried.get(a.username) <= now));
   const key = (x) => (x.junk ? 1e6 : accountScore(x.username, x)); // account junk thử lại được ưu tiên trước
   invRows.sort((a, b) => key(b) - key(a) || a.scanned_at - b.scanned_at);
@@ -236,6 +238,7 @@ async function invOne(a) {
     if (ov.ok && ov.data && Number(ov.data.numDatasets) + Number(ov.data.numBuckets) === 0) {
       if (a.junk) { await clearJunk(db, u); accCache.delete(u); log(`bo junk ${u}`); }
       await setScanned(db, u);
+      if (pending.inv > 0) pending.inv--;
       invSkip++; return;
     }
   }
@@ -246,8 +249,9 @@ async function invOne(a) {
   if (ds.complete && bk.complete) {
     if (a.junk) { await clearJunk(db, u); accCache.delete(u); log(`bo junk ${u}`); }
     await setScanned(db, u); invOk++;
+    if (pending.inv > 0) pending.inv--;
   }
-  else { invFail++; invTried.set(u, Date.now() + 10 * 60e3); }
+  else { invFail++; invTried.set(u, Date.now() + 10 * 60e3); if (pending.inv > 0) pending.inv--; }
 }
 
 // ---------------- role: index ----------------
