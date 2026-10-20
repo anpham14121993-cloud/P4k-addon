@@ -2,7 +2,8 @@ name: crawl
 
 on:
   schedule:
-    - cron: "17 */24 * * *" # 1 lần/ngày (đã tối ưu rows read)
+    # 2 lần/ngày: 00:00 và 17:00 giờ Việt Nam (UTC+7) -> 17:00 và 10:00 UTC
+    - cron: "0 10,17 * * *"
   workflow_dispatch:
     inputs:
       budget:
