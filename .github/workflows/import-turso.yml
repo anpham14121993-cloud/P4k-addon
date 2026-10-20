@@ -1,0 +1,37 @@
+name: import-turso
+
+on:
+  workflow_dispatch:
+    inputs:
+      reset:
+        description: "Xoá files/repos/accounts trước khi nạp"
+        type: boolean
+        default: false
+      offset:
+        description: "Resume files từ rowid (0 = đầu)"
+        default: "0"
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Cần file phim4k.db trong repo (hoặc tải từ Artifact/Release)
+        run: |
+          if [ ! -f phim4k.db ]; then
+            echo "::error::Thiếu phim4k.db — upload DB vào repo/Release rồi chạy lại (hoặc dùng máy local)."
+            exit 1
+          fi
+      - name: Import
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          ARGS=""
+          [ "${{ github.event.inputs.reset }}" = "true" ] && ARGS="$ARGS --reset"
+          [ "${{ github.event.inputs.offset }}" != "0" ] && ARGS="$ARGS --offset ${{ github.event.inputs.offset }}"
+          node import-turso.mjs $ARGS

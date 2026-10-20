@@ -1,0 +1,10 @@
+phim4k.db
+phim4k.db-wal
+phim4k.db-shm
+*.log
+.wrangler/
+node_modules/
+.env.turso
+.env*
+.dev.vars
+phim4k-import.db

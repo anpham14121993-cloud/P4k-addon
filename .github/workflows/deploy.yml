@@ -1,0 +1,40 @@
+name: deploy-worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker.mjs"
+      - "core.mjs"
+      - "turso-http.mjs"
+      - "turso-db.mjs"
+      - "wrangler.toml"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Đặt secrets cho Worker (Turso)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          printf '%s' "$TURSO_DATABASE_URL" | npx --yes wrangler@4 secret put TURSO_DATABASE_URL
+          printf '%s' "$TURSO_AUTH_TOKEN" | npx --yes wrangler@4 secret put TURSO_AUTH_TOKEN
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4 deploy

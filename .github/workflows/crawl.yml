@@ -1,0 +1,49 @@
+name: crawl
+
+on:
+  schedule:
+    - cron: "17 */12 * * *" # 2 lần/ngày (giữ rows written trong quota Turso free)
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: "Giây chạy tối đa"
+        default: "19800"
+
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Crawl (feed + inv + index tự cân bằng)
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          P4K_TURSO: "1"
+          P4K_GAP: "300"
+          P4K_FEED_PAGES: "1500"
+          P4K_IDLE_EXIT: "60"
+        run: |
+          set -o pipefail
+          node auto.mjs "${{ github.event.inputs.budget || '19800' }}" 2>&1 | tee crawl.log
+      - name: Summary
+        if: always()
+        run: |
+          line=$(grep "AUTO SUMMARY" crawl.log | tail -1 || true)
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crawl-log
+          path: crawl.log
+          retention-days: 7

@@ -1,0 +1,11 @@
+name = "phim4k-addon"
+main = "worker.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[vars]
+HF_ENDPOINT = "https://huggingface.co"
+
+# Secrets (đặt bằng: npx wrangler secret put <NAME>):
+#   TURSO_DATABASE_URL
+#   TURSO_AUTH_TOKEN
