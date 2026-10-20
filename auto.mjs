@@ -9,7 +9,7 @@ const {
   upsertRepoMeta, claimRepo, recoverStale, isFarm, isFarmStrict, isId, log, repoCounts,
   applyGitDiff, accountScore, getAccount, insertAccount, setScanned, pendingAccounts, countPending,
   countNew, stateCounts, getRepoPrev, pendingAccountsAdaptive, countPendingAdaptive,
-  claimRepoStale, clearJunk, markJunk,
+  claimRepoStale, clearJunk, markJunk, countStale,
 } = P;
 
 const db = openDB();
@@ -132,6 +132,7 @@ const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10
 let wFiles = 0;
 const stopState = { stop: false };
 const REPO_TTL_MS = process.env.P4K_REPO_TTL ? Math.max(3600e3, parseInt(process.env.P4K_REPO_TTL, 10)) : 864e5; // mặc định 1 ngày
+let staleBacklog = await countStale(db, Date.now() - REPO_TTL_MS); // backlog recheck thật (đếm 1 lần, giảm dần)
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
 // refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
 // feed thêm account mới thì +1 -> KHÔNG cần COUNT quét accounts mỗi tick.
@@ -142,7 +143,7 @@ async function rebalance() {
   await demand();
   pending.recheck = staleBusy > 0 ? 1 : 0;
   const wInv = pending.inv > 0 ? 4 * Math.min(1, pending.inv / 2000) : 0;
-  const wIdx = pending.index > 0 || staleBusy > 0 ? 2.6 * Math.min(1, Math.max(pending.index, staleBusy) / 200) : 0;
+  const wIdx = pending.index > 0 || staleBacklog > 0 ? 2.6 * Math.min(1, Math.max(pending.index, staleBacklog) / 200) : 0;
   const wFeed = ENABLE_FEED && pending.recheck === 0 && pending.feedPages > 0 ? 1 : 0;
   const sw = wInv + wIdx + wFeed;
   let lInv = sw ? Math.round((TOTAL * wInv) / sw) : 0;
@@ -160,7 +161,7 @@ async function rebalance() {
     while (lInv + lIdx + lFeed > TOTAL) { if (lIdx > 1) lIdx--; else if (lInv > 1) lInv--; else lFeed = 0; }
   }
   limits.inv = lInv; limits.index = lIdx; limits.feed = lFeed;
-  log(`sched slots=${TOTAL} feed=${lFeed} inv=${lInv} index=${lIdx} | backlog feed=${pending.feedPages}p inv=${pending.inv} index=${pending.index} recheck=${staleBusy} | ${stat()}`);
+  log(`sched slots=${TOTAL} feed=${lFeed} inv=${lInv} index=${lIdx} | backlog feed=${pending.feedPages}p inv=${pending.inv} new=${pending.index} stale=${staleBacklog} recheck=${staleBusy} | ${stat()}`);
 }
 async function slot(role) {
   for (;;) {
@@ -266,7 +267,7 @@ async function indexOne() {
   const stale = await claimRepoStale(db, "auto", Date.now() - REPO_TTL_MS);
   const r = stale || (await claimRepo(db, "auto"));
   if (!r) return false;
-  if (stale) staleBusy++;
+  if (stale) { staleBusy++; if (staleBacklog > 0) staleBacklog--; }
   const prev = await getRepoPrev(db, r.id, r.kind);
   const info = await repoInfo(r.kind, r.id);
   let handled = false;
@@ -364,7 +365,7 @@ if (ENABLE_FEED) workers.push(feedWorker());
 for (let i = 0; i < MAXW; i++) { workers.push(invWorker()); workers.push(indexWorker()); }
 try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e && e.stack ? e.stack : e)); process.exit(1); }
 clearInterval(timer);
-log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} | ${stat()}`);
+log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | ${stat()}`);
 log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 log(`STATUS ${JSON.stringify(await stateCounts(db))}`);
 process.exit(0);

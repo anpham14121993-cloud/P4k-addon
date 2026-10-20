@@ -202,6 +202,13 @@ export function ensureSchema(db) {
       log("junk_sweep_v1 xong, account junk +" + r);
     });
   }
+  if (!metaGet(db, "inv_nudge_v1")) {
+    retrySync(() => {
+      const r = db.prepare("UPDATE accounts SET next_scan_at=0 WHERE junk=0 AND next_scan_at>0").run().changes;
+      metaSet(db, "inv_nudge_v1", "1");
+      log("inv_nudge_v1 xong, account pending +" + r);
+    });
+  }
 }
 
 export function metaGet(db, k) { const r = db.prepare("SELECT val FROM meta WHERE key=?").get(k); return r ? r.val : null; }
@@ -508,6 +515,7 @@ export function accountCounts(db) { const r = db.prepare("SELECT v c FROM counte
 export function getRepoPrev(db, id, kind) { return db.prepare("SELECT sha,updated FROM repos WHERE id=? AND kind=?").get(id, kind) || {}; }
 export function pendingAccountsAdaptive(db, cut) { return pendingAccounts(db, cut, true); }
 export function countPendingAdaptive(db, cut) { return countPending(db, cut, true); }
+export function countStale(db, cut) { return db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND indexed_at<=?").get(cut).c; }
 export function claimRepoStale(db, worker, cut) {
   return retrySync(() => {
     const row = db.prepare("SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=? ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT 1").get(cut);

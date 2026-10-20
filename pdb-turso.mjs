@@ -192,6 +192,12 @@ export async function ensureSchema(db) {
     await metaSet(db, "junk_sweep_v1", "1");
     log("junk_sweep_v1 xong, account junk +" + r.changes);
   }
+  // Đẩy inv chạy ngay: mở lại hạn quét cho mọi account non-junk (1 lần).
+  if (!(await metaGet(db, "inv_nudge_v1"))) {
+    const r = await db.exec("UPDATE accounts SET next_scan_at=0 WHERE junk=0 AND next_scan_at>0");
+    await metaSet(db, "inv_nudge_v1", "1");
+    log("inv_nudge_v1 xong, account pending +" + r.changes);
+  }
 }
 
 export async function metaGet(db, k) { const r = await db.exec("SELECT val FROM meta WHERE key=?", [k]); return r.rows[0] ? r.rows[0].val : null; }
@@ -402,6 +408,10 @@ export async function countPending(db, cut, adaptive = false) {
     ? "SELECT COUNT(*) c FROM accounts WHERE next_scan_at<=?"
     : "SELECT COUNT(*) c FROM accounts WHERE junk=0 AND scanned_at<=?";
   return (await db.exec(sql, [cut])).rows[0].c;
+}
+export async function countStale(db, cut) {
+  const r = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND indexed_at<=?", [cut]);
+  return r.rows[0].c;
 }
 export async function claimRepoStale(db, worker, cut) {
   const row = (await db.exec("SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=? ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT 1", [cut])).rows[0];
