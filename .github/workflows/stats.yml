@@ -1,0 +1,21 @@
+name: stats
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Thống kê DB Turso
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          set -o pipefail
+          node stats.mjs --save 2>&1 | tee stats.txt
+          { echo '```'; cat stats.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
