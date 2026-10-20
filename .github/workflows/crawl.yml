@@ -38,6 +38,7 @@ jobs:
           P4K_GAP: "300"
           P4K_FEED_PAGES: "1500"
           P4K_IDLE_EXIT: "60"
+          P4K_WRITE_CAP: "200000"
         run: |
           set -o pipefail
           node auto.mjs "${{ github.event.inputs.budget || '19800' }}" 2>&1 | tee crawl.log
