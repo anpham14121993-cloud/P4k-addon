@@ -1,8 +1,8 @@
 name: crawl
 
 on:
-  # TẠM DỪNG schedule: Turso free đã dùng 100% hạn mức rows read → tránh bị khoá tài khoản.
-  # Chạy tay bằng workflow_dispatch sau khi tối ưu truy vấn / chuyển backend.
+  schedule:
+    - cron: "17 */24 * * *" # 1 lần/ngày (đã tối ưu rows read)
   workflow_dispatch:
     inputs:
       budget:
