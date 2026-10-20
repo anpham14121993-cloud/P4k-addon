@@ -81,6 +81,42 @@ function reposComposite(db) {
   return pk.length === 2 && pk[0] === "id" && pk[1] === "kind";
 }
 
+const SCHEMA_IDX_TRG = `CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(state);
+           CREATE INDEX IF NOT EXISTS idx_repos_account ON repos(account);
+           CREATE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path);
+           CREATE TABLE IF NOT EXISTS counters(k TEXT PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0);
+           CREATE INDEX IF NOT EXISTS idx_accounts_next ON accounts(next_scan_at);
+           CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at);
+           CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC);
+           CREATE INDEX IF NOT EXISTS idx_repos_stale ON repos(junk, state, has_id DESC, indexed_at ASC);
+           CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile);`;
+const SCHEMA_TRG = `CREATE TRIGGER IF NOT EXISTS trg_rep_ins AFTER INSERT ON repos BEGIN
+             INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+             INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_rep_del AFTER DELETE ON repos BEGIN
+             INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_rep_upd AFTER UPDATE ON repos WHEN NEW.state<>OLD.state OR NEW.junk<>OLD.junk BEGIN
+             INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+             INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_acc_ins AFTER INSERT ON accounts BEGIN
+             INSERT INTO counters(k,v) VALUES('acct:t',1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+             INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_acc_del AFTER DELETE ON accounts BEGIN
+             INSERT INTO counters(k,v) VALUES('acct:t',-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+           END;
+           CREATE TRIGGER IF NOT EXISTS trg_acc_upd AFTER UPDATE ON accounts WHEN NEW.junk<>OLD.junk BEGIN
+             INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
+             INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
+           END;`;
+
 // Mô hình chuẩn: account -> repo(kind=dataset|bucket) -> file (tra thẳng `files`).
 // Khoá repo = (id, kind) vì id bucket TRÙNG id dataset (1.501/2.268).
 export function ensureSchema(db) {
@@ -112,41 +148,7 @@ export function ensureSchema(db) {
   addCol(db, "repos", "prio", "INTEGER DEFAULT 0");
   addCol(db, "repos", "junk", "INTEGER DEFAULT 0");
   addCol(db, "accounts", "next_scan_at", "INTEGER DEFAULT 0");
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(state);
-           CREATE INDEX IF NOT EXISTS idx_repos_account ON repos(account);
-           CREATE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path);
-           CREATE TABLE IF NOT EXISTS counters(k TEXT PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0);
-           CREATE INDEX IF NOT EXISTS idx_accounts_next ON accounts(next_scan_at);
-           CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at);
-           CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC);
-           CREATE INDEX IF NOT EXISTS idx_repos_stale ON repos(junk, state, has_id DESC, indexed_at ASC);
-           CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile);
-           CREATE TRIGGER IF NOT EXISTS trg_rep_ins AFTER INSERT ON repos BEGIN
-             INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-             INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-           END;
-           CREATE TRIGGER IF NOT EXISTS trg_rep_del AFTER DELETE ON repos BEGIN
-             INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-             INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-           END;
-           CREATE TRIGGER IF NOT EXISTS trg_rep_upd AFTER UPDATE ON repos WHEN NEW.state<>OLD.state OR NEW.junk<>OLD.junk BEGIN
-             INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-             INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-             INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-             INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-           END;
-           CREATE TRIGGER IF NOT EXISTS trg_acc_ins AFTER INSERT ON accounts BEGIN
-             INSERT INTO counters(k,v) VALUES('acct:t',1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-             INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-           END;
-           CREATE TRIGGER IF NOT EXISTS trg_acc_del AFTER DELETE ON accounts BEGIN
-             INSERT INTO counters(k,v) VALUES('acct:t',-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-             INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-           END;
-           CREATE TRIGGER IF NOT EXISTS trg_acc_upd AFTER UPDATE ON accounts WHEN NEW.junk<>OLD.junk BEGIN
-             INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-             INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-           END;`);
+  db.exec(SCHEMA_IDX_TRG);
   if (!metaGet(db, "prio_idx_v1")) {
     db.exec(`DROP INDEX IF EXISTS idx_repos_prio;
              DROP INDEX IF EXISTS idx_repos_prio_d;
@@ -184,6 +186,21 @@ export function ensureSchema(db) {
     db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE next_scan_at=0");
     metaSet(db, "counters_v1", "1");
     log("counters_v1 backfill xong");
+  }
+  if (!metaGet(db, "junk_sweep_v1")) {
+    retrySync(() => {
+      // Tắt trigger tạm thời: UPDATE hàng loạt nhanh, rồi dựng lại counters cho khớp.
+      for (const t of ["trg_rep_ins", "trg_rep_del", "trg_rep_upd", "trg_acc_ins", "trg_acc_del", "trg_acc_upd"]) db.exec("DROP TRIGGER IF EXISTS " + t);
+      const r = db.prepare("UPDATE accounts SET junk=1, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE junk=0 AND has_id=0 AND username NOT IN (SELECT account FROM repos WHERE state='new')").run(Date.now()).changes;
+      db.prepare("UPDATE repos SET junk=1 WHERE junk=0 AND account IN (SELECT username FROM accounts WHERE junk=1)").run();
+      db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acjt:'||junk, COUNT(*) FROM accounts GROUP BY junk");
+      db.exec("INSERT OR REPLACE INTO counters(k,v) VALUES('acct:t',(SELECT COUNT(*) FROM accounts))");
+      db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rsj:'||state||':'||junk, COUNT(*) FROM repos GROUP BY state,junk");
+      db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rst:'||state, COUNT(*) FROM repos GROUP BY state");
+      db.exec(SCHEMA_TRG);
+      metaSet(db, "junk_sweep_v1", "1");
+      log("junk_sweep_v1 xong, account junk +" + r);
+    });
   }
 }
 
@@ -341,12 +358,19 @@ export function reevalAccount(db, u) {
       for (const r of db.prepare("SELECT id,kind FROM repos WHERE account=?").all(u)) upd.run(repoScore(r.id, u, r.kind, acc), r.id, r.kind);
       return;
     }
-    const d = db.prepare("SELECT COUNT(*) c FROM repos WHERE account=? AND state='done'").get(u).c;
-    if (d >= JUNK_EMPTY) {
-      const now = Date.now();
-      db.prepare("UPDATE accounts SET junk=1, scanned_at=?, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE username=?").run(now, now, u);
-      db.prepare("UPDATE repos SET junk=1 WHERE account=? AND junk=0").run(u);
-    }
+    // Account rác = không có file id nào (has_id=0) VÀ đã index hết (không còn repo 'new').
+    const pendingNew = db.prepare("SELECT 1 x FROM repos WHERE account=? AND state='new' LIMIT 1").get(u);
+    if (!pendingNew) markJunk(db, u);
+  });
+}
+
+// Đánh dấu account rác: ẩn mọi repo của nó, đặt TTL ~1 năm (thực chất là vĩnh viễn).
+export function markJunk(db, u) {
+  return retrySync(() => {
+    const now = Date.now();
+    const r = db.prepare("UPDATE accounts SET junk=1, scanned_at=?, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE username=?").run(now, now, u).changes;
+    db.prepare("UPDATE repos SET junk=1 WHERE account=? AND junk=0").run(u);
+    return r;
   });
 }
 
@@ -358,6 +382,7 @@ export function upsertRepoMeta(db, id, account, kind, lastModified) {
     const ex = db.prepare("SELECT last_modified, state, prio FROM repos WHERE id=? AND kind=?").get(id, kind);
     if (!ex) {
       db.prepare("INSERT INTO repos(id,kind,account,last_modified,state,junk,prio) VALUES(?,?,?,?,'new',?,?)").run(id, kind, account, lm, acc.junk ? 1 : 0, prio);
+      db.prepare("UPDATE accounts SET nrepo=nrepo+1 WHERE username=?").run(account);
       return true;
     }
     if (lm > (ex.last_modified || 0)) {
@@ -464,7 +489,7 @@ export function migrateFromScan(db, p = SCAN_PATH) {
 // ---------- helper backend-agnostic cho auto.mjs ----------
 export function getAccount(db, u) { return db.prepare("SELECT has_id,junk,nrepo FROM accounts WHERE username=?").get(u) || null; }
 export function insertAccount(db, u) { return db.prepare("INSERT OR IGNORE INTO accounts(username,last_seen) VALUES(?,?)").run(u, Date.now()).changes; }
-export const JUNK_RETRY_MS = 7776000000; // 90 ngay thu lai account junk
+export const JUNK_RETRY_MS = 31536000000; // account junk gan nhu vinh vien (1 nam) -> khong lo inv/index
 export const TTL_EXPR = "CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END";
 export function setScanned(db, u) { const now = Date.now(); return retrySync(() => db.prepare("UPDATE accounts SET scanned_at=?, next_scan_at=? + (" + TTL_EXPR + ") WHERE username=?").run(now, now, u)).changes; }
 export function pendingAccounts(db, cut, adaptive = true) {

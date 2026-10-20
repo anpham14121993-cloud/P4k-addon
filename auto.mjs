@@ -9,7 +9,7 @@ const {
   upsertRepoMeta, claimRepo, recoverStale, isFarm, isFarmStrict, isId, log, repoCounts,
   applyGitDiff, accountScore, getAccount, insertAccount, setScanned, pendingAccounts, countPending,
   countNew, stateCounts, getRepoPrev, pendingAccountsAdaptive, countPendingAdaptive,
-  claimRepoStale, clearJunk,
+  claimRepoStale, clearJunk, markJunk,
 } = P;
 
 const db = openDB();
@@ -236,11 +236,13 @@ async function refreshInv() {
 }
 async function invOne(a) {
   const u = a.username;
+  // Account junk (hiếm khi tới vì TTL ~1 năm): mở lại để quét, reevalAccount sẽ dán junk lại nếu vẫn rác.
+  if (a.junk) { await clearJunk(db, u); accCache.delete(u); }
   if (!a.has_id && a.nrepo === 0) {
     const ov = await req(`${base}/users/${encodeURIComponent(u)}/overview`);
     if (ov.ok && ov.data && Number(ov.data.numDatasets) + Number(ov.data.numBuckets) === 0) {
-      if (a.junk) { await clearJunk(db, u); accCache.delete(u); log(`bo junk ${u}`); }
-      await setScanned(db, u);
+      await markJunk(db, u); accCache.delete(u);
+      log(`junk rong ${u}`);
       if (pending.inv > 0) pending.inv--;
       invSkip++; return;
     }
@@ -250,8 +252,9 @@ async function invOne(a) {
   const ds = await getAllPages(`${base}/datasets?author=${encodeURIComponent(u)}&limit=1000`);
   if (Array.isArray(ds.data)) for (const z of ds.data) if (isFarm(String(z.id).split("/")[0])) { if (await upsertRepoMeta(db, z.id, u, "dataset", z.lastModified)) invEnq++; }
   if (ds.complete && bk.complete) {
-    if (a.junk) { await clearJunk(db, u); accCache.delete(u); log(`bo junk ${u}`); }
-    await setScanned(db, u); invOk++;
+    await setScanned(db, u);
+    await reevalAccount(db, u); // junk nếu hết phim + không còn repo 'new'
+    invOk++;
     if (pending.inv > 0) pending.inv--;
   }
   else { invFail++; invTried.set(u, Date.now() + 10 * 60e3); if (pending.inv > 0) pending.inv--; }

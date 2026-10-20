@@ -94,10 +94,8 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, val TEXT)`,
   `CREATE TABLE IF NOT EXISTS stems(stem TEXT PRIMARY KEY, n INTEGER DEFAULT 0, scanned_at INTEGER DEFAULT 0, added INTEGER DEFAULT 0)`,
   `CREATE TABLE IF NOT EXISTS seen_ext(ext TEXT PRIMARY KEY, n INTEGER DEFAULT 0, farm_n INTEGER DEFAULT 0, sample TEXT)`,
-  `CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(state)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_account ON repos(account)`,
   `CREATE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path)`,
-  `CREATE INDEX IF NOT EXISTS idx_repos_prio ON repos(state, prio DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_files_sizename ON files(name, size)`,
 ];
 // Cột bổ sung (DB import từ SQLite đã có; DB mới thì CREATE ở trên thiếu cột -> thêm mềm).
@@ -115,6 +113,8 @@ const ADD_COLS = [
 // Index + trigger + counters phải tạo SAU khi đã có cột (DB import có thể thiếu cột).
 const IDX2 = [
   `CREATE TABLE IF NOT EXISTS counters(k TEXT PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(state)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_prio ON repos(state, prio DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_accounts_next ON accounts(next_scan_at)`,
   `CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC)`,
@@ -176,6 +176,21 @@ export async function ensureSchema(db) {
     await db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE next_scan_at=0");
     await metaSet(db, "counters_v1", "1");
     log("counters_v1 backfill xong");
+  }
+  // Quét rác 1 lần: account không có phim (has_id=0) và đã index hết (không còn repo 'new')
+  // -> junk vĩnh viễn. Sau bước này inv/index chỉ còn làm account thật.
+  if (!(await metaGet(db, "junk_sweep_v1"))) {
+    // Tắt trigger tạm thời: UPDATE hàng loạt nhanh, rồi dựng lại counters cho khớp.
+    await db.batch(["trg_rep_ins", "trg_rep_del", "trg_rep_upd", "trg_acc_ins", "trg_acc_del", "trg_acc_upd"].map((t) => ({ sql: "DROP TRIGGER IF EXISTS " + t })));
+    const r = await db.exec("UPDATE accounts SET junk=1, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE junk=0 AND has_id=0 AND username NOT IN (SELECT account FROM repos WHERE state='new')", [Date.now()]);
+    await db.exec("UPDATE repos SET junk=1 WHERE junk=0 AND account IN (SELECT username FROM accounts WHERE junk=1)");
+    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acjt:'||junk, COUNT(*) FROM accounts GROUP BY junk");
+    await db.exec("INSERT OR REPLACE INTO counters(k,v) VALUES('acct:t',(SELECT COUNT(*) FROM accounts))");
+    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rsj:'||state||':'||junk, COUNT(*) FROM repos GROUP BY state,junk");
+    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rst:'||state, COUNT(*) FROM repos GROUP BY state");
+    await db.batch(TRG.map((sql) => ({ sql })));
+    await metaSet(db, "junk_sweep_v1", "1");
+    log("junk_sweep_v1 xong, account junk +" + r.changes);
   }
 }
 
@@ -267,6 +282,7 @@ export async function upsertRepoMeta(db, id, account, kind, lastModified) {
   const ex = (await db.exec("SELECT last_modified,state,prio FROM repos WHERE id=? AND kind=?", [id, kind])).rows[0];
   if (!ex) {
     await db.exec("INSERT INTO repos(id,kind,account,last_modified,state,junk,prio) VALUES(?,?,?,?,'new',?,?)", [id, kind, account, lm, acc.junk ? 1 : 0, prio]);
+    await db.exec("UPDATE accounts SET nrepo=nrepo+1 WHERE username=?", [account]);
     return true;
   }
   if (lm > (ex.last_modified || 0)) {
@@ -288,12 +304,18 @@ export async function reevalAccount(db, u) {
     if (st.length) await db.batch(st, 500);
     return;
   }
-  const d = (await db.exec("SELECT COUNT(*) c FROM repos WHERE account=? AND state='done'", [u])).rows[0];
-  if (d && d.c >= JUNK_EMPTY) {
-    const now = Date.now();
-    await db.exec("UPDATE accounts SET junk=1, scanned_at=?, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE username=?", [now, now, u]);
-    await db.exec("UPDATE repos SET junk=1 WHERE account=? AND junk=0", [u]);
-  }
+  // Account rác = không có file id nào (has_id=0) VÀ đã index hết (không còn repo 'new').
+  // -> dán junk vĩnh viễn, không bao giờ quay lại inv/index.
+  const pendingNew = await db.exec("SELECT 1 x FROM repos WHERE account=? AND state='new' LIMIT 1", [u]);
+  if (!pendingNew.rows.length) await markJunk(db, u);
+}
+
+// Đánh dấu account rác: ẩn mọi repo của nó, đặt TTL ~1 năm (thực chất là vĩnh viễn).
+export async function markJunk(db, u) {
+  const now = Date.now();
+  const r = await db.exec("UPDATE accounts SET junk=1, scanned_at=?, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE username=?", [now, now, u]);
+  await db.exec("UPDATE repos SET junk=1 WHERE account=? AND junk=0", [u]);
+  return r.changes;
 }
 
 export async function applyGitDiff(db, repoId, kind, diff) {
@@ -361,7 +383,7 @@ export async function insertAccount(db, u) {
   const r = await db.exec("INSERT OR IGNORE INTO accounts(username,last_seen) VALUES(?,?)", [u, Date.now()]);
   return r.changes;
 }
-export const JUNK_RETRY_MS = 7776000000; // 90 ngay thu lai account junk
+export const JUNK_RETRY_MS = 31536000000; // account junk gan nhu vinh vien (1 nam) -> khong lo inv/index
 export const TTL_EXPR = "CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END";
 export async function setScanned(db, u) {
   const now = Date.now();
