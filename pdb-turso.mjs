@@ -308,19 +308,27 @@ export async function insertAccount(db, u) {
 export async function setScanned(db, u) {
   await db.exec("UPDATE accounts SET scanned_at=? WHERE username=?", [Date.now(), u]);
 }
-const TTL_CASE = "scanned_at <= ? - CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 2592000000 END";
+export const JUNK_RETRY_MS = 7776000000; // 90 ngày thử lại account junk
+const TTL_CASE = "((junk=0 AND scanned_at <= ? - CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END) OR (junk=1 AND scanned_at <= ? - " + JUNK_RETRY_MS + "))";
 export async function pendingAccounts(db, cut, adaptive = false) {
   const sql = adaptive
-    ? "SELECT username,has_id,nrepo,scanned_at FROM accounts WHERE junk=0 AND " + TTL_CASE
-    : "SELECT username,has_id,nrepo,scanned_at FROM accounts WHERE junk=0 AND scanned_at<=?";
-  return (await db.exec(sql, [cut])).rows;
+    ? "SELECT username,has_id,nrepo,junk,scanned_at FROM accounts WHERE " + TTL_CASE
+    : "SELECT username,has_id,nrepo,junk,scanned_at FROM accounts WHERE junk=0 AND scanned_at<=?";
+  return (await db.exec(sql, adaptive ? [cut, cut] : [cut])).rows;
 }
 export async function countPending(db, cut, adaptive = false) {
   const sql = adaptive
-    ? "SELECT COUNT(*) c FROM accounts WHERE junk=0 AND " + TTL_CASE
+    ? "SELECT COUNT(*) c FROM accounts WHERE " + TTL_CASE
     : "SELECT COUNT(*) c FROM accounts WHERE junk=0 AND scanned_at<=?";
-  return (await db.exec(sql, [cut])).rows[0].c;
+  return (await db.exec(sql, adaptive ? [cut, cut] : [cut])).rows[0].c;
 }
+export async function claimRepoStale(db, worker, cut) {
+  const row = (await db.exec("SELECT r.id,r.account,r.kind FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='done' AND r.indexed_at<=? AND (a.junk IS NULL OR a.junk=0) ORDER BY (r.nfile>0) DESC, r.indexed_at ASC LIMIT 1", [cut])).rows[0];
+  if (!row) return null;
+  const u = await db.exec("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND indexed_at<=?", [worker, Date.now(), row.id, row.kind, cut]);
+  return u.changes ? row : null;
+}
+export async function clearJunk(db, u) { return (await db.exec("UPDATE accounts SET junk=0 WHERE username=?", [u])).changes; }
 export async function getRepoPrev(db, id, kind) {
   return (await db.exec("SELECT sha,updated FROM repos WHERE id=? AND kind=?", [id, kind])).rows[0] || {};
 }

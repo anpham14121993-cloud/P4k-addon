@@ -423,6 +423,16 @@ export function countNew(db) { return db.prepare("SELECT COUNT(*) c FROM repos r
 export function stateCounts(db) { return db.prepare("SELECT state,COUNT(*) c FROM repos GROUP BY state").all(); }
 export function accountCounts(db) { return db.prepare("SELECT COUNT(*) c FROM accounts WHERE junk=0").get().c; }
 export function getRepoPrev(db, id, kind) { return db.prepare("SELECT sha,updated FROM repos WHERE id=? AND kind=?").get(id, kind) || {}; }
-const _TTL_CASE = "scanned_at <= ? - CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 2592000000 END";
-export function pendingAccountsAdaptive(db, cut) { return db.prepare("SELECT username,has_id,nrepo,scanned_at FROM accounts WHERE junk=0 AND " + _TTL_CASE).all(cut); }
-export function countPendingAdaptive(db, cut) { return db.prepare("SELECT COUNT(*) c FROM accounts WHERE junk=0 AND " + _TTL_CASE).get(cut).c; }
+export const JUNK_RETRY_MS = 7776000000; // 90 ngày thử lại account junk
+const _TTL_CASE = "((junk=0 AND scanned_at <= ? - CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END) OR (junk=1 AND scanned_at <= ? - " + JUNK_RETRY_MS + "))";
+export function pendingAccountsAdaptive(db, cut) { return db.prepare("SELECT username,has_id,nrepo,junk,scanned_at FROM accounts WHERE " + _TTL_CASE).all(cut, cut); }
+export function countPendingAdaptive(db, cut) { return db.prepare("SELECT COUNT(*) c FROM accounts WHERE " + _TTL_CASE).get(cut, cut).c; }
+export function claimRepoStale(db, worker, cut) {
+  return retrySync(() => {
+    const row = db.prepare("SELECT r.id,r.account,r.kind FROM repos r LEFT JOIN accounts a ON a.username=r.account WHERE r.state='done' AND r.indexed_at<=? AND (a.junk IS NULL OR a.junk=0) ORDER BY (r.nfile>0) DESC, r.indexed_at ASC LIMIT 1").get(cut);
+    if (!row) return null;
+    const u = db.prepare("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND indexed_at<=?").run(worker, Date.now(), row.id, row.kind, cut);
+    return u.changes ? row : null;
+  });
+}
+export function clearJunk(db, u) { return retrySync(() => db.prepare("UPDATE accounts SET junk=0 WHERE username=?").run(u).changes); }

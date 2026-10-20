@@ -1,12 +1,15 @@
 // auto.mjs — 1 process, 5 token-lane, 3 role (feed/inv/index) tự cân bằng theo backlog.
 // Chạy: HF_TOKEN="t1,t2,t3,t4,t5" node auto.mjs [giây]
-// Env: P4K_DB, P4K_GAP (ms/token), P4K_INV_TTL (bỏ trống = TTL thích ứng), P4K_SLOTS (mặc định 3/token)
+// Env: P4K_DB, P4K_GAP (ms/token), P4K_INV_TTL (bỏ trống = TTL thích ứng: has_id 12h / nrepo 7d / còn lại 14d;
+//      account junk thử lại sau 90d), P4K_REPO_TTL (ms, mặc định 14 ngày — repo done quá hạn được kiểm tra lại
+//      và ưu tiên trước feed), P4K_SLOTS (mặc định 3/token)
 const P = await import(process.env.P4K_TURSO === "1" ? "./pdb-turso.mjs" : "./pdb.mjs");
 const {
   openDB, ensureSchema, metaGet, metaSet, storeTree, finishRepo, unclaimRepo, reevalAccount,
   upsertRepoMeta, claimRepo, recoverStale, isFarm, isFarmStrict, isId, log, repoCounts,
   applyGitDiff, accountScore, getAccount, insertAccount, setScanned, pendingAccounts, countPending,
   countNew, stateCounts, getRepoPrev, pendingAccountsAdaptive, countPendingAdaptive,
+  claimRepoStale, clearJunk,
 } = P;
 
 const db = openDB();
@@ -122,9 +125,10 @@ async function repoInfo(kind, id) {
 const TOTAL = Math.max(1, lanes.length * SLOTS_PER_TOKEN);
 const limits = { feed: 1, inv: 1, index: 1 };
 const inflight = { feed: 0, inv: 0, index: 0 };
-let pending = { inv: 0, index: 0, feedPages: ENABLE_FEED ? 1 : 0 };
+let pending = { inv: 0, index: 0, recheck: 0, feedPages: ENABLE_FEED ? 1 : 0 };
+let staleBusy = 0;
 const stopState = { stop: false };
-const ttlOf = (a) => (a.has_id ? 12 * 3600e3 : a.nrepo > 0 ? 7 * 86400e3 : 30 * 86400e3);
+const REPO_TTL_MS = process.env.P4K_REPO_TTL ? Math.max(3600e3, parseInt(process.env.P4K_REPO_TTL, 10)) : 14 * 86400e3;
 async function demand() {
   const now = Date.now();
   pending.inv = FIXED == null ? await countPendingAdaptive(db, now) : await countPending(db, FIXED, false);
@@ -132,9 +136,10 @@ async function demand() {
 }
 async function rebalance() {
   await demand();
+  pending.recheck = staleBusy > 0 ? 1 : 0;
   const wInv = pending.inv > 0 ? 4 * Math.min(1, pending.inv / 2000) : 0;
-  const wIdx = pending.index > 0 ? 2.6 * Math.min(1, pending.index / 200) : 0;
-  const wFeed = ENABLE_FEED && pending.feedPages > 0 ? 1 : 0;
+  const wIdx = pending.index > 0 || staleBusy > 0 ? 2.6 * Math.min(1, Math.max(pending.index, staleBusy) / 200) : 0;
+  const wFeed = ENABLE_FEED && pending.recheck === 0 && pending.feedPages > 0 ? 1 : 0;
   const sw = wInv + wIdx + wFeed;
   let lInv = sw ? Math.round((TOTAL * wInv) / sw) : 0;
   let lIdx = sw ? Math.round((TOTAL * wIdx) / sw) : 0;
@@ -144,8 +149,14 @@ async function rebalance() {
   if (wIdx > 0 && lIdx < 1) lIdx = 1;
   if (wFeed > 0 && lFeed < 1) lFeed = 1;
   while (lInv + lIdx + lFeed > TOTAL) { if (lFeed > 1) lFeed--; else if (lInv > 1) lInv--; else lIdx--; }
+  if (staleBusy > 0) {
+    // Ưu tiên cập nhật repo cũ: chặn feed (giữ 1 slot khám phá nếu nhiều slot), dồn cho index.
+    lFeed = ENABLE_FEED && pending.feedPages > 0 && TOTAL >= 12 ? 1 : 0;
+    lIdx = Math.max(1, TOTAL - lInv - lFeed);
+    while (lInv + lIdx + lFeed > TOTAL) { if (lIdx > 1) lIdx--; else if (lInv > 1) lInv--; else lFeed = 0; }
+  }
   limits.inv = lInv; limits.index = lIdx; limits.feed = lFeed;
-  log(`sched slots=${TOTAL} feed=${lFeed} inv=${lInv} index=${lIdx} | backlog feed=${pending.feedPages}p inv=${pending.inv} index=${pending.index} | ${stat()}`);
+  log(`sched slots=${TOTAL} feed=${lFeed} inv=${lInv} index=${lIdx} | backlog feed=${pending.feedPages}p inv=${pending.inv} index=${pending.index} recheck=${staleBusy} | ${stat()}`);
 }
 async function slot(role) {
   for (;;) {
@@ -213,7 +224,8 @@ async function refreshInv() {
   const now = Date.now();
   const all = FIXED == null ? await pendingAccountsAdaptive(db, now) : await pendingAccounts(db, FIXED, false);
   invRows = all.filter((a) => !invBusy.has(a.username) && (!invTried.has(a.username) || invTried.get(a.username) <= now));
-  invRows.sort((a, b) => accountScore(b.username, b) - accountScore(a.username, a) || a.scanned_at - b.scanned_at);
+  const key = (x) => (x.junk ? 1e6 : accountScore(x.username, x)); // account junk thử lại được ưu tiên trước
+  invRows.sort((a, b) => key(b) - key(a) || a.scanned_at - b.scanned_at);
   invIdx = 0; invAt = now;
   if (invRows.length && invDone % 100 !== 0) log(`inv refresh todo=${invRows.length}`);
 }
@@ -222,6 +234,7 @@ async function invOne(a) {
   if (!a.has_id && a.nrepo === 0) {
     const ov = await req(`${base}/users/${encodeURIComponent(u)}/overview`);
     if (ov.ok && ov.data && Number(ov.data.numDatasets) + Number(ov.data.numBuckets) === 0) {
+      if (a.junk) { await clearJunk(db, u); accCache.delete(u); log(`bo junk ${u}`); }
       await setScanned(db, u);
       invSkip++; return;
     }
@@ -230,15 +243,20 @@ async function invOne(a) {
   if (Array.isArray(bk.data)) for (const b of bk.data) if (isFarm(String(b.id).split("/")[0])) { if (await upsertRepoMeta(db, b.id, u, "bucket", b.updatedAt)) invEnq++; }
   const ds = await getAllPages(`${base}/datasets?author=${encodeURIComponent(u)}&limit=1000`);
   if (Array.isArray(ds.data)) for (const z of ds.data) if (isFarm(String(z.id).split("/")[0])) { if (await upsertRepoMeta(db, z.id, u, "dataset", z.lastModified)) invEnq++; }
-  if (ds.complete && bk.complete) { await setScanned(db, u); invOk++; }
+  if (ds.complete && bk.complete) {
+    if (a.junk) { await clearJunk(db, u); accCache.delete(u); log(`bo junk ${u}`); }
+    await setScanned(db, u); invOk++;
+  }
   else { invFail++; invTried.set(u, Date.now() + 10 * 60e3); }
 }
 
 // ---------------- role: index ----------------
 let idxN = 0, idxInc = 0;
 async function indexOne() {
-  const r = await claimRepo(db, "auto");
+  const stale = await claimRepoStale(db, "auto", Date.now() - REPO_TTL_MS);
+  const r = stale || (await claimRepo(db, "auto"));
   if (!r) return false;
+  if (stale) staleBusy++;
   const prev = await getRepoPrev(db, r.id, r.kind);
   const info = await repoInfo(r.kind, r.id);
   let handled = false;
@@ -276,7 +294,8 @@ async function indexOne() {
       else { await unclaimRepo(db, r.id, r.kind); await sleep(1500); }
     } else await reevalAccount(db, r.account);
   } catch (e) { await unclaimRepo(db, r.id, r.kind); throw e; }
-  if (++idxN % 20 === 0) log(`index ${idxN} (last ${r.kind}:${r.id}) inc=${idxInc}`);
+  finally { if (stale) staleBusy--; }
+  if (++idxN % 20 === 0) log(`index ${idxN} (last ${r.kind}:${r.id}) inc=${idxInc} upd=${stale ? "yes" : "no"}`);
   return true;
 }
 
@@ -312,7 +331,7 @@ async function indexWorker() {
 }
 
 // ---------------- main ----------------
-log(`AUTO start db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
+log(`AUTO start repo_ttl=${(REPO_TTL_MS / 864e5).toFixed(1)}d db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
 await refreshInv();
 await rebalance();
 let idleTicks = 0, tickN = 0;
