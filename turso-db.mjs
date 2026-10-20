@@ -1,8 +1,8 @@
 // turso-db.mjs — adapter DB cho addon trên Workers: 2 query giống bản SQLite + cache.
 import { tursoClient } from "./turso-http.mjs";
 
-const TTL_MS = 10 * 60 * 1000;
-const MAX_MEM = 1000;
+const TTL_MS = 30 * 60 * 1000;
+const MAX_MEM = 5000;
 const baseOf = (id) => (id.includes(".") ? id.slice(0, id.lastIndexOf(".")) : id);
 
 export function tursoDb(env) {
@@ -60,7 +60,7 @@ export function tursoDb(env) {
     const b = baseOf(id);
     const r = await c.exec(
       "SELECT kind, repo_id, path, size FROM files WHERE name >= ? AND name < ? " +
-      "AND rowid IN (SELECT MIN(rowid) FROM files WHERE name >= ? AND name < ? GROUP BY size) ORDER BY size DESC",
+      "AND rowid IN (SELECT MIN(rowid) FROM files WHERE name >= ? AND name < ? GROUP BY size) ORDER BY size DESC LIMIT 50",
       [b + ".", b + "/", b + ".", b + "/"]);
     await cachePut("vars", id, { at: Date.now(), vars: r.rows });
     return r.rows;
