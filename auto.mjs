@@ -1,7 +1,7 @@
 // auto.mjs — 1 process, 5 token-lane, 3 role (feed/inv/index) tự cân bằng theo backlog.
 // Chạy: HF_TOKEN="t1,t2,t3,t4,t5" node auto.mjs [giây]
 // Env: P4K_DB, P4K_GAP (ms/token), P4K_INV_TTL (bỏ trống = TTL thích ứng: has_id 12h / nrepo 7d / còn lại 14d;
-//      account junk thử lại sau 90d), P4K_REPO_TTL (ms, mặc định 14 ngày — repo done quá hạn được kiểm tra lại
+//      account junk thử lại sau 90d), P4K_REPO_TTL (ms, mặc định 1 ngày — repo done quá hạn được kiểm tra lại
 //      và ưu tiên trước feed), P4K_SLOTS (mặc định 3/token)
 const P = await import(process.env.P4K_TURSO === "1" ? "./pdb-turso.mjs" : "./pdb.mjs");
 const {
@@ -128,7 +128,7 @@ const inflight = { feed: 0, inv: 0, index: 0 };
 let pending = { inv: 0, index: 0, recheck: 0, feedPages: ENABLE_FEED ? 1 : 0 };
 let staleBusy = 0;
 const stopState = { stop: false };
-const REPO_TTL_MS = process.env.P4K_REPO_TTL ? Math.max(3600e3, parseInt(process.env.P4K_REPO_TTL, 10)) : 14 * 86400e3;
+const REPO_TTL_MS = process.env.P4K_REPO_TTL ? Math.max(3600e3, parseInt(process.env.P4K_REPO_TTL, 10)) : 864e5; // mặc định 1 ngày
 async function demand() {
   const now = Date.now();
   pending.inv = FIXED == null ? await countPendingAdaptive(db, now) : await countPending(db, FIXED, false);
