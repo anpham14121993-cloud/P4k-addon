@@ -127,13 +127,16 @@ const limits = { feed: 1, inv: 1, index: 1 };
 const inflight = { feed: 0, inv: 0, index: 0 };
 let pending = { inv: 1, index: 0, recheck: 0, feedPages: ENABLE_FEED ? 1 : 0 }; // inv=1 để role inv có slot ngay, refreshInv sẽ chỉnh lại
 let staleBusy = 0;
+// Quota ghi của Turso free = 10M dòng/tháng -> giới hạn số dòng file ghi mỗi run (P4K_WRITE_CAP, 0 = không giới hạn).
+const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10));
+let wFiles = 0;
 const stopState = { stop: false };
 const REPO_TTL_MS = process.env.P4K_REPO_TTL ? Math.max(3600e3, parseInt(process.env.P4K_REPO_TTL, 10)) : 864e5; // mặc định 1 ngày
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
 // refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
 // feed thêm account mới thì +1 -> KHÔNG cần COUNT quét accounts mỗi tick.
 async function demand() {
-  pending.index = await countNew(db);
+  pending.index = wFiles >= WRITE_CAP ? 0 : await countNew(db);
 }
 async function rebalance() {
   await demand();
@@ -292,6 +295,7 @@ async function indexOne() {
       const t = await getTree(r.id, r.kind);
       if (t.ok && Array.isArray(t.data)) {
         const { n, size } = await storeTree(db, r.id, r.kind, t.data, r.account);
+        wFiles += n;
         await finishRepo(db, r.id, r.kind, { n, size, entries: t.data.length, sha: info.sha || null, updated: info.lastModified || info.updatedAt || 0 });
         await reevalAccount(db, r.account);
       } else if (t.status === 404 || t.status === 401 || t.status === 403) await finishRepo(db, r.id, r.kind, { dead: true });
@@ -357,7 +361,7 @@ if (ENABLE_FEED) workers.push(feedWorker());
 for (let i = 0; i < MAXW; i++) { workers.push(invWorker()); workers.push(indexWorker()); }
 try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e && e.stack ? e.stack : e)); process.exit(1); }
 clearInterval(timer);
-log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} | ${stat()}`);
-log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, index_n: idxN, index_inc: idxInc, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
+log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} | ${stat()}`);
+log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 log(`STATUS ${JSON.stringify(await stateCounts(db))}`);
 process.exit(0);
