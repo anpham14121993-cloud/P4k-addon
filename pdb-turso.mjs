@@ -170,7 +170,10 @@ export async function repoCounts(db, id, kind) {
 }
 
 export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, updated }) {
-  if (dead) await db.exec("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=?", [Date.now(), id, kind]);
+  if (dead) {
+    await db.exec("DELETE FROM files WHERE repo_id=? AND kind=?", [id, kind]);
+    await db.exec("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=?", [Date.now(), id, kind]);
+  }
   else await db.exec(
     "UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?",
     [n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind]);

@@ -276,6 +276,7 @@ export function applyGitDiff(db, repoId, kind, diff) {
 export function finishRepo(db, id, kind, { n, size, dead, entries, sha, updated }) {
   retrySync(() => {
     if (dead) {
+      db.prepare("DELETE FROM files WHERE repo_id=? AND kind=?").run(id, kind);
       db.prepare("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=?").run(Date.now(), id, kind);
     } else {
       db.prepare("UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?").run(n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind);

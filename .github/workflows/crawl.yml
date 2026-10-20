@@ -22,6 +22,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      - name: Dọn file của repo dead/junk
+        continue-on-error: true
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: node clean-dead.mjs | tail -5
       - name: Crawl (feed + inv + index tự cân bằng)
         shell: bash
         env:
