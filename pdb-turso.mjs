@@ -330,3 +330,6 @@ export async function stateCounts(db) {
 export async function accountCounts(db) {
   return (await db.exec("SELECT COUNT(*) c FROM accounts WHERE junk=0")).rows[0].c;
 }
+
+export async function pendingAccountsAdaptive(db, now) { return pendingAccounts(db, now, true); }
+export async function countPendingAdaptive(db, now) { return countPending(db, now, true); }
