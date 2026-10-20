@@ -338,7 +338,7 @@ async function invWorker() {
 }
 async function indexWorker() {
   while (!stopState.stop) {
-    if (limits.index < 1 || pending.index === 0) { await sleep(1000); continue; }
+    if (limits.index < 1 || (pending.index === 0 && staleBacklog === 0)) { await sleep(1000); continue; }
     await slot("index");
     try { if (!(await indexOne())) { done("index"); await sleep(1500); continue; } } catch (e) { if (e instanceof Stop) { stopState.stop = true; } else log("index err " + (e.message || e)); } finally { done("index"); }
   }
@@ -354,7 +354,7 @@ const timer = setInterval(async () => {
   if (Date.now() > DEADLINE) { stopState.stop = true; clearInterval(timer); log("AUTO het budget"); return; }
   try { await rebalance(); } catch (e) { log("sched err " + (e.message || e)); }
   if (tickN % 30 === 0) recoverStale(db, 300000).catch(() => {});
-  const noWork = pending.inv === 0 && pending.index === 0 && pending.feedPages === 0;
+  const noWork = pending.inv === 0 && pending.index === 0 && staleBacklog === 0 && pending.feedPages === 0;
   const quiet = inflight.feed + inflight.inv + inflight.index === 0;
   if (noWork && quiet) {
     idleTicks++;
