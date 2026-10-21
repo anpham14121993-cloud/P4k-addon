@@ -174,7 +174,7 @@ export async function ensureSchema(db) {
     await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rsj:'||state||':'||junk,COUNT(*) FROM repos GROUP BY state,junk");
     await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acct:t',COUNT(*) FROM accounts");
     await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acjt:'||junk,COUNT(*) FROM accounts GROUP BY junk");
-    await db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE next_scan_at=0");
+    await db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE next_scan_at=0");
     await metaSet(db, "counters_v1", "1");
     log("counters_v1 backfill xong");
   }
@@ -198,6 +198,12 @@ export async function ensureSchema(db) {
     const r = await db.exec("UPDATE accounts SET next_scan_at=0 WHERE junk=0 AND next_scan_at>0");
     await metaSet(db, "inv_nudge_v1", "1");
     log("inv_nudge_v1 xong, account pending +" + r.changes);
+  }
+  // Đồng bộ TTL inventory has_id về 6h: tính lại next_scan_at cho account đã quét (1 lần).
+  if (!(await metaGet(db, "acct_ttl5h_v1"))) {
+    const r = await db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE junk=0 AND scanned_at>0");
+    await metaSet(db, "acct_ttl5h_v1", "1");
+    log("acct_ttl5h_v1 xong, reschedule " + r.changes);
   }
 }
 
@@ -310,7 +316,7 @@ const accCache = new Map();
 export async function reevalAccount(db, u) {
   const hit = await db.exec("SELECT 1 x FROM repos WHERE account=? AND has_id=1 LIMIT 1", [u]);
   if (hit.rows.length) {
-    await db.exec("UPDATE accounts SET verified=1, has_id=1, next_scan_at=scanned_at+43200000 WHERE username=?", [u]);
+    await db.exec("UPDATE accounts SET verified=1, has_id=1, next_scan_at=scanned_at+18000000 WHERE username=?", [u]);
     const acc = (await db.exec("SELECT has_id,nrepo,junk FROM accounts WHERE username=?", [u])).rows[0] || {};
     const rs = (await db.exec("SELECT id,kind FROM repos WHERE account=?", [u])).rows;
     const st = rs.map((r) => ({ sql: "UPDATE repos SET prio=? WHERE id=? AND kind=?", args: [repoScore(r.id, u, r.kind, acc), r.id, r.kind] }));
@@ -397,7 +403,7 @@ export async function insertAccount(db, u) {
   return r.changes;
 }
 export const JUNK_RETRY_MS = 31536000000; // account junk gan nhu vinh vien (1 nam) -> khong lo inv/index
-export const TTL_EXPR = "CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END";
+export const TTL_EXPR = "CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END";
 export async function setScanned(db, u) {
   const now = Date.now();
   await db.exec("UPDATE accounts SET scanned_at=?, next_scan_at=? + (" + TTL_EXPR + ") WHERE username=?", [now, now, u]);
@@ -427,7 +433,7 @@ export async function claimRepoStale(db, worker, cut) {
   return u.changes ? row : null;
 }
 export async function clearJunk(db, u) {
-  const r = await db.exec("UPDATE accounts SET junk=0, next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE username=?", [u]);
+  const r = await db.exec("UPDATE accounts SET junk=0, next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE username=?", [u]);
   await db.exec("UPDATE repos SET junk=0 WHERE account=? AND junk=1", [u]);
   return r.changes;
 }

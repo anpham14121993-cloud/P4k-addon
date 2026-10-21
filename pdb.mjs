@@ -184,7 +184,7 @@ export function ensureSchema(db) {
     db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rsj:'||state||':'||junk,COUNT(*) FROM repos GROUP BY state,junk");
     db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acct:t',COUNT(*) FROM accounts");
     db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acjt:'||junk,COUNT(*) FROM accounts GROUP BY junk");
-    db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE next_scan_at=0");
+    db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE next_scan_at=0");
     metaSet(db, "counters_v1", "1");
     log("counters_v1 backfill xong");
   }
@@ -208,6 +208,14 @@ export function ensureSchema(db) {
       const r = db.prepare("UPDATE accounts SET next_scan_at=0 WHERE junk=0 AND next_scan_at>0").run().changes;
       metaSet(db, "inv_nudge_v1", "1");
       log("inv_nudge_v1 xong, account pending +" + r);
+    });
+  }
+  // Đồng bộ TTL inventory has_id về 6h: tính lại next_scan_at cho account đã quét (1 lần).
+  if (!metaGet(db, "acct_ttl5h_v1")) {
+    retrySync(() => {
+      const r = db.prepare("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE junk=0 AND scanned_at>0").run().changes;
+      metaSet(db, "acct_ttl5h_v1", "1");
+      log("acct_ttl5h_v1 xong, reschedule " + r);
     });
   }
 }
@@ -365,7 +373,7 @@ export function reevalAccount(db, u) {
   retrySync(() => {
     const hit = db.prepare("SELECT 1 FROM repos WHERE account=? AND has_id=1 LIMIT 1").get(u);
     if (hit) {
-      db.prepare("UPDATE accounts SET verified=1, has_id=1, next_scan_at=scanned_at+43200000 WHERE username=?").run(u);
+      db.prepare("UPDATE accounts SET verified=1, has_id=1, next_scan_at=scanned_at+18000000 WHERE username=?").run(u);
       const acc = db.prepare("SELECT has_id,nrepo,junk FROM accounts WHERE username=?").get(u) || {};
       const upd = db.prepare("UPDATE repos SET prio=? WHERE id=? AND kind=?");
       for (const r of db.prepare("SELECT id,kind FROM repos WHERE account=?").all(u)) upd.run(repoScore(r.id, u, r.kind, acc), r.id, r.kind);
@@ -503,7 +511,7 @@ export function migrateFromScan(db, p = SCAN_PATH) {
 export function getAccount(db, u) { return db.prepare("SELECT has_id,junk,nrepo FROM accounts WHERE username=?").get(u) || null; }
 export function insertAccount(db, u) { return db.prepare("INSERT OR IGNORE INTO accounts(username,last_seen) VALUES(?,?)").run(u, Date.now()).changes; }
 export const JUNK_RETRY_MS = 31536000000; // account junk gan nhu vinh vien (1 nam) -> khong lo inv/index
-export const TTL_EXPR = "CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END";
+export const TTL_EXPR = "CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END";
 export function setScanned(db, u) { const now = Date.now(); return retrySync(() => db.prepare("UPDATE accounts SET scanned_at=?, next_scan_at=? + (" + TTL_EXPR + ") WHERE username=?").run(now, now, u)).changes; }
 export function pendingAccounts(db, cut, adaptive = true) {
   return adaptive
@@ -532,7 +540,7 @@ export function claimRepoStale(db, worker, cut) {
 }
 export function clearJunk(db, u) {
   return retrySync(() => {
-    const r = db.prepare("UPDATE accounts SET junk=0, next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 43200000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE username=?").run(u).changes;
+    const r = db.prepare("UPDATE accounts SET junk=0, next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE username=?").run(u).changes;
     db.prepare("UPDATE repos SET junk=0 WHERE account=? AND junk=1").run(u);
     return r;
   });

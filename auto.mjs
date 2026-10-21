@@ -1,6 +1,6 @@
 // auto.mjs — 1 process, 5 token-lane, 3 role (feed/inv/index) tự cân bằng theo backlog.
 // Chạy: HF_TOKEN="t1,t2,t3,t4,t5" node auto.mjs [giây]
-// Env: P4K_DB, P4K_GAP (ms/token), P4K_INV_TTL (bỏ trống = TTL thích ứng: has_id 12h / nrepo 7d / còn lại 14d;
+// Env: P4K_DB, P4K_GAP (ms/token), P4K_INV_TTL (bỏ trống = TTL thích ứng: has_id 5h / nrepo 7d / còn lại 14d;
 //      account junk thử lại sau 90d), P4K_REPO_TTL (ms, mặc định 1 ngày — repo done quá hạn được kiểm tra lại
 //      và ưu tiên trước feed), P4K_SLOTS (mặc định 3/token), P4K_FEED_LIMIT (mặc định 1000 mục/trang)
 const P = await import(process.env.P4K_TURSO === "1" ? "./pdb-turso.mjs" : "./pdb.mjs");
