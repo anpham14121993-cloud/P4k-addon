@@ -245,8 +245,12 @@ async function invOne(a) {
   const u = a.username;
   // Account junk (hiếm khi tới vì TTL ~1 năm): mở lại để quét, reevalAccount sẽ dán junk lại nếu vẫn rác.
   if (a.junk) { await clearJunk(db, u); accCache.delete(u); }
-  // Luôn lấy overview để đối chiếu số bucket/dataset thực tế với số đã liệt kê.
-  const ov = await req(`${base}/users/${encodeURIComponent(u)}/overview`);
+  // Lấy overview + 2 listing song song; overview dùng để đối chiếu số bucket/dataset thực tế.
+  const [ov, bk, ds] = await Promise.all([
+    req(`${base}/users/${encodeURIComponent(u)}/overview`),
+    getAllPages(`${base}/buckets/${encodeURIComponent(u)}`),
+    getAllPages(`${base}/datasets?author=${encodeURIComponent(u)}&limit=1000`),
+  ]);
   const ovCounts = ov.ok && ov.data && Number.isFinite(Number(ov.data.numDatasets)) && Number.isFinite(Number(ov.data.numBuckets))
     ? { b: Number(ov.data.numBuckets), d: Number(ov.data.numDatasets) } : null;
   if (!a.has_id && a.nrepo === 0 && ovCounts && ovCounts.b + ovCounts.d === 0) {
@@ -256,9 +260,7 @@ async function invOne(a) {
     invSkip++; return;
   }
   const own = (id) => String(id).startsWith(u + "/");
-  const bk = await getAllPages(`${base}/buckets/${encodeURIComponent(u)}`);
   if (Array.isArray(bk.data)) for (const b of bk.data) if (own(b.id) || isFarm(String(b.id).split("/")[0])) { if (await upsertRepoMeta(db, b.id, u, "bucket", b.updatedAt)) invEnq++; }
-  const ds = await getAllPages(`${base}/datasets?author=${encodeURIComponent(u)}&limit=1000`);
   if (Array.isArray(ds.data)) for (const z of ds.data) if (own(z.id) || isFarm(String(z.id).split("/")[0])) { if (await upsertRepoMeta(db, z.id, u, "dataset", z.lastModified)) invEnq++; }
   if (ds.complete && bk.complete) {
     // API có thể trả thiếu mà không báo lỗi: chỉ đánh dấu đã quét khi khớp overview.
