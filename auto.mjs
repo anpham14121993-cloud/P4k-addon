@@ -2,10 +2,10 @@
 // Chạy: HF_TOKEN="t1,t2,t3,t4,t5" node auto.mjs [giây]
 // Env: P4K_DB, P4K_GAP (ms/token), P4K_INV_TTL (bỏ trống = TTL thích ứng: has_id 12h / nrepo 7d / còn lại 14d;
 //      account junk thử lại sau 90d), P4K_REPO_TTL (ms, mặc định 1 ngày — repo done quá hạn được kiểm tra lại
-//      và ưu tiên trước feed), P4K_SLOTS (mặc định 3/token)
+//      và ưu tiên trước feed), P4K_SLOTS (mặc định 3/token), P4K_FEED_LIMIT (mặc định 1000 mục/trang)
 const P = await import(process.env.P4K_TURSO === "1" ? "./pdb-turso.mjs" : "./pdb.mjs");
 const {
-  openDB, ensureSchema, metaGet, metaSet, storeTree, finishRepo, unclaimRepo, reevalAccount,
+  openDB, ensureSchema, metaGet, metaSet, storeTree, finishRepo, touchRepo, unclaimRepo, reevalAccount,
   upsertRepoMeta, claimRepo, recoverStale, isFarm, isFarmStrict, isId, log, repoCounts,
   applyGitDiff, accountScore, getAccount, insertAccount, setScanned, pendingAccounts, countPending,
   countNew, stateCounts, getRepoPrev, pendingAccountsAdaptive, countPendingAdaptive,
@@ -23,6 +23,7 @@ const DEADLINE = Date.now() + BUDGET;
 const START = Date.now();
 const ENABLE_FEED = process.env.P4K_FEED !== "0";
 const FEED_MAX_PAGES = parseInt(process.env.P4K_FEED_PAGES || "0", 10);
+const FEED_LIMIT = Math.max(1, Math.min(1000, parseInt(process.env.P4K_FEED_LIMIT || "1000", 10)));
 const IDLE_EXIT = Math.max(10, parseInt(process.env.P4K_IDLE_EXIT || "30", 10)) * 1000;
 const RECOVER_MS = parseInt(process.env.P4K_RECOVER_MS || "300000", 10);
 await recoverStale(db, RECOVER_MS);
@@ -190,7 +191,7 @@ async function accOf(u) {
 async function feedOne() {
   if (!ENABLE_FEED || feedAtEnd) { await sleep(1000); return; }
   if (FEED_MAX_PAGES > 0 && feedPages >= FEED_MAX_PAGES) { feedAtEnd = true; pending.feedPages = 0; log(`feed dat gioi han ${FEED_MAX_PAGES} trang`); return; }
-  const url = `${base}/datasets?limit=100&sort=lastModified` + (feedCursor ? `&cursor=${encodeURIComponent(feedCursor)}` : "");
+  const url = `${base}/datasets?limit=${FEED_LIMIT}&sort=lastModified` + (feedCursor ? `&cursor=${encodeURIComponent(feedCursor)}` : "");
   const j = await req(url);
   if (!j.ok || !Array.isArray(j.data)) { pending.feedPages = 0; log("feed stop status=" + j.status); await waitStop(30000); pending.feedPages = 1; return; }
   if (!j.data.length) { feedCursor = null; await metaSet(db, "feed_cursor", ""); feedAtEnd = true; pending.feedPages = 0; log("feed het cursor, nghi 300s"); await waitStop(300000); feedAtEnd = false; pending.feedPages = ENABLE_FEED ? 1 : 0; return; }
@@ -280,8 +281,7 @@ async function indexOne() {
     if (info.ok) {
       if (r.kind !== "bucket" && prev.sha && info.sha) {
         if (prev.sha === info.sha) {
-          const c = await repoCounts(db, r.id, r.kind);
-          await finishRepo(db, r.id, r.kind, { n: c.n, size: c.size, sha: info.sha, updated: info.lastModified });
+          await touchRepo(db, r.id, r.kind, info.sha, info.lastModified);
           handled = true;
         } else {
           const cmp = await req(`${base}/${plural(r.kind)}/${r.id}/compare/${prev.sha}..${info.sha}`, { text: true });
@@ -295,8 +295,7 @@ async function indexOne() {
           }
         }
       } else if (r.kind === "bucket" && prev.updated && info.updatedAt && prev.updated === info.updatedAt) {
-        const c = await repoCounts(db, r.id, r.kind);
-        await finishRepo(db, r.id, r.kind, { n: c.n, size: c.size, updated: info.updatedAt });
+        await touchRepo(db, r.id, r.kind, null, info.updatedAt);
         handled = true;
       }
     }

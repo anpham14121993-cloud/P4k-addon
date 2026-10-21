@@ -89,7 +89,8 @@ const SCHEMA_IDX_TRG = `CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(stat
            CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at);
            CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC);
            CREATE INDEX IF NOT EXISTS idx_repos_stale ON repos(junk, state, has_id DESC, indexed_at ASC);
-           CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile);`;
+           CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile);
+           CREATE INDEX IF NOT EXISTS idx_repos_junkfiles ON repos(junk, nfile);`;
 const SCHEMA_TRG = `CREATE TRIGGER IF NOT EXISTS trg_rep_ins AFTER INSERT ON repos BEGIN
              INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
              INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
@@ -350,6 +351,11 @@ export function finishRepo(db, id, kind, { n, size, dead, entries, sha, updated 
       db.prepare("UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?").run(n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind);
     }
   });
+}
+
+// Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
+export function touchRepo(db, id, kind, sha, updated) {
+  return retrySync(() => db.prepare("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?").run(Date.now(), sha ?? null, updated ?? null, id, kind).changes);
 }
 
 export function unclaimRepo(db, id, kind) { retrySync(() => db.prepare("UPDATE repos SET state='new', worker=NULL WHERE id=? AND kind=? AND state='fetching'").run(id, kind)); }

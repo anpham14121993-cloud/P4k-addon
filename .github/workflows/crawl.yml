@@ -2,8 +2,8 @@ name: crawl
 
 on:
   schedule:
-    # 2 lần/ngày: 00:00 và 17:00 giờ Việt Nam (UTC+7) -> 17:00 và 10:00 UTC
-    - cron: "0 10,17 * * *"
+    # 4 lần/ngày, cách đều 6h: 01:00, 07:00, 13:00, 19:00 giờ Việt Nam (UTC+7)
+    - cron: "0 0,6,12,18 * * *"
   workflow_dispatch:
     inputs:
       budget:
@@ -37,7 +37,8 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           P4K_TURSO: "1"
           P4K_GAP: "300"
-          P4K_FEED_PAGES: "1500"
+          P4K_FEED_PAGES: "150"
+          P4K_FEED_LIMIT: "1000"
           P4K_REPO_TTL: "21600000"
           P4K_IDLE_EXIT: "60"
           P4K_WRITE_CAP: "200000"

@@ -120,6 +120,7 @@ const IDX2 = [
   `CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_stale ON repos(junk, state, has_id DESC, indexed_at ASC)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_junkfiles ON repos(junk, nfile)`,
 ];
 const TRG = [
   `CREATE TRIGGER IF NOT EXISTS trg_rep_ins AFTER INSERT ON repos BEGIN
@@ -250,6 +251,12 @@ export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, up
   else await db.exec(
     "UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?",
     [n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind]);
+}
+
+// Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
+export async function touchRepo(db, id, kind, sha, updated) {
+  const r = await db.exec("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?", [Date.now(), sha ?? null, updated ?? null, id, kind]);
+  return r.changes;
 }
 
 export async function unclaimRepo(db, id, kind) {
