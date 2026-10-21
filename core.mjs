@@ -841,7 +841,25 @@ function catalogQuery(catalogId, page) {
   }
 }
 
-function cacheExternal(baseId, tmdbId, imdbId, realId) {
+const CACHE_ORIGIN = "https://p4k-cache.internal";
+function cacheReq(path) { return new Request(CACHE_ORIGIN + "/" + path); }
+async function cacheGetJSON(path) {
+  try {
+    if (typeof caches === "undefined") return null;
+    const r = await caches.default.match(cacheReq(path));
+    return r ? await r.json() : null;
+  } catch { return null; }
+}
+async function cachePutJSON(path, obj, maxAge) {
+  try {
+    if (typeof caches === "undefined") return;
+    await caches.default.put(cacheReq(path), new Response(JSON.stringify(obj), {
+      headers: { "content-type": "application/json", "cache-control": "max-age=" + maxAge },
+    }));
+  } catch {}
+}
+
+async function cacheExternal(baseId, tmdbId, imdbId, realId) {
   EXTERNAL_ID_MAP.set(baseId, realId);
   if (tmdbId) {
     EXTERNAL_ID_MAP.set(tmdbId, realId);
@@ -853,10 +871,16 @@ function cacheExternal(baseId, tmdbId, imdbId, realId) {
     const c = String(imdbId).startsWith("tt") ? String(imdbId) : "tt" + imdbId;
     EXTERNAL_ID_MAP.set(c, realId);
   }
+  await cachePutJSON("ext/" + encodeURIComponent(baseId), { id: realId || null }, realId ? 86400 : 600);
 }
 
 async function resolveExternalToVideosId(baseId, mediaType, cfg, ms) {
   if (EXTERNAL_ID_MAP.has(baseId)) return EXTERNAL_ID_MAP.get(baseId);
+  const extCached = await cacheGetJSON("ext/" + encodeURIComponent(baseId));
+  if (extCached) {
+    if (extCached.id) EXTERNAL_ID_MAP.set(baseId, extCached.id);
+    return extCached.id || null;
+  }
   const tType = mediaType === "series" || mediaType === "tvseries" ? "tv" : "movie";
   let targetTmdbId = null, targetImdbId = null, targetTitle = "", targetOriginalTitle = "", targetYear = "";
 
@@ -883,7 +907,7 @@ async function resolveExternalToVideosId(baseId, mediaType, cfg, ms) {
         targetYear = yearFromValue(cm.released || cm.year) || targetYear;
         if (!targetImdbId && cm.imdb_id) targetImdbId = String(cm.imdb_id);
       }
-      if (!targetTmdbId && !targetTitle) { cacheExternal(baseId, null, null, null); return null; }
+      if (!targetTmdbId && !targetTitle) { await cacheExternal(baseId, null, null, null); return null; }
     }
   } else if (baseId.indexOf("tmdb:") === 0 || baseId.indexOf("tmdb_") === 0) {
     targetTmdbId = baseId.replace(/^tmdb[:_]/, "");
@@ -937,7 +961,7 @@ async function resolveExternalToVideosId(baseId, mediaType, cfg, ms) {
     const best = scored.find((c) => c.nameScore >= 70 && c.score >= 65);
     if (best) {
       const realId = String(best.item.videos_id || best.item.id || "");
-      if (realId) { cacheExternal(baseId, targetTmdbId, targetImdbId, realId); return realId; }
+      if (realId) { await cacheExternal(baseId, targetTmdbId, targetImdbId, realId); return realId; }
     }
   }
 
@@ -974,9 +998,9 @@ async function resolveExternalToVideosId(baseId, mediaType, cfg, ms) {
 
   if (fb) {
     const realId = String(fb.c.id).replace(/^videos_/, "");
-    if (realId) { cacheExternal(baseId, targetTmdbId, targetImdbId, realId); return realId; }
+    if (realId) { await cacheExternal(baseId, targetTmdbId, targetImdbId, realId); return realId; }
   }
-  cacheExternal(baseId, targetTmdbId, targetImdbId, null);
+  await cacheExternal(baseId, targetTmdbId, targetImdbId, null);
   return null;
 }
 
@@ -1274,8 +1298,17 @@ async function getDetailCached(videosId, type, cfg, ms) {
   const key = (type === "series" ? "s" : "m") + ":" + videosId;
   const hit = detailCache.get(key);
   if (hit && Date.now() - hit.at < DETAIL_CACHE_TTL_MS) return hit.d;
+  const ck = "detail/" + (type === "series" ? "s" : "m") + "/" + videosId;
+  const shared = await cacheGetJSON(ck);
+  if (shared && shared.videos_id) {
+    detailCache.set(key, { d: shared, at: Date.now() });
+    return shared;
+  }
   const d = await fetchDetail(videosId, type, cfg, ms);
-  if (d && d.videos_id) detailCache.set(key, { d, at: Date.now() });
+  if (d && d.videos_id) {
+    detailCache.set(key, { d, at: Date.now() });
+    await cachePutJSON(ck, d, 600);
+  }
   return d;
 }
 
