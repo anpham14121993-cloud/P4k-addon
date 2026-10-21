@@ -38,6 +38,7 @@ jobs:
           P4K_TURSO: "1"
           P4K_GAP: "300"
           P4K_FEED_PAGES: "1500"
+          P4K_REPO_TTL: "21600000"
           P4K_IDLE_EXIT: "60"
           P4K_WRITE_CAP: "200000"
         run: |
