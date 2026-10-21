@@ -12,4 +12,5 @@ HF_ENDPOINT = "https://huggingface.co"
 #   GH_TOKEN (PAT có quyền Actions: write, dùng cho Cron Trigger dispatch)
 
 [triggers]
-crons = ["0 0,6,12,18 * * *"]
+# 00:00, 12:00, 18:00 giờ VN (UTC+7) = 17:00, 05:00, 11:00 UTC
+crons = ["0 5,11,17 * * *"]
