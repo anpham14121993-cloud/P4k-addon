@@ -306,7 +306,10 @@ async function indexOne() {
         wFiles += n;
         await finishRepo(db, r.id, r.kind, { n, size, entries: t.data.length, sha: info.sha || null, updated: info.lastModified || info.updatedAt || 0 });
         await reevalAccount(db, r.account);
-      } else if (t.status === 404 || t.status === 401 || t.status === 403) await finishRepo(db, r.id, r.kind, { dead: true });
+      } else if (t.status === 404 || t.status === 401 || t.status === 403) {
+        await finishRepo(db, r.id, r.kind, { dead: true });
+        if (r.account) await reevalAccount(db, r.account);
+      }
       else { await unclaimRepo(db, r.id, r.kind); await sleep(1500); }
     } else await reevalAccount(db, r.account);
   } catch (e) { await unclaimRepo(db, r.id, r.kind); throw e; }

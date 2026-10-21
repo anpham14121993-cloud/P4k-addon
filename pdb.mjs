@@ -379,9 +379,9 @@ export function reevalAccount(db, u) {
       for (const r of db.prepare("SELECT id,kind FROM repos WHERE account=?").all(u)) upd.run(repoScore(r.id, u, r.kind, acc), r.id, r.kind);
       return;
     }
-    // Account rác = không có file id nào (has_id=0) VÀ đã index hết (không còn repo 'new').
-    const pendingNew = db.prepare("SELECT 1 x FROM repos WHERE account=? AND state='new' LIMIT 1").get(u);
-    if (!pendingNew) markJunk(db, u);
+    // Account rác = không có file id nào (has_id=0) VÀ đã index hết (không còn repo 'new'/'fetching').
+    const pendingWork = db.prepare("SELECT 1 x FROM repos WHERE account=? AND state IN ('new','fetching') LIMIT 1").get(u);
+    if (!pendingWork) markJunk(db, u);
   });
 }
 

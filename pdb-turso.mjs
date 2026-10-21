@@ -323,10 +323,9 @@ export async function reevalAccount(db, u) {
     if (st.length) await db.batch(st, 500);
     return;
   }
-  // Account rác = không có file id nào (has_id=0) VÀ đã index hết (không còn repo 'new').
-  // -> dán junk vĩnh viễn, không bao giờ quay lại inv/index.
-  const pendingNew = await db.exec("SELECT 1 x FROM repos WHERE account=? AND state='new' LIMIT 1", [u]);
-  if (!pendingNew.rows.length) await markJunk(db, u);
+  // Account rác = không có file id nào (has_id=0) VÀ đã index hết (không còn repo 'new'/'fetching').
+  const pendingWork = await db.exec("SELECT 1 x FROM repos WHERE account=? AND state IN ('new','fetching') LIMIT 1", [u]);
+  if (!pendingWork.rows.length) await markJunk(db, u);
 }
 
 // Đánh dấu account rác: ẩn mọi repo của nó, đặt TTL ~1 năm (thực chất là vĩnh viễn).
