@@ -210,7 +210,10 @@ async function feedOne() {
     const capWord = /^[A-Za-z]{3,20}$/.test(rbase);
     // Account đã có phim (hasId): chấp nhận mọi repo của account đó
     // (kể cả tên chứa số/dấu '-'/'_'/generic) để không sót phim.
-    const take = isSelf || hasId || (oneWord && lowerNum) || (capWord && lowerNum);
+    // Account đã có phim (hasId): chấp nhận mọi repo của account đó
+    // (kể cả tên chứa số/dấu '-'/'_'/generic) để không sót phim.
+    const hyphenWord = rbase.includes("-") && /^[A-Za-z0-9-]{3,30}$/.test(rbase);
+    const take = isSelf || hasId || (oneWord && lowerNum) || (capWord && lowerNum) || (hasId && hyphenWord);
     if (!take) { feedShape++; continue; }
     if (await insertAccount(db, author)) pending.inv++; // account mới = đến hạn quét ngay
     accCache.delete(author);
