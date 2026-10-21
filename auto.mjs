@@ -245,23 +245,33 @@ async function invOne(a) {
   const u = a.username;
   // Account junk (hiếm khi tới vì TTL ~1 năm): mở lại để quét, reevalAccount sẽ dán junk lại nếu vẫn rác.
   if (a.junk) { await clearJunk(db, u); accCache.delete(u); }
-  if (!a.has_id && a.nrepo === 0) {
-    const ov = await req(`${base}/users/${encodeURIComponent(u)}/overview`);
-    if (ov.ok && ov.data && Number(ov.data.numDatasets) + Number(ov.data.numBuckets) === 0) {
-      await markJunk(db, u); accCache.delete(u);
-      log(`junk rong ${u}`);
-      if (pending.inv > 0) pending.inv--;
-      invSkip++; return;
-    }
+  // Luôn lấy overview để đối chiếu số bucket/dataset thực tế với số đã liệt kê.
+  const ov = await req(`${base}/users/${encodeURIComponent(u)}/overview`);
+  const ovCounts = ov.ok && ov.data && Number.isFinite(Number(ov.data.numDatasets)) && Number.isFinite(Number(ov.data.numBuckets))
+    ? { b: Number(ov.data.numBuckets), d: Number(ov.data.numDatasets) } : null;
+  if (!a.has_id && a.nrepo === 0 && ovCounts && ovCounts.b + ovCounts.d === 0) {
+    await markJunk(db, u); accCache.delete(u);
+    log(`junk rong ${u}`);
+    if (pending.inv > 0) pending.inv--;
+    invSkip++; return;
   }
+  const own = (id) => String(id).startsWith(u + "/");
   const bk = await getAllPages(`${base}/buckets/${encodeURIComponent(u)}`);
-  if (Array.isArray(bk.data)) for (const b of bk.data) if (isFarm(String(b.id).split("/")[0])) { if (await upsertRepoMeta(db, b.id, u, "bucket", b.updatedAt)) invEnq++; }
+  if (Array.isArray(bk.data)) for (const b of bk.data) if (own(b.id) || isFarm(String(b.id).split("/")[0])) { if (await upsertRepoMeta(db, b.id, u, "bucket", b.updatedAt)) invEnq++; }
   const ds = await getAllPages(`${base}/datasets?author=${encodeURIComponent(u)}&limit=1000`);
-  if (Array.isArray(ds.data)) for (const z of ds.data) if (isFarm(String(z.id).split("/")[0])) { if (await upsertRepoMeta(db, z.id, u, "dataset", z.lastModified)) invEnq++; }
+  if (Array.isArray(ds.data)) for (const z of ds.data) if (own(z.id) || isFarm(String(z.id).split("/")[0])) { if (await upsertRepoMeta(db, z.id, u, "dataset", z.lastModified)) invEnq++; }
   if (ds.complete && bk.complete) {
-    await setScanned(db, u);
-    await reevalAccount(db, u); // junk nếu hết phim + không còn repo 'new'
-    invOk++;
+    // API có thể trả thiếu mà không báo lỗi: chỉ đánh dấu đã quét khi khớp overview.
+    const short = ovCounts && (bk.data.length < ovCounts.b || ds.data.length < ovCounts.d);
+    if (short) {
+      invFail++;
+      invTried.set(u, Date.now() + 10 * 60e3);
+      log(`inv thieu ${u} bucket=${bk.data.length}/${ovCounts.b} dataset=${ds.data.length}/${ovCounts.d}`);
+    } else {
+      await setScanned(db, u);
+      await reevalAccount(db, u); // junk nếu hết phim + không còn repo 'new'
+      invOk++;
+    }
     if (pending.inv > 0) pending.inv--;
   }
   else { invFail++; invTried.set(u, Date.now() + 10 * 60e3); if (pending.inv > 0) pending.inv--; }

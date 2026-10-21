@@ -252,16 +252,16 @@ export async function repoCounts(db, id, kind) {
 export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, updated }) {
   if (dead) {
     await db.exec("DELETE FROM files WHERE repo_id=? AND kind=?", [id, kind]);
-    await db.exec("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=?", [Date.now(), id, kind]);
+    await db.exec("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=? AND state='fetching'", [Date.now(), id, kind]);
   }
   else await db.exec(
-    "UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?",
+    "UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'",
     [n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind]);
 }
 
 // Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
 export async function touchRepo(db, id, kind, sha, updated) {
-  const r = await db.exec("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?", [Date.now(), sha ?? null, updated ?? null, id, kind]);
+  const r = await db.exec("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'", [Date.now(), sha ?? null, updated ?? null, id, kind]);
   return r.changes;
 }
 
@@ -304,8 +304,9 @@ export async function upsertRepoMeta(db, id, account, kind, lastModified) {
     await db.exec("UPDATE accounts SET nrepo=nrepo+1 WHERE username=?", [account]);
     return true;
   }
-  if (lm > (ex.last_modified || 0)) {
-    await db.exec("UPDATE repos SET last_modified=?, state='new', account=?, junk=?, prio=? WHERE id=? AND kind=?", [lm, account, acc.junk ? 1 : 0, prio, id, kind]);
+  if (lm > (ex.last_modified || 0) || ex.state === "dead") {
+    // Repo từng bị đánh dead nhưng vẫn xuất hiện trong listing -> sống lại, đưa vào hàng đợi index.
+    await db.exec("UPDATE repos SET last_modified=CASE WHEN ? > COALESCE(last_modified,0) THEN ? ELSE last_modified END, state='new', account=?, junk=?, prio=? WHERE id=? AND kind=?", [lm, lm, account, acc.junk ? 1 : 0, prio, id, kind]);
     return true;
   }
   if (ex.state === "new" && prio > (ex.prio || 0)) await db.exec("UPDATE repos SET prio=? WHERE id=? AND kind=?", [prio, id, kind]);

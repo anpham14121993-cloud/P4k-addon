@@ -354,16 +354,16 @@ export function finishRepo(db, id, kind, { n, size, dead, entries, sha, updated 
   retrySync(() => {
     if (dead) {
       db.prepare("DELETE FROM files WHERE repo_id=? AND kind=?").run(id, kind);
-      db.prepare("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=?").run(Date.now(), id, kind);
+      db.prepare("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=? AND state='fetching'").run(Date.now(), id, kind);
     } else {
-      db.prepare("UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?").run(n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind);
+      db.prepare("UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind);
     }
   });
 }
 
 // Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
 export function touchRepo(db, id, kind, sha, updated) {
-  return retrySync(() => db.prepare("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=?").run(Date.now(), sha ?? null, updated ?? null, id, kind).changes);
+  return retrySync(() => db.prepare("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(Date.now(), sha ?? null, updated ?? null, id, kind).changes);
 }
 
 export function unclaimRepo(db, id, kind) { retrySync(() => db.prepare("UPDATE repos SET state='new', worker=NULL WHERE id=? AND kind=? AND state='fetching'").run(id, kind)); }
@@ -406,8 +406,9 @@ export function upsertRepoMeta(db, id, account, kind, lastModified) {
       db.prepare("UPDATE accounts SET nrepo=nrepo+1 WHERE username=?").run(account);
       return true;
     }
-    if (lm > (ex.last_modified || 0)) {
-      db.prepare("UPDATE repos SET last_modified=?, state='new', account=?, junk=?, prio=? WHERE id=? AND kind=?").run(lm, account, acc.junk ? 1 : 0, prio, id, kind);
+    if (lm > (ex.last_modified || 0) || ex.state === "dead") {
+      // Repo từng bị đánh dead nhưng vẫn xuất hiện trong listing -> sống lại, đưa vào hàng đợi index.
+      db.prepare("UPDATE repos SET last_modified=CASE WHEN ? > COALESCE(last_modified,0) THEN ? ELSE last_modified END, state='new', account=?, junk=?, prio=? WHERE id=? AND kind=?").run(lm, lm, account, acc.junk ? 1 : 0, prio, id, kind);
       return true;
     }
     if (ex.state === "new" && prio > (ex.prio || 0)) db.prepare("UPDATE repos SET prio=? WHERE id=? AND kind=?").run(prio, id, kind);
