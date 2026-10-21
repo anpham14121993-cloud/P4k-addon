@@ -1,9 +1,7 @@
 name: crawl
 
 on:
-  schedule:
-    # 4 lần/ngày, cách đều 6h: 01:00, 07:00, 13:00, 19:00 giờ Việt Nam (UTC+7)
-    - cron: "0 0,6,12,18 * * *"
+  # Lịch chạy do Cloudflare Worker Cron Trigger dispatch (GitHub schedule hay bị bỏ nhịp).
   workflow_dispatch:
     inputs:
       budget:
