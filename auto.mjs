@@ -43,15 +43,16 @@ async function takeToken() {
     const now = Date.now();
     if (now > DEADLINE) throw new Stop();
     // Chọn token KHÔNG cooldown có slot sớm nhất; token 429 bị bỏ qua, không giữ worker.
-    let best = null, bt = Infinity;
+    let best = null, bt = Infinity, bi = -1;
     for (let i = 0; i < lanes.length; i++) {
-      const t = lanes[(rr + i) % lanes.length];
+      const idx = (rr + i) % lanes.length;
+      const t = lanes[idx];
       if (t.cool > now) continue;
       const at = Math.max(now, t.next);
-      if (at < bt) { bt = at; best = t; }
+      if (at < bt) { bt = at; best = t; bi = idx; }
     }
     if (!best) { await sleep(300); continue; }
-    rr = (rr + lanes.indexOf(best) + 1) % lanes.length;
+    rr = (bi + 1) % lanes.length;
     best.next = bt + GAP; // reserve ngay (đồng bộ) -> không tranh slot giữa các worker
     if (bt > now) await sleep(bt - now);
     if (best.cool > Date.now()) continue;
@@ -288,7 +289,7 @@ async function indexOne() {
   if (stale) { staleBusy++; if (staleBacklog > 0) staleBacklog--; }
   const prev = await getRepoPrev(db, r.id, r.kind);
   const info = await repoInfo(r.kind, r.id);
-  let handled = false;
+  let handled = false, changed = false;
   try {
     if (info.ok) {
       if (r.kind !== "bucket" && prev.sha && info.sha) {
@@ -302,7 +303,7 @@ async function indexOne() {
             if (res.ok) {
               const c = await repoCounts(db, r.id, r.kind);
               await finishRepo(db, r.id, r.kind, { n: c.n, size: c.size, sha: info.sha, updated: info.lastModified });
-              idxInc++; handled = true;
+              idxInc++; handled = true; changed = true;
             }
           }
         }
@@ -323,7 +324,7 @@ async function indexOne() {
         if (r.account) await reevalAccount(db, r.account);
       }
       else { await unclaimRepo(db, r.id, r.kind); await sleep(1500); }
-    } else await reevalAccount(db, r.account);
+    } else if (changed && r.account) await reevalAccount(db, r.account);
   } catch (e) { await unclaimRepo(db, r.id, r.kind); throw e; }
   finally { if (stale) staleBusy--; }
   if (++idxN % 20 === 0) log(`index ${idxN} (last ${r.kind}:${r.id}) inc=${idxInc} upd=${stale ? "yes" : "no"}`);
