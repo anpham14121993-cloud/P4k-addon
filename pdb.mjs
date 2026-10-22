@@ -369,14 +369,30 @@ export function touchRepo(db, id, kind, sha, updated) {
 export function unclaimRepo(db, id, kind) { retrySync(() => db.prepare("UPDATE repos SET state='new', worker=NULL WHERE id=? AND kind=? AND state='fetching'").run(id, kind)); }
 
 // Đếm account: verified nếu có repo chứa id; junk nếu >=JUNK_EMPTY repo rỗng mà chưa verified.
+const verifiedAccounts = new WeakMap();
+function verifiedSet(db) {
+  let s = verifiedAccounts.get(db);
+  if (!s) { s = new Set(); verifiedAccounts.set(db, s); }
+  return s;
+}
+
 export function reevalAccount(db, u) {
+  const seen = verifiedSet(db);
+  if (seen.has(u)) return;
   retrySync(() => {
+    const acc = db.prepare("SELECT has_id,verified FROM accounts WHERE username=?").get(u);
+    if (acc && acc.has_id) {
+      if (!acc.verified) db.prepare("UPDATE accounts SET verified=1 WHERE username=?").run(u);
+      seen.add(u);
+      return;
+    }
     const hit = db.prepare("SELECT 1 FROM repos WHERE account=? AND has_id=1 LIMIT 1").get(u);
     if (hit) {
       db.prepare("UPDATE accounts SET verified=1, has_id=1, next_scan_at=scanned_at+18000000 WHERE username=?").run(u);
-      const acc = db.prepare("SELECT has_id,nrepo,junk FROM accounts WHERE username=?").get(u) || {};
+      const a = db.prepare("SELECT has_id,nrepo,junk FROM accounts WHERE username=?").get(u) || {};
       const upd = db.prepare("UPDATE repos SET prio=? WHERE id=? AND kind=?");
-      for (const r of db.prepare("SELECT id,kind FROM repos WHERE account=?").all(u)) upd.run(repoScore(r.id, u, r.kind, acc), r.id, r.kind);
+      for (const r of db.prepare("SELECT id,kind FROM repos WHERE account=?").all(u)) upd.run(repoScore(r.id, u, r.kind, a), r.id, r.kind);
+      seen.add(u);
       return;
     }
     // Account rác = không có file id nào (has_id=0) VÀ đã index hết (không còn repo 'new'/'fetching').

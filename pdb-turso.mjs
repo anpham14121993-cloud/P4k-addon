@@ -314,14 +314,30 @@ export async function upsertRepoMeta(db, id, account, kind, lastModified) {
 }
 const accCache = new Map();
 
+const verifiedAccounts = new WeakMap();
+function verifiedSet(db) {
+  let s = verifiedAccounts.get(db);
+  if (!s) { s = new Set(); verifiedAccounts.set(db, s); }
+  return s;
+}
+
 export async function reevalAccount(db, u) {
+  const seen = verifiedSet(db);
+  if (seen.has(u)) return;
+  const acc = (await db.exec("SELECT has_id,verified FROM accounts WHERE username=?", [u])).rows[0];
+  if (acc && acc.has_id) {
+    if (!acc.verified) await db.exec("UPDATE accounts SET verified=1 WHERE username=?", [u]);
+    seen.add(u);
+    return;
+  }
   const hit = await db.exec("SELECT 1 x FROM repos WHERE account=? AND has_id=1 LIMIT 1", [u]);
   if (hit.rows.length) {
     await db.exec("UPDATE accounts SET verified=1, has_id=1, next_scan_at=scanned_at+18000000 WHERE username=?", [u]);
-    const acc = (await db.exec("SELECT has_id,nrepo,junk FROM accounts WHERE username=?", [u])).rows[0] || {};
+    const a = (await db.exec("SELECT has_id,nrepo,junk FROM accounts WHERE username=?", [u])).rows[0] || {};
     const rs = (await db.exec("SELECT id,kind FROM repos WHERE account=?", [u])).rows;
-    const st = rs.map((r) => ({ sql: "UPDATE repos SET prio=? WHERE id=? AND kind=?", args: [repoScore(r.id, u, r.kind, acc), r.id, r.kind] }));
+    const st = rs.map((r) => ({ sql: "UPDATE repos SET prio=? WHERE id=? AND kind=?", args: [repoScore(r.id, u, r.kind, a), r.id, r.kind] }));
     if (st.length) await db.batch(st, 500);
+    seen.add(u);
     return;
   }
   // Account rác = không có file id nào (has_id=0) VÀ đã index hết (không còn repo 'new'/'fetching').
