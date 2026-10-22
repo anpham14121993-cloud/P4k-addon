@@ -371,7 +371,10 @@ const timer = setInterval(async () => {
   tickN++;
   if (Date.now() > DEADLINE) { stopState.stop = true; clearInterval(timer); log("AUTO het budget"); return; }
   try { await rebalance(); } catch (e) { log("sched err " + (e.message || e)); }
-  if (tickN % 30 === 0) recoverStale(db, 300000).catch(() => {});
+  if (tickN % 30 === 0) {
+    recoverStale(db, 300000).catch(() => {});
+    try { staleBacklog = await countStale(db, Date.now() - REPO_TTL_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
+  }
   const noWork = pending.inv === 0 && pending.index === 0 && staleBacklog === 0 && pending.feedPages === 0;
   const quiet = inflight.feed + inflight.inv + inflight.index === 0;
   if (noWork && quiet) {
