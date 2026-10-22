@@ -6,7 +6,7 @@ on:
     inputs:
       budget:
         description: "Giây chạy tối đa"
-        default: "19800"
+        default: "3600"
 
 concurrency:
   group: crawl
@@ -42,7 +42,7 @@ jobs:
           P4K_WRITE_CAP: "200000"
         run: |
           set -o pipefail
-          node auto.mjs "${{ github.event.inputs.budget || '19800' }}" 2>&1 | tee crawl.log
+          node auto.mjs "${{ github.event.inputs.budget || '3600' }}" 2>&1 | tee crawl.log
       - name: Summary
         if: always()
         run: |

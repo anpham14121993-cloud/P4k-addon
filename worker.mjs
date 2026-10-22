@@ -24,7 +24,7 @@ export default {
         "User-Agent": "p4k-cron",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ ref: "main", inputs: { budget: "19800" } }),
+      body: JSON.stringify({ ref: "main", inputs: { budget: "3600" } }),
     });
     if (!res.ok) console.log("dispatch failed", res.status, await res.text());
   },

@@ -18,7 +18,7 @@ await ensureSchema(db);
 const TOKENS = String(process.env.HF_TOKEN || "").split(",").map((x) => x.trim()).filter(Boolean);
 const GAP = Math.max(30, parseInt(process.env.P4K_GAP || "150", 10));
 const SLOTS_PER_TOKEN = Math.max(1, parseInt(process.env.P4K_SLOTS || "3", 10));
-const BUDGET = (parseInt(process.argv[2] || process.env.P4K_BUDGET || "21000", 10) || 1e9) * 1000;
+const BUDGET = (parseInt(process.argv[2] || process.env.P4K_BUDGET || "3600", 10) || 1e9) * 1000;
 const DEADLINE = Date.now() + BUDGET;
 const START = Date.now();
 const ENABLE_FEED = process.env.P4K_FEED !== "0";

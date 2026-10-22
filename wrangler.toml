@@ -6,11 +6,5 @@ workers_dev = true
 [vars]
 HF_ENDPOINT = "https://huggingface.co"
 
-# Secrets (đặt bằng: npx wrangler secret put <NAME>):
-#   TURSO_DATABASE_URL
-#   TURSO_AUTH_TOKEN
-#   GH_TOKEN (PAT có quyền Actions: write, dùng cho Cron Trigger dispatch)
-
 [triggers]
-# 00:00, 12:00, 19:30 giờ VN (UTC+7) = 17:00, 05:00, 12:30 UTC
-crons = ["0 5,17 * * *", "30 12 * * *"]
+crons = []
