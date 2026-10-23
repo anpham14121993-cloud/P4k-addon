@@ -119,6 +119,7 @@ const IDX2 = [
   `CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_stale ON repos(junk, state, has_id DESC, indexed_at ASC)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_stale_due ON repos(junk, state, indexed_at)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_junkfiles ON repos(junk, nfile)`,
 ];
@@ -443,7 +444,7 @@ export async function countStale(db, cut) {
   return r.rows[0].c;
 }
 export async function claimRepoStale(db, worker, cut) {
-  const row = (await db.exec("SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=? ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT 1", [cut])).rows[0];
+  const row = (await db.exec("SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=? ORDER BY r.indexed_at ASC LIMIT 1", [cut])).rows[0];
   if (!row) return null;
   const u = await db.exec("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND indexed_at<=?", [worker, Date.now(), row.id, row.kind, cut]);
   return u.changes ? row : null;
