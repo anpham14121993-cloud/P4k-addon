@@ -283,7 +283,8 @@ async function invOne(a) {
 // ---------------- role: index ----------------
 let idxN = 0, idxInc = 0;
 async function indexOne() {
-  const stale = staleBacklog > 0 ? await claimRepoStale(db, "auto", Date.now() - REPO_TTL_MS) : null;
+  const now = Date.now();
+  const stale = staleBacklog > 0 ? await claimRepoStale(db, "auto", (Math.floor(now / 300000) - 1) * 300000) : null;
   const r = stale || (await claimRepo(db, "auto"));
   if (!r) return false;
   if (stale) { staleBusy++; if (staleBacklog > 0) staleBacklog--; }

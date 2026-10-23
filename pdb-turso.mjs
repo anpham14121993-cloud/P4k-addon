@@ -261,8 +261,12 @@ export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, up
 }
 
 // Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
+// Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
+// Gom indexed_at về đầu block 5 phút để giảm số dòng write khi cùng một lô stale.
 export async function touchRepo(db, id, kind, sha, updated) {
-  const r = await db.exec("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'", [Date.now(), sha ?? null, updated ?? null, id, kind]);
+  const now = Date.now();
+  const block = Math.floor(now / 300000) * 300000;
+  const r = await db.exec("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'", [block, sha ?? null, updated ?? null, id, kind]);
   return r.changes;
 }
 

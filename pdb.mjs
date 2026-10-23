@@ -363,8 +363,12 @@ export function finishRepo(db, id, kind, { n, size, dead, entries, sha, updated 
 }
 
 // Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
+// Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
+// Gom indexed_at về đầu block 5 phút để giảm số dòng write khi cùng một lô stale.
 export function touchRepo(db, id, kind, sha, updated) {
-  return retrySync(() => db.prepare("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(Date.now(), sha ?? null, updated ?? null, id, kind).changes);
+  const now = Date.now();
+  const block = Math.floor(now / 300000) * 300000;
+  return retrySync(() => db.prepare("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(block, sha ?? null, updated ?? null, id, kind).changes);
 }
 
 export function unclaimRepo(db, id, kind) { retrySync(() => db.prepare("UPDATE repos SET state='new', worker=NULL WHERE id=? AND kind=? AND state='fetching'").run(id, kind)); }
