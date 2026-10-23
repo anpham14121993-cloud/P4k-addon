@@ -551,10 +551,17 @@ export function accountCounts(db) { const r = db.prepare("SELECT v c FROM counte
 export function getRepoPrev(db, id, kind) { return db.prepare("SELECT sha,updated FROM repos WHERE id=? AND kind=?").get(id, kind) || {}; }
 export function pendingAccountsAdaptive(db, cut) { return pendingAccounts(db, cut, true); }
 export function countPendingAdaptive(db, cut) { return countPending(db, cut, true); }
-export function countStale(db, cut) { return db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND indexed_at<=?").get(cut).c; }
-export function claimRepoStale(db, worker, cut) {
+export function countStale(db, cutHasId, cutNoId) { const r1 = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND indexed_at<=?").get(cutHasId); const r2 = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND indexed_at<=?").get(cutNoId); return (r1?.c || 0) + (r2?.c || 0); }
+export function claimRepoStale(db, worker, cut, hasId = null) {
   return retrySync(() => {
-    const row = db.prepare("SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=? ORDER BY r.indexed_at ASC LIMIT 1").get(cut);
+    let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=?";
+    const params = [cut];
+    if (hasId !== null) {
+      sql += " AND r.has_id=?";
+      params.push(hasId ? 1 : 0);
+    }
+    sql += " ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT 1";
+    const row = db.prepare(sql).get(params);
     if (!row) return null;
     const u = db.prepare("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND indexed_at<=?").run(worker, Date.now(), row.id, row.kind, cut);
     return u.changes ? row : null;

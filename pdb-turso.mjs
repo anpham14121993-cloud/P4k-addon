@@ -443,12 +443,20 @@ export async function countPending(db, cut, adaptive = false) {
     : "SELECT COUNT(*) c FROM accounts WHERE junk=0 AND scanned_at<=?";
   return (await db.exec(sql, [cut])).rows[0].c;
 }
-export async function countStale(db, cut) {
-  const r = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND indexed_at<=?", [cut]);
-  return r.rows[0].c;
+export async function countStale(db, cutHasId, cutNoId) {
+  const r1 = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND indexed_at<=?", [cutHasId]);
+  const r2 = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND indexed_at<=?", [cutNoId]);
+  return (r1.rows[0]?.c || 0) + (r2.rows[0]?.c || 0);
 }
-export async function claimRepoStale(db, worker, cut) {
-  const row = (await db.exec("SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=? ORDER BY r.indexed_at ASC LIMIT 1", [cut])).rows[0];
+export async function claimRepoStale(db, worker, cut, hasId = null) {
+  let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=?";
+  const params = [cut];
+  if (hasId !== null) {
+    sql += " AND r.has_id=?";
+    params.push(hasId ? 1 : 0);
+  }
+  sql += " ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT 1";
+  const row = (await db.exec(sql, params)).rows[0];
   if (!row) return null;
   const u = await db.exec("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND indexed_at<=?", [worker, Date.now(), row.id, row.kind, cut]);
   return u.changes ? row : null;

@@ -134,7 +134,7 @@ const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10
 let wFiles = 0;
 const stopState = { stop: false };
 const REPO_TTL_MS = process.env.P4K_REPO_TTL ? Math.max(3600e3, parseInt(process.env.P4K_REPO_TTL, 10)) : 864e5; // mặc định 1 ngày
-let staleBacklog = await countStale(db, Date.now() - REPO_TTL_MS); // backlog recheck thật (đếm 1 lần, giảm dần)
+let staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); // backlog recheck thật (đếm 1 lần, giảm dần)
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
 // refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
 // feed thêm account mới thì +1 -> KHÔNG cần COUNT quét accounts mỗi tick.
@@ -364,7 +364,7 @@ async function indexWorker() {
 }
 
 // ---------------- main ----------------
-log(`AUTO start repo_ttl=${(REPO_TTL_MS / 864e5).toFixed(1)}d db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
+log(`AUTO start ttl_has_id=${REPO_TTL_HAS_ID_MS/3600000}h ttl_no_id=${REPO_TTL_NO_ID_MS/3600000}h db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
 await refreshInv();
 await rebalance();
 let idleTicks = 0, tickN = 0;
@@ -374,7 +374,7 @@ const timer = setInterval(async () => {
   try { await rebalance(); } catch (e) { log("sched err " + (e.message || e)); }
   if (tickN % 30 === 0) {
     recoverStale(db, 300000).catch(() => {});
-    try { staleBacklog = await countStale(db, Date.now() - REPO_TTL_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
+    try { staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
   }
   const noWork = pending.inv === 0 && pending.index === 0 && staleBacklog === 0 && pending.feedPages === 0;
   const quiet = inflight.feed + inflight.inv + inflight.index === 0;
