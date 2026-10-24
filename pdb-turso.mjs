@@ -123,34 +123,11 @@ const IDX2 = [
   `CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_junkfiles ON repos(junk, nfile)`,
 ];
-const TRG = [
-  `CREATE TRIGGER IF NOT EXISTS trg_rep_ins AFTER INSERT ON repos BEGIN
-     INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-     INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-   END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_rep_del AFTER DELETE ON repos BEGIN
-     INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-     INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-   END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_rep_upd AFTER UPDATE ON repos WHEN NEW.state<>OLD.state OR NEW.junk<>OLD.junk BEGIN
-     INSERT INTO counters(k,v) VALUES('rst:'||OLD.state,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-     INSERT INTO counters(k,v) VALUES('rsj:'||OLD.state||':'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-     INSERT INTO counters(k,v) VALUES('rst:'||NEW.state,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-     INSERT INTO counters(k,v) VALUES('rsj:'||NEW.state||':'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-   END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_acc_ins AFTER INSERT ON accounts BEGIN
-     INSERT INTO counters(k,v) VALUES('acct:t',1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-     INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-   END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_acc_del AFTER DELETE ON accounts BEGIN
-     INSERT INTO counters(k,v) VALUES('acct:t',-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-     INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-   END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_acc_upd AFTER UPDATE ON accounts WHEN NEW.junk<>OLD.junk BEGIN
-     INSERT INTO counters(k,v) VALUES('acjt:'||OLD.junk,-1) ON CONFLICT(k) DO UPDATE SET v=v-1;
-     INSERT INTO counters(k,v) VALUES('acjt:'||NEW.junk,1) ON CONFLICT(k) DO UPDATE SET v=v+1;
-   END`,
-];
+// Triggers counter ĐÃ BỎ: chúng ghi +4 dòng counters mỗi lần repo đổi state/junk
+// (mỗi repo stale đổi state 2 lần -> 8 dòng), là nguồn write lớn nhất. Thay bằng
+// COUNT có index khi cần (đọc rẻ hơn ghi rất nhiều trong quota Turso).
+const TRG_NAMES = ["trg_rep_ins", "trg_rep_del", "trg_rep_upd", "trg_acc_ins", "trg_acc_del", "trg_acc_upd"];
+const DROP_TRG = TRG_NAMES.map((t) => ({ sql: "DROP TRIGGER IF EXISTS " + t }));
 
 export async function ensureSchema(db) {
   await db.batch(SCHEMA.map((sql) => ({ sql })));
@@ -160,7 +137,7 @@ export async function ensureSchema(db) {
     if (!have) { try { await db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${d}`); } catch { /* đã có cột */ } }
   }
   await db.batch(IDX2.map((sql) => ({ sql })));
-  await db.batch(TRG.map((sql) => ({ sql })));
+  await db.batch(DROP_TRG);
   await db.batch([
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('prio_idx_v1','1')" },
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('prio_backfill_v3','1')" },
@@ -169,12 +146,8 @@ export async function ensureSchema(db) {
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('acct_nrepo_v1','1')" },
   ]);
   if (!(await metaGet(db, "counters_v1"))) {
-    // Backfill 1 lần: đồng bộ repos.junk theo account junk, rồi chốt lại counters cho khớp tuyệt đối.
+    // Backfill 1 lần: đồng bộ repos.junk theo account junk + hẹn lịch quét.
     await db.exec("UPDATE repos SET junk=1 WHERE junk=0 AND account IN (SELECT username FROM accounts WHERE junk=1)");
-    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rst:'||state,COUNT(*) FROM repos GROUP BY state");
-    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rsj:'||state||':'||junk,COUNT(*) FROM repos GROUP BY state,junk");
-    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acct:t',COUNT(*) FROM accounts");
-    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acjt:'||junk,COUNT(*) FROM accounts GROUP BY junk");
     await db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN junk=1 THEN " + JUNK_RETRY_MS + " WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE next_scan_at=0");
     await metaSet(db, "counters_v1", "1");
     log("counters_v1 backfill xong");
@@ -182,15 +155,9 @@ export async function ensureSchema(db) {
   // Quét rác 1 lần: account không có phim (has_id=0) và đã index hết (không còn repo 'new')
   // -> junk vĩnh viễn. Sau bước này inv/index chỉ còn làm account thật.
   if (!(await metaGet(db, "junk_sweep_v1"))) {
-    // Tắt trigger tạm thời: UPDATE hàng loạt nhanh, rồi dựng lại counters cho khớp.
-    await db.batch(["trg_rep_ins", "trg_rep_del", "trg_rep_upd", "trg_acc_ins", "trg_acc_del", "trg_acc_upd"].map((t) => ({ sql: "DROP TRIGGER IF EXISTS " + t })));
+    await db.batch(DROP_TRG);
     const r = await db.exec("UPDATE accounts SET junk=1, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE junk=0 AND has_id=0 AND username NOT IN (SELECT account FROM repos WHERE state='new')", [Date.now()]);
     await db.exec("UPDATE repos SET junk=1 WHERE junk=0 AND account IN (SELECT username FROM accounts WHERE junk=1)");
-    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'acjt:'||junk, COUNT(*) FROM accounts GROUP BY junk");
-    await db.exec("INSERT OR REPLACE INTO counters(k,v) VALUES('acct:t',(SELECT COUNT(*) FROM accounts))");
-    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rsj:'||state||':'||junk, COUNT(*) FROM repos GROUP BY state,junk");
-    await db.exec("INSERT OR REPLACE INTO counters(k,v) SELECT 'rst:'||state, COUNT(*) FROM repos GROUP BY state");
-    await db.batch(TRG.map((sql) => ({ sql })));
     await metaSet(db, "junk_sweep_v1", "1");
     log("junk_sweep_v1 xong, account junk +" + r.changes);
   }
@@ -470,14 +437,14 @@ export async function getRepoPrev(db, id, kind) {
   return (await db.exec("SELECT sha,updated FROM repos WHERE id=? AND kind=?", [id, kind])).rows[0] || {};
 }
 export async function countNew(db) {
-  const r = await db.exec("SELECT v c FROM counters WHERE k='rsj:new:0'");
+  const r = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='new' AND junk=0");
   return r.rows[0] ? r.rows[0].c : 0;
 }
 export async function stateCounts(db) {
-  return (await db.exec("SELECT substr(k,5) state, v c FROM counters WHERE k LIKE 'rst:%'")).rows;
+  return (await db.exec("SELECT state, COUNT(*) c FROM repos GROUP BY state")).rows;
 }
 export async function accountCounts(db) {
-  const r = await db.exec("SELECT v c FROM counters WHERE k='acjt:0'");
+  const r = await db.exec("SELECT COUNT(*) c FROM accounts WHERE junk=0");
   return r.rows[0] ? r.rows[0].c : 0;
 }
 

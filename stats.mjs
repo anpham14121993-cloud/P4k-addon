@@ -10,8 +10,8 @@ const tb = (n) => ((Number(n) || 0) / 1099511627776).toFixed(2) + " TB";
 const t0 = Date.now();
 // Đọc từ counters + SUM(nfile) theo repo: tránh mọi truy vấn quét toàn bảng files.
 const files = await one("SELECT COALESCE(SUM(nfile),0) n, COALESCE(SUM(size),0) sz FROM repos");
-const acct = await one("SELECT (SELECT v FROM counters WHERE k='acct:t') total, (SELECT v FROM counters WHERE k='acjt:1') junk, COALESCE(SUM(has_id=1),0) has_id, COALESCE(SUM(scanned_at=0),0) never FROM accounts");
-const repos = await all("SELECT substr(k,5) state, v c FROM counters WHERE k LIKE 'rst:%' ORDER BY v DESC");
+const acct = await one("SELECT (SELECT COUNT(*) FROM accounts) total, (SELECT COUNT(*) FROM accounts WHERE junk=1) junk, COALESCE(SUM(has_id=1),0) has_id, COALESCE(SUM(scanned_at=0),0) never FROM accounts");
+const repos = await all("SELECT state, COUNT(*) c FROM repos GROUP BY state ORDER BY c DESC");
 const kinds = await all("SELECT kind, COUNT(*) c FROM repos WHERE state='done' GROUP BY kind ORDER BY c DESC");
 const fkinds = await all("SELECT kind, COALESCE(SUM(nfile),0) c FROM repos GROUP BY kind ORDER BY c DESC");
 const pend = await one("SELECT COUNT(*) c FROM accounts WHERE next_scan_at<=?", [Date.now()]);
