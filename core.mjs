@@ -39,8 +39,11 @@
  * tra bảng `files` trong phim4k.db → dựng link HuggingFace trực tiếp.
  * Không fallback: tra không thấy → 404.
  */
-const ENV = (typeof process !== "undefined" && process.env) ? process.env : {};
-const HF_ENDPOINT = String(ENV.HF_ENDPOINT || "https://huggingface.co").replace(/\/$/, "");
+const PROCESS_ENV = (typeof process !== "undefined" && process.env) ? process.env : {};
+let ENV = PROCESS_ENV;
+// Nạp secrets từ Cloudflare Worker env (worker.mjs gọi setEnv(env) ở request đầu).
+export function setEnv(e) { ENV = e || {}; applySecrets(ENV); }
+const HF_ENDPOINT = String(PROCESS_ENV.HF_ENDPOINT || "https://huggingface.co").replace(/\/$/, "");
 
 // DB adapter inject: { row(id) -> row|null, variants(id) -> rows[] } (async).
 let DB = null;
@@ -68,7 +71,7 @@ const VERSION = "2.1.0-app-dyn";
 
 /* ═══════════════════════ 1. CẤU HÌNH ═══════════════════════ */
 
-const CONFIG_SECRET = "***REMOVED***";
+let CONFIG_SECRET = "";
 
 // Config động như app Phim4K 2.8.4: app KHÔNG nhúng host — mọi host (api/cdn)
 // đều đến từ config AES-GCM. Thử theo thứ tự; rip trả cdn=svpc (đúng bộ mobile).
@@ -84,8 +87,8 @@ const FALLBACK_CFG = {
   jsonBase: "https://api.phim4k.space/rest-api/v130/",
   cdnBase: "https://svpc.cryboiz.workers.dev",
   cdnFallback: "",
-  apiKey: "***REMOVED***",
-  tmdbKey: "***REMOVED***",
+  apiKey: "",
+  tmdbKey: "",
   prefer: [],
   signedHosts: [],
 };
@@ -97,19 +100,16 @@ const API_MIRRORS = [
   "https://api.phim4k.online/rest-api/v130/",
 ];
 
-const API_USER = "admin";
-const API_PASS = "";
+let API_USER = "admin";
+let API_PASS = "";
 
 const ADDON_NAME = "Nothing-P • P4K";
 
 // Secret theo từng resolver (kiểm chứng thực nghiệm 2026-10-12):
 //   svpc  -> f7a2…  (resolver của mobile 2.8.4, config rip trỏ cdn=svpc)
 //   svatv -> 5e8d…  (cộng đồng/cũ, nhúng trong libapi_config.so của 270/271)
-const HMAC_SECRETS = {
-  "svpc.cryboiz.workers.dev": "***REMOVED***",
-  "svatv.cryboiz.workers.dev": "***REMOVED***",
-};
-const HMAC_SECRET = HMAC_SECRETS["svatv.cryboiz.workers.dev"];
+let HMAC_SECRETS = {};
+let HMAC_SECRET = "";
 
 // Resolver 503 "STREAM_DOMAIN_UNAVAILABLE" theo egress: từ IP VN-FPT (và cả colo
 // CF SEA như HKG/TWN) resolver chối 503; egress nước ngoài (US/Google) mint vé OK.
@@ -130,8 +130,28 @@ const EGRESS_MIRRORS = [
 // svpc (mobile 2.8.4) đã kiểm chứng mint tốt ở egress nước ngoài.
 const EGRESS_HOST = "svpc.cryboiz.workers.dev";
 
-const TMDB_API_KEY = "***REMOVED***";
+let TMDB_API_KEY = "";
 const TMDB_API_BASE = "https://api.themoviedb.org/3/";
+
+// Nạp toàn bộ secret từ env (Worker env hoặc process.env khi chạy local).
+// Tên biến env: CONFIG_SECRET, P4K_API_KEY, P4K_TMDB_KEY, P4K_API_USER,
+// P4K_API_PASS, P4K_HMAC_SVPC, P4K_HMAC_SVATV, TMDB_API_KEY.
+function applySecrets(env) {
+  env = env || {};
+  CONFIG_SECRET = env.CONFIG_SECRET || "";
+  API_USER = env.P4K_API_USER || "admin";
+  API_PASS = env.P4K_API_PASS || "";
+  FALLBACK_CFG.apiKey = env.P4K_API_KEY || "";
+  FALLBACK_CFG.tmdbKey = env.P4K_TMDB_KEY || "";
+  HMAC_SECRETS = {
+    "svpc.cryboiz.workers.dev": env.P4K_HMAC_SVPC || "",
+    "svatv.cryboiz.workers.dev": env.P4K_HMAC_SVATV || "",
+  };
+  HMAC_SECRET = HMAC_SECRETS["svatv.cryboiz.workers.dev"] || HMAC_SECRETS["svpc.cryboiz.workers.dev"] || "";
+  TMDB_API_KEY = env.TMDB_API_KEY || "";
+}
+applySecrets(PROCESS_ENV);
+
 
 // Dự phòng cho TMDB. api.themoviedb.org hay bị nhà mạng chặn (FPT reset
 // connection ở tầng TLS), còn cinemeta.strem.io thì không. Chỉ tra được theo
