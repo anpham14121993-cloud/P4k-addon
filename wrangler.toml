@@ -6,6 +6,6 @@ workers_dev = true
 [vars]
 HF_ENDPOINT = "https://huggingface.co"
 
-# 02:00, 12:00, 19:30 giờ VN (UTC+7) = 19:00, 05:00, 12:30 UTC
+# 00:00, 10:00, 15:00, 19:30 giờ VN (UTC+7) = 17:00, 03:00, 08:00, 12:30 UTC
 [triggers]
-crons = ["0 5,19 * * *", "30 12 * * *"]
+crons = ["0 3 * * *", "0 8 * * *", "30 12 * * *", "0 17 * * *"]
