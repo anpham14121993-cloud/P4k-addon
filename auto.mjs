@@ -133,7 +133,9 @@ let staleBusy = 0;
 const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10));
 let wFiles = 0;
 const stopState = { stop: false };
-const REPO_TTL_MS = process.env.P4K_REPO_TTL ? Math.max(3600e3, parseInt(process.env.P4K_REPO_TTL, 10)) : 864e5; // mặc định 1 ngày
+// TTL động: has_id=1 (có file phim) 1h, has_id=0 (không có phim) 12h
+const REPO_TTL_HAS_ID_MS = 3600000;      // 1h
+const REPO_TTL_NO_ID_MS = 43200000;      // 12h
 let staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); // backlog recheck thật (đếm 1 lần, giảm dần)
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
 // refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
@@ -284,7 +286,9 @@ async function invOne(a) {
 let idxN = 0, idxInc = 0;
 async function indexOne() {
   const now = Date.now();
-  const stale = staleBacklog > 0 ? await claimRepoStale(db, "auto", (Math.floor(now / 300000) - 1) * 300000) : null;
+  // Ưu tiên stale has_id=1 (TTL 1h), hết mới tới has_id=0 (TTL 12h)
+  let stale = staleBacklog > 0 ? await claimRepoStale(db, "auto", now - REPO_TTL_HAS_ID_MS, 1) : null;
+  if (!stale && staleBacklog > 0) stale = await claimRepoStale(db, "auto", now - REPO_TTL_NO_ID_MS, 0);
   const r = stale || (await claimRepo(db, "auto"));
   if (!r) return false;
   if (stale) { staleBusy++; if (staleBacklog > 0) staleBacklog--; }
