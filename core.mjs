@@ -749,22 +749,47 @@ async function resolveStreamUrl(fileUrl, cfg, opts = {}) {
   return hfDirectUrl(row);
 }
 
+function attachSubtitles(stream, item) {
+  if (Array.isArray(item.subtitles) && item.subtitles.length > 0) {
+    const subs = item.subtitles.filter((s) => s && s.url)
+      .map((s) => ({ url: s.url, lang: s.srclang || s.language || "vi" }));
+    if (subs.length) stream.subtitles = subs;
+  }
+}
+
+// Chạy fn với tối đa `limit` tác vụ đồng thời; trả [{status,value|reason}] theo thứ tự.
+async function mapLimit(arr, limit, fn) {
+  const res = new Array(arr.length);
+  let i = 0;
+  const run = async () => {
+    while (i < arr.length) {
+      const idx = i++;
+      try { res[idx] = { status: "fulfilled", value: await fn(arr[idx], idx) }; }
+      catch (e) { res[idx] = { status: "rejected", reason: e }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, arr.length) }, run));
+  return res;
+}
+
+const FALLBACK_CONCURRENCY = 3;
+
 async function resolveMediaSet(items, cfg, opts = {}) {
-  // Mỗi fileUrl (id) có thể có NHIỀU biến thể (id,size) trong DB — trả ĐỦ tất cả,
-  // mỗi biến thể thành 1 luồng riêng (cùng id nhưng khác nội dung/dung lượng).
-  // Tra DB là cục bộ nên không còn nghẽn mạng/429 như resolver cũ.
-  const units = [];
+  // Ưu tiên CHÍNH lấy từ DB (link HuggingFace trực tiếp). File nào DB KHÔNG có
+  // thì chuyển về resolver gốc (svpc/svatv theo config động) làm luồng Dự Phòng.
+  const dbUnits = [];   // { item, row, vi, total }
+  const fbItems = [];   // item không có trong DB
   for (const it of items) {
     const id = fileNameFrom(it.fileUrl);
     const vars = id ? await dbVariants(id) : [];
-    if (!vars.length) { units.push({ item: it, row: null, vi: 0, total: 0 }); continue; }
-    vars.forEach((row, vi) => units.push({ item: it, row, vi, total: vars.length }));
+    if (!vars.length) { fbItems.push(it); continue; }
+    vars.forEach((row, vi) => dbUnits.push({ item: it, row, vi, total: vars.length }));
   }
-  if (!units.length) throw new HttpError(502, "empty file set");
+  if (!dbUnits.length && !fbItems.length) throw new HttpError(502, "empty file set");
+
   const out = [];
-  let fail = { status: 404, message: "id not in db" };
-  for (const u of units) {
-    if (!u.row) { fail = { status: 404, message: "id not in db: " + fileNameFrom(u.item.fileUrl) }; continue; }
+  // 1) Nguồn chính: DB → HuggingFace trực tiếp (giữ tên account-repo như cũ).
+  for (const u of dbUnits) {
     let title = u.item.label;
     try {
       if (typeof title === "string" && /💾\s*N\/A/.test(title) && u.row.size) {
@@ -774,14 +799,24 @@ async function resolveMediaSet(items, cfg, opts = {}) {
       if (u.total > 1 && typeof title === "string") title = title + "\n🔀 Bản " + (u.vi + 1) + "/" + u.total;
     } catch {}
     const stream = { name: "⚡ " + ADDON_NAME, url: hfDirectUrl(u.row), title: title || undefined };
-    if (Array.isArray(u.item.subtitles) && u.item.subtitles.length > 0) {
-      stream.subtitles = u.item.subtitles.filter((s) => s && s.url)
-        .map((s) => ({ url: s.url, lang: s.srclang || s.language || "vi" }));
-    }
+    attachSubtitles(stream, u.item);
     out.push(stream);
   }
+  // 2) Dự phòng: DB không có → resolve gốc; ghi rõ "Dự Phòng".
+  if (fbItems.length) {
+    const settled = await mapLimit(fbItems, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
+    settled.forEach((r, idx) => {
+      if (!r || r.status !== "fulfilled" || !r.value) return;
+      const it = fbItems[idx];
+      let title = it.label;
+      try { if (typeof title === "string") title = title + "\n📁 Dự Phòng"; } catch {}
+      const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
+      attachSubtitles(stream, it);
+      out.push(stream);
+    });
+  }
   if (out.length) return out;
-  throw new HttpError(fail.status, fail.message);
+  throw new HttpError(404, "không có luồng (DB miss & resolve thất bại)");
 }
 
 /* ═══════════════════════ 6. TMDB / ID MAPPING ═══════════════════════ */
@@ -1397,8 +1432,6 @@ function parseStreamMeta(source, subtitle) {
   const hasLT = /LỒNG.?TIẾNG|LONG.?TIENG|LỒNG TIẾNG|\bLT\b|DUBBED/.test(s);
   const vnTag = [hasSub && "PĐ", hasTM && "TM", hasLT && "LT"].filter(Boolean).join("-");
   if (vnTag) m.lang.push(vnTag);
-  m.subCount = Array.isArray(subtitle) ? subtitle.length : 0;
-  if (m.subCount > 0) m.lang.push(`Phụ đề sẵn sàng (${m.subCount})`);
   m.audio = [...new Set(m.audio)];
   m.lang = [...new Set(m.lang)];
   return m;
@@ -1447,7 +1480,6 @@ function buildStreamTitle(src) {
   const vid = [m.quality, m.source, m.video, ...m.hdr, m.container].filter((x) => x && x !== "-").join(" · ");
   const l2 = "💿 " + (vid || "HD").toUpperCase();
   const l3 = "🔊 " + (m.audio.length ? m.audio.join(" · ") : "N/A");
-  const subs = Array.isArray(src.subtitleLangs) ? src.subtitleLangs.filter(Boolean).map((x) => "SUB:" + x) : [];
   // Bổ sung tag biến thể từ release info (video_quality) vào mục phụ đề nếu API không trả subtitle.
   const vq = String(src.releaseInfo || src.quality || "").toUpperCase();
   const extraTags = [];
@@ -1456,7 +1488,7 @@ function buildStreamTitle(src) {
   if (/(?:\bLT\b|LỒNG\s?TIẾNG|LONG\s?TIENG|DUBBED)/.test(vq)) extraTags.push("LT");
   if (/\bAI\b/.test(vq)) extraTags.push("AI");
   if (/\bVS\b/.test(vq)) extraTags.push("VS");
-  const langs = [...new Set([...m.lang, ...subs, ...extraTags])];
+  const langs = [...new Set([...m.lang, ...extraTags])];
   const l4 = "🌐 " + (langs.length ? langs.join(" · ") : "N/A");
   const l5 = "💾 " + (m.size !== "-" ? m.size : "N/A");
   return [l1, l2, l3, l4, l5].join("\n");
