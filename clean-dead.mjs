@@ -22,7 +22,7 @@ if (process.env.P4K_TURSO_LOCAL) {
 }
 
 const DEAD = "SELECT id,kind,nfile FROM repos WHERE state='dead' AND nfile>0 LIMIT ?";
-const JUNK = "SELECT r.id,r.kind,r.nfile FROM repos r JOIN accounts a ON a.username=r.account WHERE a.junk=1 AND r.nfile>0 LIMIT ?";
+const JUNK = "SELECT id,kind,nfile FROM repos WHERE junk=1 AND nfile>0 LIMIT ?";
 
 let dead = 0, junk = 0;
 for (const [label, sql] of [["dead", DEAD], ["junk", JUNK]]) {
