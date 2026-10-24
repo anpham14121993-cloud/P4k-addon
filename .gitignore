@@ -2,6 +2,8 @@ phim4k.db
 phim4k.db-wal
 phim4k.db-shm
 *.log
+run-stats.tsv
+track-runs.mjs
 .wrangler/
 node_modules/
 .env.turso
