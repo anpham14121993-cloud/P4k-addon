@@ -217,24 +217,41 @@ export async function repoCounts(db, id, kind) {
   return { n: x.c, size: x.s };
 }
 
+// state 'done' = repo stale (claim trong bộ nhớ, không qua 'fetching').
 export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, updated }) {
+  if (staleSeen.delete(kind + ":" + id)) staleDone.add(kind + ":" + id);
   if (dead) {
     await db.exec("DELETE FROM files WHERE repo_id=? AND kind=?", [id, kind]);
-    await db.exec("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=? AND state='fetching'", [Date.now(), id, kind]);
+    await db.exec("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=? AND state IN ('fetching','done')", [Date.now(), id, kind]);
   }
   else await db.exec(
-    "UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'",
+    "UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state IN ('fetching','done')",
     [n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind]);
 }
 
 // Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
-// Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
-// Gom indexed_at về đầu block 5 phút để giảm số dòng write khi cùng một lô stale.
+// Turso tính write theo dòng + mỗi index bị đổi: repo stale chỉ SET indexed_at/sha/updated
+// (không đụng state/worker -> 2 index thay vì 6) và gom batch, flush bằng flushTouches().
+const touchBuf = [];
+const TOUCH_BATCH = 100;
 export async function touchRepo(db, id, kind, sha, updated) {
-  const now = Date.now();
-  const block = Math.floor(now / 300000) * 300000;
+  const block = Math.floor(Date.now() / 300000) * 300000;
+  const key = kind + ":" + id;
+  if (staleSeen.delete(key)) {
+    staleDone.add(key);
+    touchBuf.push({ sql: "UPDATE repos SET indexed_at=?, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='done'", args: [block, sha ?? null, updated ?? null, id, kind] });
+    if (touchBuf.length >= TOUCH_BATCH) await flushTouches(db);
+    return 1;
+  }
   const r = await db.exec("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'", [block, sha ?? null, updated ?? null, id, kind]);
   return r.changes;
+}
+
+export async function flushTouches(db) {
+  if (!touchBuf.length) return 0;
+  const st = touchBuf.splice(0);
+  try { await db.batch(st, 500); } catch (e) { touchBuf.unshift(...st); throw e; }
+  return st.length;
 }
 
 export async function unclaimRepo(db, id, kind) {
@@ -415,18 +432,41 @@ export async function countStale(db, cutHasId, cutNoId) {
   const r2 = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND indexed_at<=?", [cutNoId]);
   return (r1.rows[0]?.c || 0) + (r2.rows[0]?.c || 0);
 }
+// Claim stale trong bộ nhớ (workflow crawl có concurrency group -> chỉ 1 crawler),
+// không ghi state='fetching'. Đọc theo lô; flush touch trước để lô mới không lặp repo vừa xử lý.
+const staleSeen = new Set();
+const staleDone = new Set();
+const staleQ = new Map();
+const staleFill = new Map();
+const STALE_BATCH = 200;
 export async function claimRepoStale(db, worker, cut, hasId = null) {
-  let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=?";
-  const params = [cut];
-  if (hasId !== null) {
-    sql += " AND r.has_id=?";
-    params.push(hasId ? 1 : 0);
+  const qk = String(hasId);
+  if (!(staleQ.get(qk) || []).length) {
+    if (!staleFill.has(qk)) staleFill.set(qk, (async () => {
+      await flushTouches(db);
+      let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=?";
+      const params = [cut];
+      if (hasId !== null) {
+        sql += " AND r.has_id=?";
+        params.push(hasId ? 1 : 0);
+      }
+      sql += " ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT " + STALE_BATCH;
+      staleQ.set(qk, (await db.exec(sql, params)).rows);
+    })().finally(() => staleFill.delete(qk)));
+    await staleFill.get(qk);
   }
-  sql += " ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT 1";
-  const row = (await db.exec(sql, params)).rows[0];
-  if (!row) return null;
-  const u = await db.exec("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND indexed_at<=?", [worker, Date.now(), row.id, row.kind, cut]);
-  return u.changes ? row : null;
+  const q = staleQ.get(qk) || [];
+  while (q.length) {
+    const row = q.shift();
+    const key = row.kind + ":" + row.id;
+    if (staleSeen.has(key) || staleDone.has(key)) continue;
+    staleSeen.add(key);
+    return row;
+  }
+  return null;
+}
+export function releaseStale(db, id, kind) {
+  staleSeen.delete(kind + ":" + id);
 }
 export async function clearJunk(db, u) {
   const r = await db.exec("UPDATE accounts SET junk=0, next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE username=?", [u]);

@@ -9,7 +9,7 @@ const {
   upsertRepoMeta, claimRepo, recoverStale, isFarm, isFarmStrict, isId, log, repoCounts,
   applyGitDiff, accountScore, getAccount, insertAccount, setScanned, pendingAccounts, countPending,
   countNew, stateCounts, getRepoPrev, pendingAccountsAdaptive, countPendingAdaptive,
-  claimRepoStale, clearJunk, markJunk, countStale,
+  claimRepoStale, clearJunk, markJunk, countStale, flushTouches, releaseStale,
 } = P;
 
 const db = openDB();
@@ -328,9 +328,9 @@ async function indexOne() {
         await finishRepo(db, r.id, r.kind, { dead: true });
         if (r.account) await reevalAccount(db, r.account);
       }
-      else { await unclaimRepo(db, r.id, r.kind); await sleep(1500); }
+      else { if (stale) releaseStale(db, r.id, r.kind); else await unclaimRepo(db, r.id, r.kind); await sleep(1500); }
     } else if (changed && r.account) await reevalAccount(db, r.account);
-  } catch (e) { await unclaimRepo(db, r.id, r.kind); throw e; }
+  } catch (e) { if (stale) releaseStale(db, r.id, r.kind); else await unclaimRepo(db, r.id, r.kind); throw e; }
   finally { if (stale) staleBusy--; }
   if (++idxN % 20 === 0) log(`index ${idxN} (last ${r.kind}:${r.id}) inc=${idxInc} upd=${stale ? "yes" : "no"}`);
   return true;
@@ -376,6 +376,7 @@ const timer = setInterval(async () => {
   tickN++;
   if (Date.now() > DEADLINE) { stopState.stop = true; clearInterval(timer); log("AUTO het budget"); return; }
   try { await rebalance(); } catch (e) { log("sched err " + (e.message || e)); }
+  try { await flushTouches(db); } catch (e) { log("touch flush err " + (e.message || e)); }
   if (tickN % 30 === 0) {
     recoverStale(db, 300000).catch(() => {});
     try { staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
@@ -393,6 +394,7 @@ if (ENABLE_FEED) workers.push(feedWorker());
 for (let i = 0; i < MAXW; i++) { workers.push(invWorker()); workers.push(indexWorker()); }
 try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e && e.stack ? e.stack : e)); process.exit(1); }
 clearInterval(timer);
+await flushTouches(db);
 log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | ${stat()}`);
 log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 log(`STATUS ${JSON.stringify(await stateCounts(db))}`);

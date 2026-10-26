@@ -342,6 +342,9 @@ export function touchRepo(db, id, kind, sha, updated) {
 }
 
 export function unclaimRepo(db, id, kind) { retrySync(() => db.prepare("UPDATE repos SET state='new', worker=NULL WHERE id=? AND kind=? AND state='fetching'").run(id, kind)); }
+// SQLite local: touch ghi ngay và stale vẫn claim qua 'fetching' (khác pdb-turso.mjs).
+export function flushTouches() { return 0; }
+export function releaseStale(db, id, kind) { unclaimRepo(db, id, kind); }
 
 // Đếm account: verified nếu có repo chứa id; junk nếu >=JUNK_EMPTY repo rỗng mà chưa verified.
 const verifiedAccounts = new WeakMap();
