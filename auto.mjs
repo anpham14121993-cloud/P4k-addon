@@ -187,7 +187,7 @@ async function waitStop(ms) {
 let feedCursor = (await metaGet(db, "feed_cursor")) || null;
 let feedPages = 0, feedSeen = 0, feedEnq = 0, feedShape = 0, feedStyle = 0, feedAtEnd = false;
 // Chẩn đoán feed: đếm item trùng trong cùng run + mốc lastModified mỗi trang và của cursor.
-let feedDup = 0, feedCurLt = "-";
+let feedDup = 0, feedCurLt = "-", feedNoLink = 0, feedNoLinkStreak = 0;
 const feedIds = new Set();
 const accCache = new Map();
 async function accOf(u) {
@@ -228,12 +228,48 @@ async function feedOne() {
     accCache.delete(author);
     if (await upsertRepoMeta(db, id, author, "dataset", x.lastModified)) feedEnq++;
   }
+  const nx = nextCursor(j.link);
+  if (!nx && j.data.length >= FEED_LIMIT) {
+    // Trang đầy nhưng thiếu Link: nếu lưu cursor rỗng thì lượt sau chạy lại từ đầu feed.
+    feedNoLink++; feedNoLinkStreak++;
+    const lastLM = [...j.data].reverse().find((x) => x.lastModified)?.lastModified;
+    if (feedNoLinkStreak >= 2 && lastLM) {
+      const synth = Buffer.from(JSON.stringify({ $or: [{ lastModified: { $lt: lastLM } }, { lastModified: null }] })).toString("base64url");
+      feedCursor = synth;
+      await metaSet(db, "feed_cursor", synth);
+      feedNoLinkStreak = 0;
+      log(`feed thieu link p=${feedPages + 1}, tu dung cursor lt=${lastLM}`);
+      await waitStop(3000);
+    } else {
+      log(`feed thieu link p=${feedPages + 1} (giu cursor cu)`);
+      await waitStop(5000);
+    }
+    return;
+  }
+  if (!nx) {
+    // Trang cuối thật (ít hơn limit, không có link): kết thúc feed, không để cursor rỗng
+    // vì lượt sau sẽ quét lại từ đầu.
+    feedPages++;
+    feedCursor = null;
+    await metaSet(db, "feed_cursor", "");
+    feedAtEnd = true; pending.feedPages = 0;
+    log("feed het cursor (trang cuoi), nghi 300s");
+    await waitStop(300000);
+    feedAtEnd = false;
+    pending.feedPages = ENABLE_FEED ? 1 : 0;
+    return;
+  }
   feedPages++;
-  feedCursor = nextCursor(j.link);
+  feedNoLinkStreak = 0;
+  feedCursor = nx;
   await metaSet(db, "feed_cursor", feedCursor || "");
   const lms = j.data.map((x) => x.lastModified).filter(Boolean);
   feedCurLt = "-";
-  try { feedCurLt = JSON.parse(Buffer.from(feedCursor || "", "base64url").toString()).$or?.[1]?.lastModified ?? "-"; } catch { }
+  try {
+    const o = JSON.parse(Buffer.from(feedCursor || "", "base64url").toString());
+    const lt = (o?.$or || []).find((c) => c && c.lastModified && typeof c.lastModified === "object")?.lastModified?.$lt;
+    feedCurLt = lt || o?.$or?.[0]?.lastModified || "-";
+  } catch { }
   if (feedPages === 1 || feedPages % 10 === 0) log(`feed pages=${feedPages} seen=${feedSeen} dup=${feedDup} enq=${feedEnq} shape=${feedShape} style=${feedStyle} lm=${lms[0] || "-"}..${lms[lms.length - 1] || "-"} next_lt=${feedCurLt}`);
   if (FEED_MAX_PAGES > 0 && feedPages >= FEED_MAX_PAGES) { feedAtEnd = true; pending.feedPages = 0; log(`feed dat gioi han ${FEED_MAX_PAGES} trang`); }
 }
@@ -404,6 +440,6 @@ try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e &&
 clearInterval(timer);
 await flushTouches(db);
 log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | ${stat()}`);
-log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_dup: feedDup, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
+log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 log(`STATUS ${JSON.stringify(await stateCounts(db))}`);
 process.exit(0);
