@@ -336,7 +336,7 @@ async function invOne(a) {
 // ---------------- role: bucket ----------------
 // Chỉ gọi /api/buckets/{user} (1 request/account), xoay vòng toàn bộ account active.
 // Không phụ thuộc inv TTL nên bucket mới được phát hiện trong vòng 1 lượt chạy.
-let bktRows = [], bktIdx = 0, bktDone = 0, bktEnq = 0, bktErr = 0, bktLoaded = false, bktAtEnd = false, bktLoading = null;
+let bktRows = [], bktIdx = 0, bktDone = 0, bktEnq = 0, bktErr = 0, bkt404 = 0, bktBusy = 0, bktLoaded = false, bktAtEnd = false, bktLoading = null;
 async function loadBkt() {
   const rows = (await db.exec("SELECT username FROM accounts WHERE junk=0 ORDER BY username")).rows.map((r) => r.username);
   bktRows = rows;
@@ -355,33 +355,38 @@ async function ensureBkt() {
 }
 async function bktOne(u) {
   const r = await req(`${base}/buckets/${encodeURIComponent(u)}`);
-  if (!Array.isArray(r.data)) { bktErr++; return; }
+  bktDone++;
+  if (!Array.isArray(r.data)) {
+    if (r.status === 404) bkt404++; else bktErr++;
+    return;
+  }
   for (const b of r.data) {
     const id = String(b.id || ""), au = id.split("/")[0];
     if (!id || (au !== u && !isFarm(au))) continue;
     if (await upsertRepoMeta(db, id, u, "bucket", b.updatedAt)) bktEnq++;
   }
-  bktDone++;
 }
 async function bktWorker() {
   if (!ENABLE_BKT) return;
   while (!stopState.stop) {
+    if (bktAtEnd) return;
     if (!(await ensureBkt())) { await sleep(5000); continue; }
     if (bktIdx >= bktRows.length) {
-      bktIdx = 0; pending.bkt = 0;
       if (!bktAtEnd) {
         bktAtEnd = true;
-        await metaSet(db, "bkt_cursor", "0");
-        log(`bkt xong vong done=${bktDone} enq=${bktEnq} err=${bktErr}`);
+        pending.bkt = 0;
+        try { await metaSet(db, "bkt_cursor", "0"); } catch { }
+        log(`bkt xong vong done=${bktDone} enq=${bktEnq} err=${bktErr} 404=${bkt404}`);
       }
       return;
     }
     const u = bktRows[bktIdx++];
     if (pending.bkt > 0) pending.bkt--;
-    try { await bktOne(u); } catch { bktErr++; }
+    bktBusy++;
+    try { await bktOne(u); } catch { bktErr++; } finally { bktBusy--; }
     if (bktDone % 250 === 0) {
-      await metaSet(db, "bkt_cursor", String(bktIdx % bktRows.length));
-      log(`bkt done=${bktDone} enq=${bktEnq} err=${bktErr}`);
+      try { await metaSet(db, "bkt_cursor", String(bktIdx % bktRows.length)); } catch { }
+      log(`bkt done=${bktDone}/${bktRows.length} enq=${bktEnq} err=${bktErr} 404=${bkt404}`);
     }
   }
   try { await metaSet(db, "bkt_cursor", String(bktRows.length ? bktIdx % bktRows.length : 0)); } catch { }
@@ -487,7 +492,7 @@ const timer = setInterval(async () => {
     try { staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
   }
   const noWork = pending.inv === 0 && pending.index === 0 && staleBacklog === 0 && pending.feedPages === 0 && pending.bkt === 0;
-  const quiet = inflight.feed + inflight.inv + inflight.index === 0;
+  const quiet = inflight.feed + inflight.inv + inflight.index === 0 && bktBusy === 0;
   if (noWork && quiet) {
     idleTicks++;
     if (idleTicks * 10000 >= IDLE_EXIT) { log("AUTO idle-exit: het viec"); stopState.stop = true; clearInterval(timer); }
@@ -501,7 +506,7 @@ for (let i = 0; i < MAXW; i++) { workers.push(invWorker()); workers.push(indexWo
 try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e && e.stack ? e.stack : e)); process.exit(1); }
 clearInterval(timer);
 await flushTouches(db);
-log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | bkt done=${bktDone} enq=${bktEnq} err=${bktErr} | ${stat()}`);
-log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, bkt_done: bktDone, bkt_enq: bktEnq, bkt_err: bktErr, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
+log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | bkt done=${bktDone} enq=${bktEnq} err=${bktErr} 404=${bkt404} | ${stat()}`);
+log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, bkt_done: bktDone, bkt_enq: bktEnq, bkt_err: bktErr, bkt_404: bkt404, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 log(`STATUS ${JSON.stringify(await stateCounts(db))}`);
 process.exit(0);
