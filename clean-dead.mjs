@@ -24,6 +24,17 @@ if (process.env.P4K_TURSO_LOCAL) {
 const DEAD = "SELECT id,kind,nfile FROM repos WHERE state='dead' AND nfile>0 LIMIT ?";
 const JUNK = "SELECT id,kind,nfile FROM repos WHERE junk=1 AND nfile>0 LIMIT ?";
 
+// Mỗi lần chạy phải quét 2 tập repos lớn (dead + junk) nên chỉ chạy tối đa 1 lần/6h.
+const GUARD_MS = Math.max(0, parseInt(process.env.P4K_CLEAN_EVERY || "21600", 10)) * 1000;
+try {
+  const prev = (await exec("SELECT val FROM meta WHERE key='clean_dead_at'")).rows[0];
+  const last = prev ? Number(prev.val) || 0 : 0;
+  if (GUARD_MS > 0 && last && Date.now() - last < GUARD_MS) {
+    console.log(`SKIP clean-dead (lan truoc ${((Date.now() - last) / 3600000).toFixed(1)}h)`);
+    process.exit(0);
+  }
+} catch { }
+
 let dead = 0, junk = 0;
 for (const [label, sql] of [["dead", DEAD], ["junk", JUNK]]) {
   let removed = 0, rounds = 0;
@@ -40,3 +51,4 @@ for (const [label, sql] of [["dead", DEAD], ["junk", JUNK]]) {
   if (label === "dead") dead = removed; else junk = removed;
 }
 console.log(`DONE dead_files=${dead} junk_files=${junk} rounds_ok`);
+try { await exec("INSERT OR REPLACE INTO meta(key,val) VALUES('clean_dead_at',?)", [String(Date.now())]); } catch { }

@@ -6,6 +6,6 @@ workers_dev = true
 [vars]
 HF_ENDPOINT = "https://huggingface.co"
 
-# 00:00, 10:00, 15:00, 19:30 giờ VN (UTC+7) = 17:00, 03:00, 08:00, 12:30 UTC
+# Mỗi giờ: crawler chạy ngắn (feed top + inv/index đến hạn) rồi tự idle-exit.
 [triggers]
-crons = ["0 3 * * *", "0 8 * * *", "30 12 * * *", "0 17 * * *"]
+crons = ["0 * * * *"]

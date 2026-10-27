@@ -1,8 +1,9 @@
 // auto.mjs — 1 process, 5 token-lane, 3 role (feed/inv/index) tự cân bằng theo backlog.
 // Chạy: HF_TOKEN="t1,t2,t3,t4,t5" node auto.mjs [giây]
 // Env: P4K_DB, P4K_GAP (ms/token), P4K_INV_TTL (bỏ trống = TTL thích ứng: has_id 5h / nrepo 7d / còn lại 14d;
-//      account junk thử lại sau 90d), P4K_REPO_TTL (ms, mặc định 1 ngày — repo done quá hạn được kiểm tra lại
-//      và ưu tiên trước feed), P4K_SLOTS (mặc định 3/token), P4K_FEED_LIMIT (mặc định 1000 mục/trang)
+//      account junk thử lại sau 1 năm), P4K_REPO_TTL (ms, mặc định 6h — repo done quá hạn được kiểm tra lại
+//      và ưu tiên trước feed), P4K_REPO_TTL_NO_ID (mặc định 12h), P4K_SLOTS (mặc định 3/token),
+//      P4K_FEED_LIMIT (mặc định 1000 mục/trang), P4K_FEED_TOP=1 (luôn quét từ đầu feed mỗi lượt)
 const P = await import(process.env.P4K_TURSO === "1" ? "./pdb-turso.mjs" : "./pdb.mjs");
 const {
   openDB, ensureSchema, metaGet, metaSet, storeTree, finishRepo, touchRepo, unclaimRepo, reevalAccount,
@@ -24,6 +25,8 @@ const START = Date.now();
 const ENABLE_FEED = process.env.P4K_FEED !== "0";
 const FEED_MAX_PAGES = parseInt(process.env.P4K_FEED_PAGES || "0", 10);
 const FEED_LIMIT = Math.max(1, Math.min(1000, parseInt(process.env.P4K_FEED_LIMIT || "1000", 10)));
+// P4K_FEED_TOP=1: luôn quét từ đầu feed mỗi lượt (lịch sử đã quét hết), không đi tiếp cursor cũ.
+const FEED_TOP = process.env.P4K_FEED_TOP === "1";
 const IDLE_EXIT = Math.max(10, parseInt(process.env.P4K_IDLE_EXIT || "30", 10)) * 1000;
 const RECOVER_MS = parseInt(process.env.P4K_RECOVER_MS || "300000", 10);
 await recoverStale(db, RECOVER_MS);
@@ -133,9 +136,9 @@ let staleBusy = 0;
 const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10));
 let wFiles = 0;
 const stopState = { stop: false };
-// TTL động: has_id=1 (có file phim) 1h, has_id=0 (không có phim) 12h
-const REPO_TTL_HAS_ID_MS = 3600000;      // 1h
-const REPO_TTL_NO_ID_MS = 43200000;      // 12h
+// TTL động: has_id=1 (có file phim) 6h, has_id=0 (không có phim) 12h
+const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10)); // 6h
+const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "43200000", 10)); // 12h
 let staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); // backlog recheck thật (đếm 1 lần, giảm dần)
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
 // refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
@@ -184,7 +187,7 @@ async function waitStop(ms) {
 }
 
 // ---------------- role: feed ----------------
-let feedCursor = (await metaGet(db, "feed_cursor")) || null;
+let feedCursor = FEED_TOP ? null : (await metaGet(db, "feed_cursor")) || null;
 let feedPages = 0, feedSeen = 0, feedEnq = 0, feedShape = 0, feedStyle = 0, feedAtEnd = false;
 // Chẩn đoán feed: đếm item trùng trong cùng run + mốc lastModified mỗi trang và của cursor.
 let feedDup = 0, feedCurLt = "-", feedNoLink = 0, feedNoLinkStreak = 0;

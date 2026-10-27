@@ -35,9 +35,10 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           P4K_TURSO: "1"
           P4K_GAP: "200"
-          P4K_FEED_PAGES: "150"
+          P4K_FEED_TOP: "1"
+          P4K_FEED_PAGES: "20"
           P4K_FEED_LIMIT: "1000"
-          P4K_REPO_TTL: "18000000"
+          P4K_REPO_TTL: "21600000"
           P4K_IDLE_EXIT: "60"
           P4K_WRITE_CAP: "200000"
         run: |
