@@ -186,6 +186,9 @@ async function waitStop(ms) {
 // ---------------- role: feed ----------------
 let feedCursor = (await metaGet(db, "feed_cursor")) || null;
 let feedPages = 0, feedSeen = 0, feedEnq = 0, feedShape = 0, feedStyle = 0, feedAtEnd = false;
+// Chẩn đoán feed: đếm item trùng trong cùng run + mốc lastModified mỗi trang và của cursor.
+let feedDup = 0, feedCurLt = "-";
+const feedIds = new Set();
 const accCache = new Map();
 async function accOf(u) {
   if (!accCache.has(u)) accCache.set(u, (await getAccount(db, u)) || null);
@@ -201,6 +204,8 @@ async function feedOne() {
   for (const x of j.data) {
     feedSeen++;
     const id = String(x.id), author = id.split("/")[0];
+    if (feedIds.has(id)) feedDup++;
+    else feedIds.add(id);
     if (!isFarmStrict(author)) continue;
     const acc = await accOf(author);
     if (acc?.junk) continue;
@@ -226,8 +231,11 @@ async function feedOne() {
   feedPages++;
   feedCursor = nextCursor(j.link);
   await metaSet(db, "feed_cursor", feedCursor || "");
+  const lms = j.data.map((x) => x.lastModified).filter(Boolean);
+  feedCurLt = "-";
+  try { feedCurLt = JSON.parse(Buffer.from(feedCursor || "", "base64url").toString()).$or?.[1]?.lastModified ?? "-"; } catch { }
+  if (feedPages === 1 || feedPages % 10 === 0) log(`feed pages=${feedPages} seen=${feedSeen} dup=${feedDup} enq=${feedEnq} shape=${feedShape} style=${feedStyle} lm=${lms[0] || "-"}..${lms[lms.length - 1] || "-"} next_lt=${feedCurLt}`);
   if (FEED_MAX_PAGES > 0 && feedPages >= FEED_MAX_PAGES) { feedAtEnd = true; pending.feedPages = 0; log(`feed dat gioi han ${FEED_MAX_PAGES} trang`); }
-  if (feedPages % 20 === 0) log(`feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} shape=${feedShape} style=${feedStyle}`);
 }
 
 // ---------------- role: inv ----------------
@@ -396,6 +404,6 @@ try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e &&
 clearInterval(timer);
 await flushTouches(db);
 log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | ${stat()}`);
-log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
+log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_dup: feedDup, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 log(`STATUS ${JSON.stringify(await stateCounts(db))}`);
 process.exit(0);
