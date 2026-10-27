@@ -38,6 +38,8 @@ const POLL_END = Math.min(DEADLINE, START + Math.max(0, parseInt(process.env.P4K
 // Lane bucket: mỗi account 1 request /api/buckets/{user}, xoay vòng 1 lượt/run.
 const ENABLE_BKT = process.env.P4K_BKT !== "0";
 const BKT_WORKERS = Math.max(1, parseInt(process.env.P4K_BKT_WORKERS || "4", 10));
+const BKT_SWEEPS = Math.max(1, parseInt(process.env.P4K_BKT_SWEEPS || "1", 10));
+const BKT_EVERY_MS = Math.max(60000, parseInt(process.env.P4K_BKT_EVERY || "900000", 10));
 const IDLE_EXIT = Math.max(10, parseInt(process.env.P4K_IDLE_EXIT || "30", 10)) * 1000;
 const RECOVER_MS = parseInt(process.env.P4K_RECOVER_MS || "300000", 10);
 await recoverStale(db, RECOVER_MS);
@@ -362,8 +364,9 @@ async function invOne(a) {
 
 // ---------------- role: bucket ----------------
 // Chỉ gọi /api/buckets/{user} (1 request/account), xoay vòng toàn bộ account active.
-// Không phụ thuộc inv TTL nên bucket mới được phát hiện trong vòng 1 lượt chạy.
-let bktRows = [], bktIdx = 0, bktDone = 0, bktEnq = 0, bktErr = 0, bkt404 = 0, bktBusy = 0, bktLoaded = false, bktAtEnd = false, bktLoading = null;
+// Không phụ thuộc inv TTL nên bucket mới được phát hiện sớm; P4K_BKT_SWEEPS vòng/run, cách P4K_BKT_EVERY ms.
+let bktRows = [], bktIdx = 0, bktDone = 0, bktEnq = 0, bktErr = 0, bkt404 = 0, bktBusy = 0, bktSweeps = 0, bktNextAt = 0, bktLoaded = false, bktAtEnd = false, bktLoading = null;
+const bktWaiting = () => bktAtEnd && bktRows.length > 0 && bktSweeps > 0 && bktSweeps < BKT_SWEEPS && bktNextAt + 60000 < DEADLINE;
 async function loadBkt() {
   const rows = (await db.exec("SELECT username FROM accounts WHERE junk=0 ORDER BY username")).rows.map((r) => r.username);
   bktRows = rows;
@@ -396,16 +399,29 @@ async function bktOne(u) {
 async function bktWorker() {
   if (!ENABLE_BKT) return;
   while (!stopState.stop) {
-    if (bktAtEnd) return;
     if (!(await ensureBkt())) { await sleep(5000); continue; }
+    if (bktAtEnd) {
+      // Chờ tới lượt quét kế tiếp; cờ đổi trước await nên chỉ 1 worker mở vòng.
+      if (bktWaiting() && Date.now() >= bktNextAt) {
+        bktAtEnd = false;
+        bktIdx = 0;
+        pending.bkt = bktRows.length;
+        log(`bkt vong #${bktSweeps + 1} bat dau`);
+      } else {
+        await sleep(5000);
+      }
+      continue;
+    }
     if (bktIdx >= bktRows.length) {
       if (!bktAtEnd) {
         bktAtEnd = true;
         pending.bkt = 0;
+        bktSweeps++;
+        bktNextAt = Date.now() + BKT_EVERY_MS;
         try { await metaSet(db, "bkt_cursor", "0"); } catch { }
-        log(`bkt xong vong done=${bktDone} enq=${bktEnq} err=${bktErr} 404=${bkt404}`);
+        log(`bkt xong vong #${bktSweeps} done=${bktDone} enq=${bktEnq} err=${bktErr} 404=${bkt404}`);
       }
-      return;
+      continue;
     }
     const u = bktRows[bktIdx++];
     if (pending.bkt > 0) pending.bkt--;
@@ -505,7 +521,7 @@ async function indexWorker() {
 }
 
 // ---------------- main ----------------
-log(`AUTO start ttl_has_id=${REPO_TTL_HAS_ID_MS/3600000}h ttl_no_id=${REPO_TTL_NO_ID_MS/3600000}h db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} poll=${POLL_MS ? `${POLL_MS/1000}s/${Math.max(0, Math.round((POLL_END - START) / 1000))}s` : "off"} bkt=${ENABLE_BKT ? BKT_WORKERS : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
+log(`AUTO start ttl_has_id=${REPO_TTL_HAS_ID_MS/3600000}h ttl_no_id=${REPO_TTL_NO_ID_MS/3600000}h db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} poll=${POLL_MS ? `${POLL_MS/1000}s/${Math.max(0, Math.round((POLL_END - START) / 1000))}s` : "off"} bkt=${ENABLE_BKT ? `${BKT_WORKERS}x${BKT_SWEEPS}/${BKT_EVERY_MS/1000}s` : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
 await refreshInv();
 await rebalance();
 let idleTicks = 0, tickN = 0;
@@ -518,7 +534,7 @@ const timer = setInterval(async () => {
     recoverStale(db, 300000).catch(() => {});
     try { staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
   }
-  const noWork = pending.inv === 0 && pending.index === 0 && staleBacklog === 0 && pending.feedPages === 0 && pending.bkt === 0 && !feedPolling;
+  const noWork = pending.inv === 0 && pending.index === 0 && staleBacklog === 0 && pending.feedPages === 0 && pending.bkt === 0 && !feedPolling && !bktWaiting();
   const quiet = inflight.feed + inflight.inv + inflight.index === 0 && bktBusy === 0;
   if (noWork && quiet) {
     idleTicks++;
@@ -533,7 +549,7 @@ for (let i = 0; i < MAXW; i++) { workers.push(invWorker()); workers.push(indexWo
 try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e && e.stack ? e.stack : e)); process.exit(1); }
 clearInterval(timer);
 await flushTouches(db);
-log(`AUTO done feed pages=${feedPagesAll} enq=${feedEnq} poll=${feedPollN} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | bkt done=${bktDone} enq=${bktEnq} err=${bktErr} 404=${bkt404} | ${stat()}`);
-log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPagesAll, feed_poll: feedPollN, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, bkt_done: bktDone, bkt_enq: bktEnq, bkt_err: bktErr, bkt_404: bkt404, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
+log(`AUTO done feed pages=${feedPagesAll} enq=${feedEnq} poll=${feedPollN} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | bkt done=${bktDone} sweeps=${bktSweeps} enq=${bktEnq} err=${bktErr} 404=${bkt404} | ${stat()}`);
+log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPagesAll, feed_poll: feedPollN, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, bkt_done: bktDone, bkt_sweeps: bktSweeps, bkt_enq: bktEnq, bkt_err: bktErr, bkt_404: bkt404, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 log(`STATUS ${JSON.stringify(await stateCounts(db))}`);
 process.exit(0);
