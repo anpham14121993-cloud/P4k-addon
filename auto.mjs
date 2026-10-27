@@ -3,7 +3,8 @@
 // Env: P4K_DB, P4K_GAP (ms/token), P4K_INV_TTL (bỏ trống = TTL thích ứng: has_id 5h / nrepo 7d / còn lại 14d;
 //      account junk thử lại sau 1 năm), P4K_REPO_TTL (ms, mặc định 6h — repo done quá hạn được kiểm tra lại
 //      và ưu tiên trước feed), P4K_REPO_TTL_NO_ID (mặc định 12h), P4K_SLOTS (mặc định 3/token),
-//      P4K_FEED_LIMIT (mặc định 1000 mục/trang), P4K_FEED_TOP=1 (luôn quét từ đầu feed mỗi lượt)
+//      P4K_FEED_LIMIT (mặc định 1000 mục/trang), P4K_FEED_TOP=1 (luôn quét từ đầu feed mỗi lượt),
+//      P4K_BKT=0 (tắt lane bucket), P4K_BKT_WORKERS (mặc định 4)
 const P = await import(process.env.P4K_TURSO === "1" ? "./pdb-turso.mjs" : "./pdb.mjs");
 const {
   openDB, ensureSchema, metaGet, metaSet, storeTree, finishRepo, touchRepo, unclaimRepo, reevalAccount,
@@ -27,6 +28,9 @@ const FEED_MAX_PAGES = parseInt(process.env.P4K_FEED_PAGES || "0", 10);
 const FEED_LIMIT = Math.max(1, Math.min(1000, parseInt(process.env.P4K_FEED_LIMIT || "1000", 10)));
 // P4K_FEED_TOP=1: luôn quét từ đầu feed mỗi lượt (lịch sử đã quét hết), không đi tiếp cursor cũ.
 const FEED_TOP = process.env.P4K_FEED_TOP === "1";
+// Lane bucket: mỗi account 1 request /api/buckets/{user}, xoay vòng 1 lượt/run.
+const ENABLE_BKT = process.env.P4K_BKT !== "0";
+const BKT_WORKERS = Math.max(1, parseInt(process.env.P4K_BKT_WORKERS || "4", 10));
 const IDLE_EXIT = Math.max(10, parseInt(process.env.P4K_IDLE_EXIT || "30", 10)) * 1000;
 const RECOVER_MS = parseInt(process.env.P4K_RECOVER_MS || "300000", 10);
 await recoverStale(db, RECOVER_MS);
@@ -130,7 +134,7 @@ async function repoInfo(kind, id) {
 const TOTAL = Math.max(1, lanes.length * SLOTS_PER_TOKEN);
 const limits = { feed: 1, inv: 1, index: 1 };
 const inflight = { feed: 0, inv: 0, index: 0 };
-let pending = { inv: 1, index: 0, recheck: 0, feedPages: ENABLE_FEED ? 1 : 0 }; // inv=1 để role inv có slot ngay, refreshInv sẽ chỉnh lại
+let pending = { inv: 1, index: 0, recheck: 0, feedPages: ENABLE_FEED ? 1 : 0, bkt: 0 }; // inv=1 để role inv có slot ngay, refreshInv sẽ chỉnh lại
 let staleBusy = 0;
 // Quota ghi của Turso free = 10M dòng/tháng -> giới hạn số dòng file ghi mỗi run (P4K_WRITE_CAP, 0 = không giới hạn).
 const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10));
@@ -329,6 +333,60 @@ async function invOne(a) {
   else { invFail++; invTried.set(u, Date.now() + 10 * 60e3); if (pending.inv > 0) pending.inv--; }
 }
 
+// ---------------- role: bucket ----------------
+// Chỉ gọi /api/buckets/{user} (1 request/account), xoay vòng toàn bộ account active.
+// Không phụ thuộc inv TTL nên bucket mới được phát hiện trong vòng 1 lượt chạy.
+let bktRows = [], bktIdx = 0, bktDone = 0, bktEnq = 0, bktErr = 0, bktLoaded = false, bktAtEnd = false, bktLoading = null;
+async function loadBkt() {
+  const rows = (await db.exec("SELECT username FROM accounts WHERE junk=0 ORDER BY username")).rows.map((r) => r.username);
+  bktRows = rows;
+  const saved = parseInt((await metaGet(db, "bkt_cursor")) || "0", 10) || 0;
+  bktIdx = rows.length ? saved % rows.length : 0;
+  bktLoaded = true;
+  pending.bkt = rows.length ? rows.length - bktIdx : 0;
+  log(`bkt sweep accounts=${rows.length} start=${bktIdx}`);
+}
+async function ensureBkt() {
+  if (!bktLoaded) {
+    if (!bktLoading) bktLoading = loadBkt().catch(() => { bktLoading = null; });
+    await bktLoading;
+  }
+  return bktLoaded;
+}
+async function bktOne(u) {
+  const r = await req(`${base}/buckets/${encodeURIComponent(u)}`);
+  if (!Array.isArray(r.data)) { bktErr++; return; }
+  for (const b of r.data) {
+    const id = String(b.id || ""), au = id.split("/")[0];
+    if (!id || (au !== u && !isFarm(au))) continue;
+    if (await upsertRepoMeta(db, id, u, "bucket", b.updatedAt)) bktEnq++;
+  }
+  bktDone++;
+}
+async function bktWorker() {
+  if (!ENABLE_BKT) return;
+  while (!stopState.stop) {
+    if (!(await ensureBkt())) { await sleep(5000); continue; }
+    if (bktIdx >= bktRows.length) {
+      bktIdx = 0; pending.bkt = 0;
+      if (!bktAtEnd) {
+        bktAtEnd = true;
+        await metaSet(db, "bkt_cursor", "0");
+        log(`bkt xong vong done=${bktDone} enq=${bktEnq} err=${bktErr}`);
+      }
+      return;
+    }
+    const u = bktRows[bktIdx++];
+    if (pending.bkt > 0) pending.bkt--;
+    try { await bktOne(u); } catch { bktErr++; }
+    if (bktDone % 250 === 0) {
+      await metaSet(db, "bkt_cursor", String(bktIdx % bktRows.length));
+      log(`bkt done=${bktDone} enq=${bktEnq} err=${bktErr}`);
+    }
+  }
+  try { await metaSet(db, "bkt_cursor", String(bktRows.length ? bktIdx % bktRows.length : 0)); } catch { }
+}
+
 // ---------------- role: index ----------------
 let idxN = 0, idxInc = 0;
 async function indexOne() {
@@ -415,7 +473,7 @@ async function indexWorker() {
 }
 
 // ---------------- main ----------------
-log(`AUTO start ttl_has_id=${REPO_TTL_HAS_ID_MS/3600000}h ttl_no_id=${REPO_TTL_NO_ID_MS/3600000}h db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
+log(`AUTO start ttl_has_id=${REPO_TTL_HAS_ID_MS/3600000}h ttl_no_id=${REPO_TTL_NO_ID_MS/3600000}h db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} bkt=${ENABLE_BKT ? BKT_WORKERS : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
 await refreshInv();
 await rebalance();
 let idleTicks = 0, tickN = 0;
@@ -428,7 +486,7 @@ const timer = setInterval(async () => {
     recoverStale(db, 300000).catch(() => {});
     try { staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
   }
-  const noWork = pending.inv === 0 && pending.index === 0 && staleBacklog === 0 && pending.feedPages === 0;
+  const noWork = pending.inv === 0 && pending.index === 0 && staleBacklog === 0 && pending.feedPages === 0 && pending.bkt === 0;
   const quiet = inflight.feed + inflight.inv + inflight.index === 0;
   if (noWork && quiet) {
     idleTicks++;
@@ -438,11 +496,12 @@ const timer = setInterval(async () => {
 for (const t of ["SIGINT", "SIGTERM"]) process.on(t, () => { log(`AUTO ${t} -> stop`); stopState.stop = true; });
 const workers = [];
 if (ENABLE_FEED) workers.push(feedWorker());
+if (ENABLE_BKT) for (let i = 0; i < BKT_WORKERS; i++) workers.push(bktWorker());
 for (let i = 0; i < MAXW; i++) { workers.push(invWorker()); workers.push(indexWorker()); }
 try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e && e.stack ? e.stack : e)); process.exit(1); }
 clearInterval(timer);
 await flushTouches(db);
-log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | ${stat()}`);
-log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
+log(`AUTO done feed pages=${feedPages} seen=${feedSeen} enq=${feedEnq} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | bkt done=${bktDone} enq=${bktEnq} err=${bktErr} | ${stat()}`);
+log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPages, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, bkt_done: bktDone, bkt_enq: bktEnq, bkt_err: bktErr, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 log(`STATUS ${JSON.stringify(await stateCounts(db))}`);
 process.exit(0);

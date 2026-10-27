@@ -38,6 +38,8 @@ jobs:
           P4K_FEED_TOP: "1"
           P4K_FEED_PAGES: "20"
           P4K_FEED_LIMIT: "1000"
+          P4K_BKT: "1"
+          P4K_BKT_WORKERS: "4"
           P4K_REPO_TTL: "21600000"
           P4K_IDLE_EXIT: "60"
           P4K_WRITE_CAP: "200000"
