@@ -1,0 +1,40 @@
+name: salvage-new
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Số lượng repo kiểm tra (tối đa 2600)"
+        default: "1500"
+        required: false
+
+concurrency:
+  group: salvage
+  cancel-in-progress: false
+
+jobs:
+  salvage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Quét giải cứu repo 'new' nghi vấn
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          P4K_TURSO: "1"
+        run: |
+          set -o pipefail
+          node salvage-new.mjs "${{ github.event.inputs.limit || '1500' }}" 2>&1 | tee salvage.log
+      - name: Báo cáo kết quả
+        if: always()
+        run: |
+          echo "### Kết quả Salvage New Repos" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          grep -A 15 "TỔNG KẾT SALVAGE" salvage.log >> "$GITHUB_STEP_SUMMARY" || tail -20 salvage.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
