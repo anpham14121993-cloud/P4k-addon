@@ -1222,15 +1222,16 @@ function collectEpisodeSources(d, season, episode) {
     if (seen.has(dedup)) continue;
     seen.add(dedup);
     const subLangs = Array.isArray(e.subtitle) ? e.subtitle.map((x) => x && (x.srclang || x.language)).filter(Boolean) : [];
+    const srcObj = {
+      title: d.title, season: wS, episode: wE, source: e.episodes_name, subtitle: e.subtitle,
+      container: e.file_type, variant: (s && (s.seasons_name || s.season_name)) || "", subtitleLangs: subLangs,
+      releaseInfo: d.video_quality,
+    };
     out.push({
       fileUrl,
-      label: buildStreamTitle({
-        title: d.title, season: wS, episode: wE, source: e.episodes_name, subtitle: e.subtitle,
-        container: e.file_type, variant: (s && (s.seasons_name || s.season_name)) || "", subtitleLangs: subLangs,
-        releaseInfo: d.video_quality,
-      }),
+      label: buildStreamTitle(srcObj),
       subtitles: e.subtitle,
-      w: streamTierScore([(e && e.episodes_name), (s && (s.seasons_name || s.season_name)), (d && d.video_quality)].filter(Boolean).join(" ")),
+      w: streamTierScore(e.episodes_name, srcObj),
     });
   }
   return out;
@@ -1488,12 +1489,24 @@ const MAX_STREAMS = Infinity; // không giới hạn số luồng — trả đ�
 //   CHẤT LƯỢNG: 4K > FHD > 720p > HD > CAM/TS
 //   NGUỒN:      BluRay Remux > BluRay > Web-DL > WebRip > BDRip > HDRip > DVDRip
 //   DUNG LƯỢNG: lớn hơn xếp trước (HDR/codec/audio chỉ là tiêu chí phụ).
-function streamTierScore(label) {
+function streamTierScore(label, extra = {}) {
   const s = String(label || "").replace(/_/g, " ").toUpperCase();
-  const q = /\b(2160P|2160|4K|UHD)\b/.test(s) ? 5
-    : /\b(1080P|1080|FULL.?HD|FHD)\b/.test(s) ? 4
-    : /\b(720P|720)\b/.test(s) ? 3
-    : /\b(CAM|TS)\b/.test(s) ? 1 : 2;
+  const ctx = String([extra.variant, extra.releaseInfo].filter(Boolean).join(" ")).replace(/_/g, " ").toUpperCase();
+  const allText = (s + " " + ctx).trim();
+
+  // Ưu tiên trích xuất từ chính tên file trước (nếu tên file có 1080p thì chắc chắn là FHD).
+  // Chỉ khi tên file không có độ phân giải mới xét đến variant (tên season) hoặc releaseInfo.
+  const qMatch = s.match(/\b(2160P|2160|4K|UHD|1080P|1080|FULL.?HD|FHD|720P|720|MHD|HD|CAM|TS)\b/)
+              || allText.match(/\b(2160P|2160|4K|UHD|1080P|1080|FULL.?HD|FHD|720P|720|MHD|HD|CAM|TS)\b/);
+  let q = 2;
+  if (qMatch) {
+    const t = qMatch[1].replace(/\s+/g, "").toUpperCase();
+    q = /2160P|2160|4K|UHD/.test(t) ? 5       // 4K
+      : /1080P|1080|FULL.?HD|FHD/.test(t) ? 4 // FHD
+      : /720P|720/.test(t) ? 3                // 720p
+      : /CAM|TS/.test(t) ? 1 : 2;             // CAM hoặc HD
+  }
+
   const src = /\b(BDREMUX|REMUX)\b/.test(s) ? 7
     : /\b(BLURAY|BLU-?RAY|BLU)\b/.test(s) ? 6
     : /\b(WEB-?DL|WEBDL)\b/.test(s) ? 5
@@ -1501,19 +1514,25 @@ function streamTierScore(label) {
     : /\b(BRRIP)\b/.test(s) ? 3
     : /\b(HDRIP)\b/.test(s) ? 2
     : /\b(DVDRIP)\b/.test(s) ? 1 : 0;
+
   let gb = 0;
   const sz = s.match(/\b([\d.]+)\s*(TB|GB|MB)\b/);
   if (sz) {
     const n = parseFloat(sz[1]) || 0;
     gb = sz[2] === "TB" ? n * 1024 : sz[2] === "MB" ? n / 1024 : n;
   }
+
   let tie = 0;
-  if (/HDR10\+/.test(s)) tie += 40;
-  else if (/\bHDR\b|DOLBY.?VISION|\bDV\b/.test(s)) tie += 30;
-  if (/\b(HEVC|H\.?265|X\.?265)\b/.test(s)) tie += 10;
-  if (/\b10BIT\b/.test(s)) tie += 5;
-  if (/\b60FPS\b/.test(s)) tie += 5;
+  if (/HDR10\+/.test(allText)) tie += 40;
+  else if (/\bHDR\b|DOLBY.?VISION|\bDV\b/.test(allText)) tie += 30;
+  if (/\b(HEVC|H\.?265|X\.?265)\b/.test(allText)) tie += 10;
+  if (/\b10BIT\b/.test(allText)) tie += 5;
+  if (/\b60FPS\b/.test(allText)) tie += 5;
+
   // Trọng số tách tầng: quality(1e9) > nguồn(1e7) > dung lượng(<1e7) > phụ(<1000).
+  // 4K: q=5 -> tối thiểu 5.000.000.000 điểm.
+  // FHD: q=4 -> tối đa 4.079.999.040 điểm (kể cả Remux 100GB).
+  // Vì vậy mọi file 4K luôn luôn đứng trước FHD bất kể dung lượng và loại nguồn.
   return q * 1e9 + src * 1e7 + Math.min(Math.round(gb), 9999) * 1000 + tie;
 }
 
@@ -1615,17 +1634,20 @@ async function handleStream(type, id, cfg, ms, opts) {
   if (metaType === "movie") {
     const d = await getDetailCached(realId, "movie", cfg, ms);
     if (!d || !d.videos_id) throw new HttpError(404, "detail not found");
-    const items = (Array.isArray(d.videos) ? d.videos : []).map((v) => ({
-      fileUrl: v.file_url,
-      label: buildStreamTitle({
+    const items = (Array.isArray(d.videos) ? d.videos : []).map((v) => {
+      const srcObj = {
         title: d.title, source: v.label, subtitle: v.subtitle,
         container: v.file_type,
         subtitleLangs: Array.isArray(v.subtitle) ? v.subtitle.map((x) => x && (x.srclang || x.language)).filter(Boolean) : [],
         releaseInfo: d.video_quality,
-      }),
-      subtitles: v.subtitle,
-      w: streamTierScore([(v && v.label), (d && d.video_quality)].filter(Boolean).join(" ")),
-    }));
+      };
+      return {
+        fileUrl: v.file_url,
+        label: buildStreamTitle(srcObj),
+        subtitles: v.subtitle,
+        w: streamTierScore(v.label, srcObj),
+      };
+    });
     // Đủ mọi luồng theo ý người dùng, nhưng chặn trần 40 file để không vượt
     // giới hạn subrequest của CF (mặc định 50/đợt gọi) — ghi đè bằng ?maxstreams=.
     const MAX_STREAMS_HARD = 40;
