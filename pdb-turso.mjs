@@ -278,8 +278,15 @@ export async function claimRepo(db, worker, kind = null) {
   return null;
 }
 
+const lmSeen = new Map(); // kind:id -> lastModified đã xử lý trong run
 export async function upsertRepoMeta(db, id, account, kind, lastModified) {
   const lm = lastModified ? Date.parse(lastModified) || 0 : 0;
+  // Cùng repo xuất hiện lại trong run (feed trùng, bucket sweep #2, feed chồng
+  // bucket) với cùng lastModified thì kết quả không đổi -> bỏ lượt đọc PK.
+  const seenKey = kind + ":" + id;
+  if (lmSeen.get(seenKey) === lm) return false;
+  if (lmSeen.size > 50000) lmSeen.clear();
+  lmSeen.set(seenKey, lm);
   if (!accCache.has(account)) {
     const a = await db.exec("SELECT has_id,nrepo,junk FROM accounts WHERE username=?", [account]);
     accCache.set(account, a.rows[0] || {});

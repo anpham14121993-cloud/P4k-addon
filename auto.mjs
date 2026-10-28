@@ -240,8 +240,8 @@ async function feedOne() {
   for (const x of j.data) {
     feedSeen++;
     const id = String(x.id), author = id.split("/")[0];
-    if (feedIds.has(id)) feedDup++;
-    else feedIds.add(id);
+    if (feedIds.has(id)) { feedDup++; continue; } // trùng trong run: đã xử lý rồi, khỏi đọc DB lại
+    feedIds.add(id);
     if (!isFarmStrict(author)) continue;
     const acc = await accOf(author);
     if (acc?.junk) continue;
@@ -260,8 +260,10 @@ async function feedOne() {
     const hyphenWord = rbase.includes("-") && /^[A-Za-z0-9-]{3,30}$/.test(rbase);
     const take = isSelf || hasId || (oneWord && lowerNum) || (capWord && lowerNum) || (hasId && hyphenWord);
     if (!take) { feedShape++; continue; }
-    if (await insertAccount(db, author)) pending.inv++; // account mới = đến hạn quét ngay
-    accCache.delete(author);
+    if (!acc) { // account đã có trong DB thì INSERT OR IGNORE là thừa (1 lượt đọc PK)
+      if (await insertAccount(db, author)) pending.inv++; // account mới = đến hạn quét ngay
+      accCache.delete(author);
+    }
     if (await upsertRepoMeta(db, id, author, "dataset", x.lastModified)) feedEnq++;
   }
   const nx = nextCursor(j.link);
@@ -551,5 +553,17 @@ clearInterval(timer);
 await flushTouches(db);
 log(`AUTO done feed pages=${feedPagesAll} enq=${feedEnq} poll=${feedPollN} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | bkt done=${bktDone} sweeps=${bktSweeps} enq=${bktEnq} err=${bktErr} 404=${bkt404} | ${stat()}`);
 log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPagesAll, feed_poll: feedPollN, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, bkt_done: bktDone, bkt_sweeps: bktSweeps, bkt_enq: bktEnq, bkt_err: bktErr, bkt_404: bkt404, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
-log(`STATUS ${JSON.stringify(await stateCounts(db))}`);
+// STATUS chỉ để theo dõi; GROUP BY state quét covering index toàn bộ repos
+// (~242k dòng read mỗi lần — chiếm ~94% reads/run). Cache 6h trong meta: các
+// run sau chỉ đọc 1 dòng thay vì quét cả bảng, số liệu lệch tối đa 6h.
+let statusRows = null;
+try {
+  const c = JSON.parse((await metaGet(db, "state_counts_v1")) || "null");
+  if (c && Array.isArray(c.rows) && Date.now() - c.at < 6 * 3600e3) statusRows = c.rows;
+} catch { }
+if (!statusRows) {
+  statusRows = await stateCounts(db);
+  try { await metaSet(db, "state_counts_v1", JSON.stringify({ at: Date.now(), rows: statusRows })); } catch { }
+}
+log(`STATUS ${JSON.stringify(statusRows)}`);
 process.exit(0);
