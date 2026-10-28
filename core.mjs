@@ -1230,7 +1230,7 @@ function collectEpisodeSources(d, season, episode) {
         releaseInfo: d.video_quality,
       }),
       subtitles: e.subtitle,
-      w: streamTierScore(String((e && e.episodes_name) || "")),
+      w: streamTierScore([(e && e.episodes_name), (s && (s.seasons_name || s.season_name)), (d && d.video_quality)].filter(Boolean).join(" ")),
     });
   }
   return out;
@@ -1380,60 +1380,106 @@ async function fetchDetail(videosId, type, cfg, ms) {
 //   🔊 Chuẩn âm thanh
 //   🌐 Ngôn ngữ · Phụ đề (PĐ / TM / PĐ-TM)
 //   💾 Dung lượng (MB/GB/TB)
-function parseStreamMeta(source, subtitle) {
-  const s = String(source || "").toUpperCase();
-  const m = { quality: "-", video: "-", hdr: [], audio: [], size: "-", lang: [], subCount: 0, container: "-" };
+function parseStreamMeta(source, subtitle, extraContext = {}) {
+  const s = String(source || "").replace(/_/g, " ").toUpperCase();
+  const ctx = String([extraContext.variant, extraContext.releaseInfo].filter(Boolean).join(" ")).replace(/_/g, " ").toUpperCase();
+  const allText = (s + " " + ctx).trim();
+
+  const m = { quality: "-", video: "-", hdr: [], audio: [], size: "-", lang: [], container: "-" };
+
+  // 1. Container: ưu tiên đuôi file thực từ source, fallback về container API nếu hợp lệ
   const ct = s.match(/\.(MKV|MP4|AVI|MOV|WEBM|M2TS|TS)\b/);
-  if (ct) m.container = ct[1];
+  const VALID_CONTAINERS = new Set(["MKV", "MP4", "AVI", "MOV", "WEBM", "M2TS", "TS"]);
+  if (ct) {
+    m.container = ct[1];
+  } else if (extraContext.container) {
+    const cUpper = String(extraContext.container).toUpperCase();
+    if (VALID_CONTAINERS.has(cUpper)) m.container = cUpper;
+  }
+
+  // 2. Dung lượng
   const sz = s.match(/\b(\d[\d.,]*)\s?(GB|MB|TB)\b/);
   if (sz) m.size = sz[1] + " " + sz[2];
-  const q = s.match(/\b(2160P|2160|4K|UHD|1080P|1080|FHD|720P|720|MHD|HD|CAM|TS)\b/);
+
+  // 3. Chất lượng (Quality): ưu tiên tên file, dự phòng sang variant / releaseInfo
+  const q = s.match(/\b(2160P|2160|4K|UHD|1080P|1080|FULL.?HD|FHD|720P|720|MHD|HD|CAM|TS)\b/)
+         || allText.match(/\b(2160P|2160|4K|UHD|1080P|1080|FULL.?HD|FHD|720P|720|MHD|HD|CAM|TS)\b/);
   if (q) {
-    const t = q[1].toUpperCase();
-    m.quality = /2160P|4K|UHD/.test(t) ? "4K"
-      : /1080P|1080|FHD/.test(t) ? "FHD"
+    const t = q[1].replace(/\s+/g, "").toUpperCase();
+    m.quality = /2160P|2160|4K|UHD/.test(t) ? "4K"
+      : /1080P|1080|FULL.?HD|FHD/.test(t) ? "FHD"
       : /720P|720/.test(t) ? "720p"
       : /CAM|TS/.test(t) ? "CAM" : "HD";
   }
-  const vc = s.match(/\b(X265|H265|HEVC|X264|H264|AVC|VC-1|AV1|VP9|MPEG-?4|DIVX|XVID)\b/);
+
+  // 4. Codec Video (nhận diện cả H.264, H.265, X.264, X.265 có dấu chấm)
+  const vc = s.match(/\b(X\.?265|H\.?265|HEVC|X\.?264|H\.?264|AVC|VC-1|AV1|VP9|MPEG-?4|DIVX|XVID)\b/);
   if (vc) {
-    const t = vc[1].toUpperCase();
+    const t = vc[1].replace(/\./g, "").toUpperCase();
     m.video = /HEVC/.test(t) ? "H265"
-      : /H26[45]/.test(t) ? t.replace(/\./g, "")
+      : /H26[45]/.test(t) ? t
+      : /X26[45]/.test(t) ? t
       : /AV1/.test(t) ? "AV1" : /VP9/.test(t) ? "VP9" : t;
   }
   if (/\b10BIT\b/.test(s) && m.video !== "-") m.video += " (10bit)";
+
+  // 5. Nguồn phát (Source)
   if (/\b(BDREMUX|REMUX)\b/.test(s)) m.source = "BluRay Remux";
   else if (/\b(WEBRIP)\b/.test(s)) m.source = "WebRip";
-  else if (/\b(WEB-?DL)\b/.test(s)) m.source = "WEB-DL";
+  else if (/\b(WEB-?DL|WEBDL)\b/.test(s)) m.source = "WEB-DL";
   else if (/\b(BLURAY|BLU-?RAY|BLU)\b/.test(s)) m.source = "BluRay";
   else if (/\b(BRRIP)\b/.test(s)) m.source = "BDRip";
   else if (/\b(HDRIP)\b/.test(s)) m.source = "HDRip";
   else if (/\b(DVDRIP)\b/.test(s)) m.source = "DVDRip";
+  else if (/\b(HDTV)\b/.test(s)) m.source = "HDTV";
+  else if (/\bWEB\b/.test(s)) m.source = "WEB";
   else m.source = "";
-  if (/DOLBY.?VISION|\bDOVI\b|\bDV\b/.test(s)) m.hdr.push("Dolby Vision");
-  if (/HDR10\s*\+|HDR10 ?PLUS|HDR ?\+|HDR ?PLUS/.test(s)) m.hdr.push("HDR10+");
-  else if (/\bHDR10\b/.test(s)) m.hdr.push("HDR10");
-  else if (/\bHLG\b/.test(s)) m.hdr.push("HLG");
-  else if (/\bHDR\b/.test(s)) m.hdr.push("HDR");
-  if (/ATMOS/.test(s)) m.audio.push("Atmos");
-  if (/TRUEHD/.test(s)) m.audio.push("TRUEHD");
-  if (/DTS-HD/.test(s)) m.audio.push("DTS-HD");
-  else if (/\bDTS\b/.test(s)) m.audio.push("DTS");
-  if (/\bDDP|EAC-?3|AC-?3|DOLBY.?DIGITAL/.test(s)) m.audio.push("DDP/EAC3");
-  if (/AAC/.test(s)) m.audio.push("AAC");
-  if (/FLAC/.test(s)) m.audio.push("FLAC");
-  const ch = s.match(/[2567]\.1|2\.0|MONO/);
-  if (ch) m.audio.push(ch[0]);
-  // Định dạng nguồn Việt: PĐ (phụ đề) · TM (thuyết minh) · LT (lồng tiếng);
-  // gộp bằng "-" khi nguồn có nhiều định dạng (vd: PĐ-TM, PĐ-LT, PĐ-TM-LT).
-  const hasSub = /\bVIE\b|VIET.?SUB|\bVST\b|PHỤ.?ĐỀ|PHU.?DE|\bPĐ\b|SUBBED|SUBTITLE|SUBVIET/.test(s);
-  const hasTM = /THUYET.?MINH|THUYẾT.?MINH|THUYETMINH|\bTM\b|T\.M\b/.test(s);
-  const hasLT = /LỒNG.?TIẾNG|LONG.?TIENG|LỒNG TIẾNG|\bLT\b|DUBBED/.test(s);
-  const vnTag = [hasSub && "PĐ", hasTM && "TM", hasLT && "LT"].filter(Boolean).join("-");
-  if (vnTag) m.lang.push(vnTag);
+
+  // 6. HDR / Dải động (quét cả trong tên file và context)
+  if (/DOLBY.?VISION|\bDOVI\b|\bDV\b/.test(allText)) m.hdr.push("Dolby Vision");
+  if (/HDR10\s*\+|HDR10 ?PLUS|HDR ?\+|HDR ?PLUS/.test(allText)) m.hdr.push("HDR10+");
+  else if (/\bHDR10\b/.test(allText)) m.hdr.push("HDR10");
+  else if (/\bHLG\b/.test(allText)) m.hdr.push("HLG");
+  else if (/\bHDR\b/.test(allText)) m.hdr.push("HDR");
+  else if (/\bEDR\b/.test(allText)) m.hdr.push("EDR");
+  else if (/\bSDR\b/.test(allText)) m.hdr.push("SDR");
+  if (/\b60FPS\b/.test(allText)) m.hdr.push("60fps");
+
+  // 7. Âm thanh (Audio)
+  if (/ATMOS/.test(allText)) m.audio.push("Atmos");
+  if (/TRUEHD/.test(allText)) m.audio.push("TRUEHD");
+  if (/DTS-HD/.test(allText)) m.audio.push("DTS-HD");
+  else if (/\bDTS\b/.test(allText)) m.audio.push("DTS");
+  if (/\bDDP|EAC-?3|AC-?3|DOLBY.?DIGITAL|\bDD\b|\bDD\+/.test(allText)) m.audio.push("DDP/EAC3");
+  if (/AAC/.test(allText)) m.audio.push("AAC");
+  if (/FLAC/.test(allText)) m.audio.push("FLAC");
+  const ch = allText.match(/\b([2567]\.1|2\.0|MONO)\b/)
+          || allText.match(/(?:DDP|DD\+|DD|EAC-?3|AC-?3|TRUEHD|DTS-HD|DTS|AAC)[._\s]*([2567])[._\s]*([01])(?!\d)/i);
+  if (ch) {
+    if (ch[2] !== undefined) m.audio.push(ch[1] + "." + ch[2]);
+    else m.audio.push(ch[1]);
+  }
+
+  // 8. Định dạng nguồn Việt / Phụ đề / Thuyết minh / Lồng tiếng
+  const hasSub = /(?:^|[^a-zA-Z0-9])(?:P[ĐD]|PHỤ\s?ĐỀ|PHU\s?DE|VIET\s?SUB|VST|SUBTITLE)(?:$|[^a-zA-Z0-9])|\bVIE\b|\bSUB\b/i.test(allText)
+    || (Array.isArray(subtitle) && subtitle.length > 0)
+    || (Array.isArray(extraContext.subtitleLangs) && extraContext.subtitleLangs.length > 0);
+  const hasTM = /THUYET.?MINH|THUYẾT.?MINH|THUYETMINH|(?:^|[^a-zA-Z0-9])(?:TM|T\.M)(?:$|[^a-zA-Z0-9])/i.test(allText);
+  const hasLT = /LỒNG.?TIẾNG|LONG.?TIENG|LỒNG TIẾNG|(?:^|[^a-zA-Z0-9])LT(?:$|[^a-zA-Z0-9])|DUBBED/i.test(allText);
+  const hasAI = /(?:^|[^a-zA-Z0-9])AI(?:$|[^a-zA-Z0-9])/i.test(allText);
+  const hasVS = /(?:^|[^a-zA-Z0-9])VS(?:$|[^a-zA-Z0-9])/i.test(allText);
+
+  const tags = [];
+  if (hasSub) tags.push("PĐ");
+  if (hasTM) tags.push(hasAI ? "TM (AI)" : "TM");
+  else if (hasAI) tags.push("AI");
+  if (hasLT) tags.push("LT");
+  if (hasVS && !hasSub) tags.push("VS");
+  m.lang = tags;
+
   m.audio = [...new Set(m.audio)];
   m.lang = [...new Set(m.lang)];
+  m.hdr = [...new Set(m.hdr)];
   return m;
 }
 const MAX_STREAMS = Infinity; // không giới hạn số luồng — trả đủ mọi file; ép xuống bằng ?maxstreams=N
@@ -1443,14 +1489,14 @@ const MAX_STREAMS = Infinity; // không giới hạn số luồng — trả đ�
 //   NGUỒN:      BluRay Remux > BluRay > Web-DL > WebRip > BDRip > HDRip > DVDRip
 //   DUNG LƯỢNG: lớn hơn xếp trước (HDR/codec/audio chỉ là tiêu chí phụ).
 function streamTierScore(label) {
-  const s = String(label || "").toUpperCase();
+  const s = String(label || "").replace(/_/g, " ").toUpperCase();
   const q = /\b(2160P|2160|4K|UHD)\b/.test(s) ? 5
-    : /\b(1080P|1080|FHD)\b/.test(s) ? 4
+    : /\b(1080P|1080|FULL.?HD|FHD)\b/.test(s) ? 4
     : /\b(720P|720)\b/.test(s) ? 3
     : /\b(CAM|TS)\b/.test(s) ? 1 : 2;
   const src = /\b(BDREMUX|REMUX)\b/.test(s) ? 7
     : /\b(BLURAY|BLU-?RAY|BLU)\b/.test(s) ? 6
-    : /\b(WEB-?DL)\b/.test(s) ? 5
+    : /\b(WEB-?DL|WEBDL)\b/.test(s) ? 5
     : /\b(WEBRIP)\b/.test(s) ? 4
     : /\b(BRRIP)\b/.test(s) ? 3
     : /\b(HDRIP)\b/.test(s) ? 2
@@ -1463,16 +1509,21 @@ function streamTierScore(label) {
   }
   let tie = 0;
   if (/HDR10\+/.test(s)) tie += 40;
-  else if (/\bHDR\b|DOLBY.?VISION/.test(s)) tie += 30;
-  if (/\b(HEVC|H265|X265)\b/.test(s)) tie += 10;
+  else if (/\bHDR\b|DOLBY.?VISION|\bDV\b/.test(s)) tie += 30;
+  if (/\b(HEVC|H\.?265|X\.?265)\b/.test(s)) tie += 10;
   if (/\b10BIT\b/.test(s)) tie += 5;
+  if (/\b60FPS\b/.test(s)) tie += 5;
   // Trọng số tách tầng: quality(1e9) > nguồn(1e7) > dung lượng(<1e7) > phụ(<1000).
   return q * 1e9 + src * 1e7 + Math.min(Math.round(gb), 9999) * 1000 + tie;
 }
 
 function buildStreamTitle(src) {
-  const m = parseStreamMeta(src.source, src.subtitle);
-  if (src.container) m.container = String(src.container).toUpperCase();  // file_type từ API (chính xác hơn tên file)
+  const m = parseStreamMeta(src.source, src.subtitle, {
+    container: src.container,
+    variant: src.variant,
+    releaseInfo: src.releaseInfo,
+    subtitleLangs: src.subtitleLangs,
+  });
   const name = cleanText(src.title);
   const icon = m.quality === "4K" ? "💎" : m.quality === "FHD" ? "⭐" : "🎬";
   const ep = src.season != null && src.episode != null ? ` (Mùa ${src.season} · Tập ${src.episode})` : "";
@@ -1480,16 +1531,7 @@ function buildStreamTitle(src) {
   const vid = [m.quality, m.source, m.video, ...m.hdr, m.container].filter((x) => x && x !== "-").join(" · ");
   const l2 = "💿 " + (vid || "HD").toUpperCase();
   const l3 = "🔊 " + (m.audio.length ? m.audio.join(" · ") : "N/A");
-  // Bổ sung tag biến thể từ release info (video_quality) vào mục phụ đề nếu API không trả subtitle.
-  const vq = String(src.releaseInfo || src.quality || "").toUpperCase();
-  const extraTags = [];
-  if (/(?:PĐ|PHỤ\s?ĐỀ|PHU\s?DE|VIETSUB|VST|SUBTITLE|\bSUB\b)/.test(vq)) extraTags.push("PĐ");
-  if (/(?:\bTM\b|THUYẾT\s?MINH|THUYET\s?MINH)/.test(vq)) extraTags.push("TM");
-  if (/(?:\bLT\b|LỒNG\s?TIẾNG|LONG\s?TIENG|DUBBED)/.test(vq)) extraTags.push("LT");
-  if (/\bAI\b/.test(vq)) extraTags.push("AI");
-  if (/\bVS\b/.test(vq)) extraTags.push("VS");
-  const langs = [...new Set([...m.lang, ...extraTags])];
-  const l4 = "🌐 " + (langs.length ? langs.join(" · ") : "N/A");
+  const l4 = "🌐 " + (m.lang.length ? m.lang.join(" · ") : "N/A");
   const l5 = "💾 " + (m.size !== "-" ? m.size : "N/A");
   return [l1, l2, l3, l4, l5].join("\n");
 }
@@ -1582,7 +1624,7 @@ async function handleStream(type, id, cfg, ms, opts) {
         releaseInfo: d.video_quality,
       }),
       subtitles: v.subtitle,
-      w: streamTierScore(String(v.label || "")),
+      w: streamTierScore([(v && v.label), (d && d.video_quality)].filter(Boolean).join(" ")),
     }));
     // Đủ mọi luồng theo ý người dùng, nhưng chặn trần 40 file để không vượt
     // giới hạn subrequest của CF (mặc định 50/đợt gọi) — ghi đè bằng ?maxstreams=.
