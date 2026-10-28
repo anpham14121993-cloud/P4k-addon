@@ -149,8 +149,8 @@ let staleBusy = 0;
 const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10));
 let wFiles = 0;
 const stopState = { stop: false };
-// TTL động: has_id=1 (có file phim) 6h, has_id=0 (không có phim) 12h
-const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10)); // 6h
+// TTL động: has_id=1 (có file phim) 1h, has_id=0 (không có phim) 12h
+const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "3600000", 10)); // 1h
 const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "43200000", 10)); // 12h
 let staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); // backlog recheck thật (đếm 1 lần, giảm dần)
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
@@ -461,6 +461,7 @@ async function indexOne() {
           if (cmp.ok) {
             const res = await applyGitDiff(db, r.id, r.kind, cmp.text);
             if (res.ok) {
+              if (res.ups) wFiles += res.ups;
               const c = await repoCounts(db, r.id, r.kind);
               await finishRepo(db, r.id, r.kind, { n: c.n, size: c.size, sha: info.sha, updated: info.lastModified });
               idxInc++; handled = true; changed = true;

@@ -45,7 +45,7 @@ jobs:
           P4K_BKT_WORKERS: "4"
           P4K_BKT_SWEEPS: "2"
           P4K_BKT_EVERY: "600000"
-          P4K_REPO_TTL: "21600000"
+          P4K_REPO_TTL: "3600000"
           P4K_IDLE_EXIT: "60"
           P4K_WRITE_CAP: "200000"
         run: |
