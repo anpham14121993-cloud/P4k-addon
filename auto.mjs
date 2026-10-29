@@ -2,7 +2,7 @@
 // Chạy: HF_TOKEN="t1,t2,t3,t4,t5" node auto.mjs [giây]
 // Env: P4K_DB, P4K_GAP (ms/token), P4K_INV_TTL (bỏ trống = TTL thích ứng: has_id 5h / nrepo 7d / còn lại 14d;
 //      account junk thử lại sau 1 năm), P4K_REPO_TTL (ms, mặc định 6h — repo done quá hạn được kiểm tra lại
-//      và ưu tiên trước feed), P4K_REPO_TTL_NO_ID (mặc định 12h), P4K_SLOTS (mặc định 3/token),
+//      và ưu tiên trước feed), P4K_REPO_TTL_NO_ID (mặc định 24h), P4K_SLOTS (mặc định 3/token),
 //      P4K_FEED_LIMIT (mặc định 1000 mục/trang), P4K_FEED_TOP=1 (luôn quét từ đầu feed mỗi lượt),
 //      P4K_FEED_PAGES (số trang quét đầu run), P4K_POLL_MS (ms giữa 2 lần poll top, 0 = tắt),
 //      P4K_POLL_PAGES (mặc định 1 trang/lần poll), P4K_POLL_UNTIL (giây đầu run còn poll top),
@@ -149,9 +149,9 @@ let staleBusy = 0;
 const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10));
 let wFiles = 0;
 const stopState = { stop: false };
-// TTL động: has_id=1 (có file phim) 1h, has_id=0 (không có phim) 12h
-const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "3600000", 10)); // 1h
-const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "43200000", 10)); // 12h
+// TTL động: has_id=1 (có file phim) 6h, has_id=0 (không có phim) 24h
+const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10)); // 6h
+const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10)); // 24h
 let staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); // backlog recheck thật (đếm 1 lần, giảm dần)
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
 // refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
