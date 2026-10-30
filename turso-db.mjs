@@ -2,7 +2,9 @@
 import { tursoClient } from "./turso-http.mjs";
 
 const TTL_MS = 30 * 60 * 1000;
+const CATALOG_TTL_MS = 5 * 60 * 1000;
 const MAX_MEM = 5000;
+const CACHE_VER = "v2";
 const baseOf = (id) => (id.includes(".") ? id.slice(0, id.lastIndexOf(".")) : id);
 
 function normalizeText(v) {
@@ -18,13 +20,13 @@ export function tursoDb(env) {
   const c = tursoClient({ url: env.TURSO_DATABASE_URL, token: env.TURSO_AUTH_TOKEN });
   const mem = new Map(); // "<kind>:<id>" -> { at, ... }
   const cache = typeof caches !== "undefined" && caches.default ? caches.default : null;
-  const keyOf = (kind, id) => new Request("https://p4k-db.internal/" + kind + "/" + encodeURIComponent(id));
+  const keyOf = (kind, id) => new Request("https://p4k-db.internal/" + CACHE_VER + "/" + kind + "/" + encodeURIComponent(id));
 
-  async function cacheGet(kind, id) {
+  async function cacheGet(kind, id, ttl = TTL_MS) {
     const mk = kind + ":" + id;
     if (mem.has(mk)) {
       const v = mem.get(mk);
-      if (Date.now() - v.at < TTL_MS) return v;
+      if (Date.now() - v.at < ttl) return v;
       mem.delete(mk);
     }
     if (cache) {
@@ -32,7 +34,7 @@ export function tursoDb(env) {
         const r = await cache.match(keyOf(kind, id));
         if (r) {
           const v = await r.json();
-          if (v && typeof v.at === "number" && Date.now() - v.at < TTL_MS) {
+          if (v && typeof v.at === "number" && Date.now() - v.at < ttl) {
             putMem(kind, id, v);
             return v;
           }
@@ -51,14 +53,14 @@ export function tursoDb(env) {
     mem.set(mk, v);
   }
 
-  async function cachePut(kind, id, v) {
+  async function cachePut(kind, id, v, ttl = TTL_MS) {
     putMem(kind, id, v);
     if (!cache) return;
     try {
       await cache.put(
         keyOf(kind, id),
         new Response(JSON.stringify(v), {
-          headers: { "content-type": "application/json", "cache-control": "max-age=" + Math.floor(TTL_MS / 1000) },
+          headers: { "content-type": "application/json", "cache-control": "max-age=" + Math.floor(ttl / 1000) },
         })
       );
     } catch {}
@@ -96,7 +98,7 @@ export function tursoDb(env) {
 
   async function getCatalog(catalogId, page = 1, limit = 20) {
     const cacheKey = `${catalogId}:${page}:${limit}`;
-    const hit = await cacheGet("cat", cacheKey);
+    const hit = await cacheGet("cat", cacheKey, CATALOG_TTL_MS);
     if (hit && hit.rows) return hit.rows;
 
     const offset = Math.max(0, (page - 1) * limit);
@@ -126,7 +128,7 @@ export function tursoDb(env) {
     const r = await c.exec(sql, args);
     const rows = r.rows || [];
     if (rows.length > 0) {
-      await cachePut("cat", cacheKey, { at: Date.now(), rows });
+      await cachePut("cat", cacheKey, { at: Date.now(), rows }, CATALOG_TTL_MS);
     }
     return rows;
   }
