@@ -87,17 +87,15 @@ const FALLBACK_CFG = {
   jsonBase: "https://api.phim4k.space/rest-api/v130/",
   cdnBase: "https://svpc.cryboiz.workers.dev",
   cdnFallback: "",
-  apiKey: "",
+  apiKey: "bbbb411dea44849",
   tmdbKey: "",
   prefer: [],
   signedHosts: [],
 };
 
-// Mirror API (đã kiểm: api.phim4k.space và api.phim4k.online trả y hệt nhau).
-// getJson thất bại ở base chính (mạng/timeout/5xx) thì thử từng mirror.
+// Mirror API
 const API_MIRRORS = [
   "https://api.phim4k.space/rest-api/v130/",
-  "https://api.phim4k.online/rest-api/v130/",
 ];
 
 let API_USER = "admin";
@@ -141,7 +139,7 @@ function applySecrets(env) {
   CONFIG_SECRET = env.CONFIG_SECRET || "";
   API_USER = env.P4K_API_USER || "admin";
   API_PASS = env.P4K_API_PASS || "";
-  FALLBACK_CFG.apiKey = env.P4K_API_KEY || "";
+  FALLBACK_CFG.apiKey = env.P4K_API_KEY || "bbbb411dea44849";
   FALLBACK_CFG.tmdbKey = env.P4K_TMDB_KEY || "";
   HMAC_SECRETS = {
     "svpc.cryboiz.workers.dev": env.P4K_HMAC_SVPC || "",
@@ -1604,8 +1602,9 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
   const page = Math.floor((skip || 0) / 20) + 1;
   const forceType = (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") ? "series" : null;
 
-  // 1. Ưu tiên đọc Catalog từ Turso DB độc lập
-  if (DB && typeof DB.getCatalog === "function") {
+  // 1. Phim lẻ & Phim bộ: Ưu tiên đọc từ Turso DB độc lập
+  // Riêng "phim4k-otv-top": Là bảng xếp hạng lượt xem thời gian thực -> Lấy trực tiếp từ API gốc Phim4K
+  if (DB && typeof DB.getCatalog === "function" && catalogId !== "phim4k-otv-top") {
     try {
       let dbList = [];
       if (query) {
@@ -1634,32 +1633,58 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
     } catch {}
   }
 
-  // Fallback: gọi upstream Phim4K nếu DB chưa có hoặc đang backfill
+  // 2. Với "phim4k-otv-top": Kiểm tra Edge Cache trước (cache 1 giờ = 3600s)
+  if (catalogId === "phim4k-otv-top" && !query) {
+    const topCacheKey = "cat/top_views/" + page;
+    const cachedTop = await cacheGetJSON(topCacheKey);
+    if (cachedTop && Array.isArray(cachedTop.metas) && cachedTop.metas.length > 0) {
+      return cachedTop;
+    }
+  }
+
+  // 3. Gọi upstream Phim4K
   let list;
   if (query) {
     list = await searchP4K(query, type, cfg, ms);
   } else {
     const path = catalogQuery(catalogId, page);
     if (!path) throw new HttpError(404, "unknown catalog: " + catalogId);
-    const data = await getJson(path, cfg, ms);
-    list = Array.isArray(data) ? data : [];
+    try {
+      const data = await getJson(path, cfg, ms);
+      list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
+    } catch (e) {
+      // Nếu API gốc lỗi và có DB: Fallback sang Turso DB
+      if (DB && typeof DB.getCatalog === "function") {
+        const dbList = await DB.getCatalog(catalogId, page, 20).catch(() => []);
+        if (dbList.length > 0) list = dbList;
+      }
+      if (!list) throw e;
+    }
   }
-  return {
+
+  const result = {
     metas: list.filter((m) => m && (m.videos_id || m.id)).map((m) => {
-      const t = forceType || (String(m.is_tvseries) === "1" ? "series" : "movie");
+      const t = forceType || (String(m.is_tvseries) === "1" ? "series" : (m.type || "movie"));
       return {
         id: "otv:" + (m.videos_id || m.id),
         type: t,
         name: m.title || "",
         poster: m.poster_url || "",
         background: m.thumbnail_url || "",
-        year: parseInt(m.release, 10) || undefined,
-        releaseInfo: m.video_quality || undefined,
-        imdbRating: m.imdb_rating || undefined,
-        description: m.description || undefined,
+        year: parseInt(m.release || m.release_year, 10) || undefined,
+        releaseInfo: m.video_quality || m.quality || undefined,
+        imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
+        description: m.description || m.overview || undefined,
       };
     }),
   };
+
+  // Lưu cache cho topview
+  if (catalogId === "phim4k-otv-top" && !query && result.metas.length > 0) {
+    await cachePutJSON("cat/top_views/" + page, result, 3600);
+  }
+
+  return result;
 }
 
 async function handleMeta(type, id, cfg, ms) {

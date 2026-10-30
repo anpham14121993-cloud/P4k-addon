@@ -299,7 +299,7 @@ async function main() {
         const year = parseInt(String(d.release || "").slice(0, 4), 10) || null;
         const imdbId = d.imdb_id ? (String(d.imdb_id).startsWith("tt") ? String(d.imdb_id) : "tt" + d.imdb_id) : null;
         const tmdbId = d.tmdb_id ? parseInt(d.tmdb_id, 10) || null : null;
-        const rating = d.imdb_rating ? parseFloat(d.imdb_rating) || null : null;
+        const rating = (d.imdb_rating || item.imdb_rating) ? parseFloat(d.imdb_rating || item.imdb_rating) || null : null;
         const genres = Array.isArray(d.genre) ? JSON.stringify(d.genre.map((g) => g.name).filter(Boolean)) : null;
 
         let itemStreams = 0;
