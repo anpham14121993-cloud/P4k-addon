@@ -58,9 +58,3 @@ jobs:
           line=$(grep "AUTO SUMMARY" crawl.log | tail -1 || true)
           echo "$line"
           echo "$line" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: crawl-log
-          path: crawl.log
-          retention-days: 7

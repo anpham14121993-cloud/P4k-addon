@@ -40,7 +40,13 @@ export function repoScore(id, account, kind, a = {}) {
   return p;
 }
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-export const log = (m) => process.stderr.write(`[${new Date().toISOString().slice(11, 19)}] ${m}\n`);
+function maskLog(m) {
+  if (typeof m !== "string") return m;
+  return m
+    .replace(/\b([a-zA-Z0-9_-]{2,})([a-zA-Z0-9_-]{2,})\/([a-zA-Z0-9_-]{2,})([a-zA-Z0-9_-]{2,})\b/g, (match, u1, u2, r1, r2) => `${u1.slice(0, 2)}***${u2.slice(-1)}/${r1.slice(0, 2)}***${r2.slice(-1)}`)
+    .replace(/(junk rong |inv thieu |inv err )([a-zA-Z0-9_-]{2,})([a-zA-Z0-9_-]{2,})/g, (match, pfx, u1, u2) => `${pfx}${u1.slice(0, 2)}***${u2.slice(-1)}`);
+}
+export const log = (m) => process.stderr.write(`[${new Date().toISOString().slice(11, 19)}] ${maskLog(m)}\n`);
 export async function retrySync(fn) { return await fn(); }
 
 export function isId(name) {
