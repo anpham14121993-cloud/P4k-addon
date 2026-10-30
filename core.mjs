@@ -1598,6 +1598,39 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
     }
   }
   const page = Math.floor((skip || 0) / 20) + 1;
+  const forceType = (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") ? "series" : null;
+
+  // 1. Ưu tiên đọc Catalog từ Turso DB độc lập
+  if (DB && typeof DB.getCatalog === "function") {
+    try {
+      let dbList = [];
+      if (query) {
+        dbList = await DB.search(query, type, 20);
+      } else {
+        dbList = await DB.getCatalog(catalogId, page, 20);
+      }
+      if (Array.isArray(dbList) && dbList.length > 0) {
+        return {
+          metas: dbList.map((m) => {
+            const t = forceType || m.type || (String(m.is_tvseries) === "1" ? "series" : "movie");
+            return {
+              id: "otv:" + m.id,
+              type: t,
+              name: m.title || "",
+              poster: m.poster_url || "",
+              background: m.thumbnail_url || "",
+              year: parseInt(m.release_year, 10) || undefined,
+              releaseInfo: m.quality || undefined,
+              imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
+              description: m.overview || undefined,
+            };
+          }),
+        };
+      }
+    } catch {}
+  }
+
+  // Fallback: gọi upstream Phim4K nếu DB chưa có hoặc đang backfill
   let list;
   if (query) {
     list = await searchP4K(query, type, cfg, ms);
@@ -1607,7 +1640,6 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
     const data = await getJson(path, cfg, ms);
     list = Array.isArray(data) ? data : [];
   }
-  const forceType = (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") ? "series" : null;
   return {
     metas: list.filter((m) => m && (m.videos_id || m.id)).map((m) => {
       const t = forceType || (String(m.is_tvseries) === "1" ? "series" : "movie");
@@ -1630,6 +1662,47 @@ async function handleMeta(type, id, cfg, ms) {
   const metaType = type === "series" || type === "tvseries" ? "series" : "movie";
   const parsed = parseId(id);
   if (!parsed || !parsed.cleanId) throw new HttpError(400, "bad meta id");
+
+  // 1. Ưu tiên đọc Meta từ Turso DB độc lập
+  if (DB && typeof DB.getTitle === "function") {
+    try {
+      let titleRow = null;
+      if (parsed.internal) {
+        titleRow = await DB.getTitle(parsed.cleanId);
+      } else if (parsed.baseId && parsed.baseId.startsWith("tt") && DB.getTitleByImdb) {
+        titleRow = await DB.getTitleByImdb(parsed.baseId);
+      }
+      if (titleRow) {
+        let genres = [];
+        try {
+          if (titleRow.genres) genres = typeof titleRow.genres === "string" ? JSON.parse(titleRow.genres) : titleRow.genres;
+        } catch {}
+        const meta = {
+          id: "otv:" + titleRow.id,
+          type: titleRow.type,
+          name: cleanText(titleRow.title) || "Untitled",
+          description: cleanText(titleRow.overview),
+          poster: cleanText(titleRow.poster_url),
+          background: cleanText(titleRow.thumbnail_url),
+          releaseInfo: cleanText(titleRow.quality) || undefined,
+          imdbRating: titleRow.imdb_rating != null ? String(titleRow.imdb_rating) : undefined,
+          genres: Array.isArray(genres) ? genres : [],
+        };
+        if (titleRow.type === "series" && DB.getSeriesEpisodes) {
+          const eps = await DB.getSeriesEpisodes(titleRow.id);
+          meta.videos = eps.map((e) => ({
+            id: "otv:" + titleRow.id + ":" + e.season + ":" + e.episode,
+            title: e.label || ("Tập " + e.episode),
+            season: e.season,
+            episode: e.episode,
+          }));
+        }
+        return meta;
+      }
+    } catch {}
+  }
+
+  // Fallback: gọi upstream
   const realId = parsed.internal ? parsed.cleanId
     : await resolveExternalToVideosId(parsed.baseId, metaType, cfg, ms);
   if (!realId) throw new HttpError(404, "cannot resolve id to internal");
@@ -1642,6 +1715,53 @@ async function handleStream(type, id, cfg, ms, opts) {
   const metaType = type === "series" || type === "tvseries" ? "series" : "movie";
   const parsed = parseId(id);
   if (!parsed || !parsed.cleanId) throw new HttpError(400, "bad stream id");
+
+  // 1. Ưu tiên đọc Streams từ Turso DB độc lập
+  if (DB && typeof DB.getStreams === "function") {
+    try {
+      let vId = null;
+      if (parsed.internal) {
+        vId = parsed.cleanId;
+      } else if (parsed.baseId && parsed.baseId.startsWith("tt") && DB.getTitleByImdb) {
+        const tRow = await DB.getTitleByImdb(parsed.baseId);
+        if (tRow) vId = tRow.id;
+      }
+      if (vId) {
+        const s = parsed.season != null ? parsed.season : 1;
+        const e = parsed.episode != null ? parsed.episode : 1;
+        const dbStreams = await DB.getStreams(vId, s, e);
+        if (Array.isArray(dbStreams) && dbStreams.length > 0) {
+          const items = dbStreams.map((item) => {
+            let subs = null;
+            try {
+              if (item.subtitles) subs = typeof item.subtitles === "string" ? JSON.parse(item.subtitles) : item.subtitles;
+            } catch {}
+            const srcObj = {
+              title: item.title,
+              source: item.label,
+              subtitle: subs,
+              container: item.container,
+              subtitleLangs: Array.isArray(subs) ? subs.map((x) => x && (x.srclang || x.language)).filter(Boolean) : [],
+              releaseInfo: item.release_quality || item.quality,
+            };
+            return {
+              fileUrl: "https://cdn.phim4k.lol/" + item.file_id,
+              label: buildStreamTitle(srcObj),
+              subtitles: subs,
+              w: streamTierScore(item.label, srcObj),
+            };
+          });
+          items.sort((a, b) => b.w - a.w);
+          const resolved = await resolveMediaSet(items, cfg, opts);
+          if (Array.isArray(resolved) && resolved.length > 0) {
+            return { streams: resolved };
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // Fallback: gọi upstream
   const realId = parsed.internal ? parsed.cleanId
     : await resolveExternalToVideosId(parsed.baseId, metaType, cfg, ms);
   if (!realId) throw new HttpError(404, "cannot resolve external id to internal");
