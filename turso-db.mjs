@@ -106,9 +106,15 @@ export function tursoDb(env) {
       sql =
         "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'movie' ORDER BY id DESC LIMIT ? OFFSET ?";
       args.push(limit, offset);
-    } else if (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") {
+    } else if (catalogId === "phim4k-otv-series-latest") {
+      // Phim bộ mới nhất: sắp xếp theo ID giảm dần (phim mới đăng vào kho)
       sql =
         "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'series' ORDER BY id DESC LIMIT ? OFFSET ?";
+      args.push(limit, offset);
+    } else if (catalogId === "phim4k-otv-series") {
+      // Phim bộ: sắp xếp theo updated_at giảm dần (phim vừa cập nhật tập mới)
+      sql =
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'series' ORDER BY updated_at DESC LIMIT ? OFFSET ?";
       args.push(limit, offset);
     } else if (catalogId === "phim4k-otv-top") {
       sql =
