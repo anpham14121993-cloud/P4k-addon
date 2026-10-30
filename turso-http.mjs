@@ -2,7 +2,7 @@
 // Dùng được ở Cloudflare Workers, Node 18+, GitHub Actions.
 const encArg = (v) =>
   v === null || v === undefined ? { type: "null" }
-  : typeof v === "number" ? (Number.isInteger(v) ? { type: "integer", value: String(v) } : { type: "float", value: String(v) })
+  : typeof v === "number" ? (Number.isInteger(v) ? { type: "integer", value: String(v) } : { type: "float", value: v })
   : { type: "text", value: String(v) };
 
 const dec = (cell) => {

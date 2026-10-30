@@ -1,0 +1,58 @@
+name: backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: "Loại phim cần cào"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - movies
+          - tvseries
+      from_page:
+        description: "Trang bắt đầu (mặc định 1)"
+        required: false
+        default: "1"
+      to_page:
+        description: "Trang kết thúc (0 = cào hết kho)"
+        required: false
+        default: "0"
+      force:
+        description: "Ghi đè phim đã có trong DB"
+        required: false
+        type: boolean
+        default: false
+      delay:
+        description: "Độ trễ giữa các lượt gọi chi tiết (ms)"
+        required: false
+        default: "200"
+      batch_size:
+        description: "Số câu lệnh gom mỗi đợt nạp Turso"
+        required: false
+        default: "50"
+
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Chạy Backfill vào Turso DB
+        shell: bash
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          ARGS="--type ${{ github.event.inputs.type }} --from-page ${{ github.event.inputs.from_page }} --to-page ${{ github.event.inputs.to_page }} --delay ${{ github.event.inputs.delay }} --batch-size ${{ github.event.inputs.batch_size }}"
+          [ "${{ github.event.inputs.force }}" = "true" ] && ARGS="$ARGS --force"
+          node backfill.mjs $ARGS
