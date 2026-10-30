@@ -40,7 +40,7 @@ const TYPE = (getArg("type", "all") || "all").toLowerCase(); // all | movies | s
 const FROM_PAGE = Math.max(1, parseInt(getArg("from-page", "1"), 10) || 1);
 const TO_PAGE = parseInt(getArg("to-page", "0"), 10) || 0; // 0 = cào đến khi hết trang
 const FORCE = hasFlag("force"); // Nếu bật: ghi đè cả phim đã có trong DB
-const DELAY_MS = Math.max(100, parseInt(getArg("delay", "200"), 10) || 200);
+const DELAY_MS = Math.max(100, parseInt(getArg("delay", "280"), 10) || 280);
 const BATCH_SIZE = Math.max(10, parseInt(getArg("batch-size", "50"), 10) || 50);
 const BUDGET_SEC = parseInt(getArg("budget", "0"), 10) || 0;
 
@@ -127,8 +127,8 @@ async function fetchWithRetry(url, maxRetries = 4) {
     try {
       const r = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
       if (r.status === 429) {
-        console.warn(`[429 Rate Limit] Đang đợi ${1500 * (i + 1)}ms...`);
-        const backoff = 1500 * (i + 1);
+        console.warn(`[429 Rate Limit] Đang đợi ${2000 * (i + 1)}ms...`);
+        const backoff = 2000 * (i + 1);
         await sleep(backoff);
         continue;
       }
