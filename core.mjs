@@ -119,6 +119,7 @@ let HMAC_SECRET = "";
 // cors.lol 429 — CHỈ r.jina còn mint được. Các mirror chết vừa tốn request vừa
 // giữ subrequest slot (gây "stalled response" / giảm tốc), nên bỏ khỏi danh sách.
 const EGRESS_MIRRORS = [
+  { name: "p4k-relay", wrap: (u) => "https://p4k-relay.vercel.app/api/relay?url=" + encodeURIComponent(u), ms: 6000, headers: { Accept: "application/json" } },
   { name: "r.jina.ai", wrap: (u) => "https://r.jina.ai/" + u, ms: 6000, headers: {} },
 ];
 // Ghi chú (tạm giữ cấu hình cũ nếu cần bật lại một mirror khác):
@@ -663,7 +664,7 @@ function extractMint(text, attemptedHost) {
     for (const c of cands) {
       let cn = "";
       try { cn = (c && c.url) ? new URL(c.url).hostname : ""; } catch { }
-      if (c && typeof c.url === "string" && /^https:\/\//.test(c.url)
+      if (c && typeof c.url === "string" && /^https?:\/\//.test(c.url)
           && cn !== rn
           && !isResolverFallback(c.url)
           && !/dmm_vo_cc/.test(c.url)) return c;
