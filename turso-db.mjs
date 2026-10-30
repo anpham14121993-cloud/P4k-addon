@@ -100,15 +100,15 @@ export function tursoDb(env) {
     const args = [];
     if (catalogId === "phim4k-otv-movies") {
       sql =
-        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'movie' ORDER BY updated_at DESC LIMIT ? OFFSET ?";
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'movie' ORDER BY id DESC LIMIT ? OFFSET ?";
       args.push(limit, offset);
     } else if (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") {
       sql =
-        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'series' ORDER BY updated_at DESC LIMIT ? OFFSET ?";
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'series' ORDER BY id DESC LIMIT ? OFFSET ?";
       args.push(limit, offset);
     } else if (catalogId === "phim4k-otv-top") {
       sql =
-        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles ORDER BY imdb_rating DESC, updated_at DESC LIMIT ? OFFSET ?";
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles ORDER BY imdb_rating DESC, id DESC LIMIT ? OFFSET ?";
       args.push(limit, offset);
     } else {
       return [];
