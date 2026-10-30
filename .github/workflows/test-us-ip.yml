@@ -1,0 +1,57 @@
+name: test-us-ip
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check US IP & Geolocation
+        run: |
+          echo "=== 1. RUNNER GEOLOCATION ==="
+          curl -s https://ipinfo.io/json || true
+
+      - name: Test Cloudflare Worker Addon from US IP
+        run: |
+          echo -e "\n=== 2. CATALOG TEST (FROM TURSO DB) ==="
+          curl -s -o /tmp/cat.json -w "HTTP: %{http_code}, Time: %{time_total}s\n" "https://phim4k-addon.notthingp.workers.dev/catalog/movie/phim4k-otv-movies.json"
+          node -e '
+            const d = JSON.parse(require("fs").readFileSync("/tmp/cat.json"));
+            console.log("Metas count:", d.metas?.length, "First:", d.metas?.[0]?.name);
+          '
+
+          echo -e "\n=== 3. META TEST (TURSO DB) ==="
+          curl -s -o /tmp/meta1.json -w "HTTP: %{http_code}, Time: %{time_total}s\n" "https://phim4k-addon.notthingp.workers.dev/meta/movie/otv:18178.json"
+          node -e '
+            const d = JSON.parse(require("fs").readFileSync("/tmp/meta1.json"));
+            console.log("Meta:", d.meta?.id, d.meta?.name);
+          '
+
+          echo -e "\n=== 4. META TEST (FALLBACK ĐƯỜNG API GỐC Phim4K - ID 12000) ==="
+          curl -s -o /tmp/meta2.json -w "HTTP: %{http_code}, Time: %{time_total}s\n" "https://phim4k-addon.notthingp.workers.dev/meta/movie/otv:12000.json"
+          node -e '
+            const d = JSON.parse(require("fs").readFileSync("/tmp/meta2.json"));
+            console.log("Fallback Meta:", d.meta?.id, d.meta?.name, d.error);
+          '
+
+          echo -e "\n=== 5. STREAM TEST (FALLBACK ĐƯỜNG API GỐC - ID 12000) ==="
+          curl -s -o /tmp/stream.json -w "HTTP: %{http_code}, Time: %{time_total}s\n" "https://phim4k-addon.notthingp.workers.dev/stream/movie/otv:12000.json"
+          node -e '
+            const d = JSON.parse(require("fs").readFileSync("/tmp/stream.json"));
+            console.log("Fallback Streams count:", d.streams?.length);
+            if (d.streams?.length) {
+              d.streams.forEach((s, idx) => console.log(`Stream ${idx+1}: [${s.name}] url=${s.url.slice(0, 70)}...`));
+            }
+          '
+
+      - name: Test Direct Upstream & Resolver from US IP
+        run: |
+          echo -e "\n=== 6. DIRECT CALL TỚI api.phim4k.space TỪ US IP ==="
+          curl -s -I "https://api.phim4k.space/rest-api/v130/movies?page=1" || true
+
+          echo -e "\n=== 7. DIRECT CALL TỚI RESOLVER GỐC (svpc.cryboiz.workers.dev) ==="
+          curl -s -I "https://svpc.cryboiz.workers.dev" || true
+
+          echo -e "\n=== 8. WORKER _DIAG TỪ US IP ==="
+          curl -s "https://phim4k-addon.notthingp.workers.dev/_diag" || true
