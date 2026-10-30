@@ -118,7 +118,8 @@ function episodeInfo(seasonEntry, ep) {
 const headers = {
   "Accept": "application/json",
   "API-KEY": "bbbb411dea44849",
-  "Authorization": "Basic " + Buffer.from("admin:").toString("base64")
+  "Authorization": "Basic " + Buffer.from("admin:").toString("base64"),
+  "User-Agent": "okhttp/4.9.0",
 };
 
 async function fetchWithRetry(url, maxRetries = 4) {
@@ -126,21 +127,26 @@ async function fetchWithRetry(url, maxRetries = 4) {
     try {
       const r = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
       if (r.status === 429) {
+        console.warn(`[429 Rate Limit] Đang đợi ${1500 * (i + 1)}ms...`);
         const backoff = 1500 * (i + 1);
         await sleep(backoff);
         continue;
       }
       if (!r.ok) {
+        const bodyTxt = await r.text().catch(() => "");
+        console.warn(`[HTTP ${r.status}] Gọi ${url} thất bại: ${bodyTxt.slice(0, 200)}`);
         if (r.status >= 500) { await sleep(1000 * (i + 1)); continue; }
         return null;
       }
       const txt = await r.text();
       if (txt.includes("rate limited") || txt.includes("Cloudflare")) {
+        console.warn(`[Cloudflare WAF] Bị chặn tạm thời: ${txt.slice(0, 150)}`);
         await sleep(2000 * (i + 1));
         continue;
       }
       return JSON.parse(txt);
-    } catch {
+    } catch (e) {
+      console.warn(`[Network/Fetch Error] ${e.message || e}`);
       await sleep(1000 * (i + 1));
     }
   }
