@@ -34,7 +34,7 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
           echo "=== ĐỒNG BỘ PHIM MỚI & TẬP MỚI VÀO TURSO DB ==="
-          node backfill.mjs --type all --from-page 1 --to-page 3 --force --delay 200
+          node backfill.mjs --type all --from-page 1 --to-page 1 --delay 200
       - name: Crawl (feed + inv + index tự cân bằng)
         shell: bash
         env:

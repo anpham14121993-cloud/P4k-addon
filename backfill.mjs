@@ -264,10 +264,29 @@ async function main() {
         const vId = Number(item.videos_id);
         if (!vId) continue;
 
-        if (!FORCE && existingIds.has(vId)) {
+        // 1. Phim lẻ: Nếu không phải --force và đã có trong DB -> Bỏ qua luôn 100%
+        if (!FORCE && titleType === "movie" && existingIds.has(vId)) {
           pageSkipped++;
           totalSkipped++;
           continue;
+        }
+
+        // 2. Phim bộ: Nếu đã có trong DB, lấy danh sách các tập đã lưu để không ghi đè lại
+        let isExistingSeries = false;
+        let existingEpKeys = new Set();
+        if (!FORCE && titleType === "series" && existingIds.has(vId)) {
+          isExistingSeries = true;
+          try {
+            const epRes = await client.exec(
+              "SELECT season, episode, file_id FROM episodes_streams WHERE title_id = ?",
+              [vId]
+            );
+            existingEpKeys = new Set(
+              (epRes.rows || []).map((r) => `${r.season}:${r.episode}:${r.file_id}`)
+            );
+          } catch (e) {
+            console.error(`Lỗi kiểm tra tập cũ của phim ${vId}:`, e.message);
+          }
         }
 
         await sleep(DELAY_MS);
@@ -283,7 +302,86 @@ async function main() {
         const rating = d.imdb_rating ? parseFloat(d.imdb_rating) || null : null;
         const genres = Array.isArray(d.genre) ? JSON.stringify(d.genre.map((g) => g.name).filter(Boolean)) : null;
 
-        // Câu lệnh thêm vào titles
+        let itemStreams = 0;
+        const streamStatements = [];
+
+        // Xử lý stream nguồn phát
+        if (titleType === "movie") {
+          if (Array.isArray(d.videos)) {
+            for (const v of d.videos) {
+              const fileId = fileNameFrom(v.file_url);
+              if (!fileId) continue;
+
+              streamStatements.push({
+                sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                args: [
+                  vId,
+                  1,
+                  1,
+                  fileId,
+                  cleanText(v.label || d.title),
+                  cleanText(v.file_type),
+                  cleanText(d.video_quality),
+                  Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
+                  Date.now(),
+                ],
+              });
+              itemStreams++;
+            }
+          }
+        } else if (titleType === "series") {
+          if (Array.isArray(d.season)) {
+            for (const s of d.season) {
+              if (!Array.isArray(s.episodes)) continue;
+              for (const ep of s.episodes) {
+                const fileId = fileNameFrom(ep.file_url);
+                if (!fileId) continue;
+                const info = episodeInfo(s, ep);
+                if (info.episode === null) continue;
+
+                const from = info.episode;
+                const to = info.episodeEnd ? info.episodeEnd : from;
+                const span = Math.min(to, from + 60);
+
+                for (let epNum = from; epNum <= span; epNum++) {
+                  const epKey = `${info.season}:${epNum}:${fileId}`;
+                  if (existingEpKeys.has(epKey)) {
+                    // Tập này ĐÃ CÓ trong DB rồi -> Bỏ qua, không ghi đè lại vào Turso!
+                    continue;
+                  }
+
+                  streamStatements.push({
+                    sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    args: [
+                      vId,
+                      info.season,
+                      epNum,
+                      fileId,
+                      cleanText(ep.episodes_name || s.seasons_name),
+                      cleanText(ep.file_type),
+                      cleanText(d.video_quality),
+                      Array.isArray(ep.subtitle) && ep.subtitle.length ? JSON.stringify(ep.subtitle) : null,
+                      Date.now(),
+                    ],
+                  });
+                  itemStreams++;
+                }
+              }
+            }
+          }
+        }
+
+        // Nếu là phim bộ cũ và KHÔNG có tập mới nào -> Bỏ qua hoàn toàn, không tốn ghi Turso!
+        if (isExistingSeries && itemStreams === 0) {
+          pageSkipped++;
+          totalSkipped++;
+          console.log(`  [${listPath}: p${page}] [${i + 1}/${list.length}] [${vId}] ${d.title} -> Đã đủ tập (bỏ qua)`);
+          continue;
+        }
+
+        // Nếu là phim mới hoặc phim bộ có thêm tập mới: Ghi thông tin title
         collector.add({
           sql: `INSERT OR REPLACE INTO titles (id, type, title, title_clean, imdb_id, tmdb_id, poster_url, thumbnail_url, release_year, imdb_rating, quality, genres, overview, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -305,78 +403,18 @@ async function main() {
           ],
         });
 
+        // Ghi các stream/tập mới
+        for (const st of streamStatements) {
+          collector.add(st);
+        }
+
         existingIds.add(vId);
         pageInserted++;
         totalTitlesInserted++;
-        let itemStreams = 0;
+        pageStreams += itemStreams;
+        totalStreamsInserted += itemStreams;
 
-        // Xử lý stream nguồn phát
-        if (titleType === "movie") {
-          if (Array.isArray(d.videos)) {
-            for (const v of d.videos) {
-              const fileId = fileNameFrom(v.file_url);
-              if (!fileId) continue;
-
-              collector.add({
-                sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                args: [
-                  vId,
-                  1,
-                  1,
-                  fileId,
-                  cleanText(v.label || d.title),
-                  cleanText(v.file_type),
-                  cleanText(d.video_quality),
-                  Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
-                  Date.now(),
-                ],
-              });
-              itemStreams++;
-              pageStreams++;
-              totalStreamsInserted++;
-            }
-          }
-        } else if (titleType === "series") {
-          if (Array.isArray(d.season)) {
-            for (const s of d.season) {
-              if (!Array.isArray(s.episodes)) continue;
-              for (const ep of s.episodes) {
-                const fileId = fileNameFrom(ep.file_url);
-                if (!fileId) continue;
-                const info = episodeInfo(s, ep);
-                if (info.episode === null) continue;
-
-                const from = info.episode;
-                const to = info.episodeEnd ? info.episodeEnd : from;
-                const span = Math.min(to, from + 60);
-
-                for (let epNum = from; epNum <= span; epNum++) {
-                  collector.add({
-                    sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    args: [
-                      vId,
-                      info.season,
-                      epNum,
-                      fileId,
-                      cleanText(ep.episodes_name || s.seasons_name),
-                      cleanText(ep.file_type),
-                      cleanText(d.video_quality),
-                      Array.isArray(ep.subtitle) && ep.subtitle.length ? JSON.stringify(ep.subtitle) : null,
-                      Date.now(),
-                    ],
-                  });
-                  itemStreams++;
-                  pageStreams++;
-                  totalStreamsInserted++;
-                }
-              }
-            }
-          }
-        }
-
-        console.log(`  [${listPath}: p${page}] [${i + 1}/${list.length}] [${vId}] ${d.title} -> ${itemStreams} streams`);
+        console.log(`  [${listPath}: p${page}] [${i + 1}/${list.length}] [${vId}] ${d.title} -> +${itemStreams} streams mới`);
         await collector.checkAutoFlush();
       }
 
