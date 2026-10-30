@@ -1,0 +1,61 @@
+name: upgrade-quality
+
+on:
+  schedule:
+    # 17:00 UTC = 00:00 (nửa đêm) hàng ngày theo giờ Việt Nam (UTC+7)
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+    inputs:
+      type:
+        description: "Loại phim: all | movie | series"
+        default: "all"
+        required: false
+      limit:
+        description: "Giới hạn số phim kiểm tra (0 = không giới hạn)"
+        default: "0"
+        required: false
+      dry_run:
+        description: "Chỉ kiểm tra, không ghi DB (true/false)"
+        default: "false"
+        required: false
+
+concurrency:
+  group: upgrade-quality
+  cancel-in-progress: false
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Đồng bộ nâng cấp chất lượng (Tuyến 2)
+        shell: bash
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          set -o pipefail
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.type }}" != "" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --type ${{ github.event.inputs.type }}"
+          fi
+          if [ "${{ github.event.inputs.limit }}" != "" ] && [ "${{ github.event.inputs.limit }}" != "0" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --limit ${{ github.event.inputs.limit }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --dry-run"
+          fi
+
+          node upgrade-quality.mjs --delay 150 --batch-size 30 $EXTRA_ARGS 2>&1 | tee upgrade.log
+
+      - name: Báo cáo kết quả
+        if: always()
+        run: |
+          echo "### Kết quả Đồng bộ Nâng cấp Chất lượng (Tuyến 2)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          grep -A 10 "TỔNG KẾT TUYẾN 2" upgrade.log >> "$GITHUB_STEP_SUMMARY" || tail -20 upgrade.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
