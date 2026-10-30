@@ -1,5 +1,5 @@
 // upgrade-quality.mjs — Tuyến 2: Đồng bộ nâng cấp chất lượng (4K, Remux, Blu-ray...)
-// Chạy 1 lần/ngày vào lúc 00:00 giờ Việt Nam (17:00 UTC).
+// Chạy 2 lần/ngày: 12:00 trưa và 00:00 nửa đêm giờ Việt Nam (05:00 và 17:00 UTC).
 // Chỉ thực hiện 1 nhiệm vụ duy nhất: Kiểm tra và nạp bản chất lượng mới (file_id mới)
 // cho các phim/season phát hành gần đây (2025–2026 hoặc có cập nhật trong 1 năm qua).
 // Tuyệt đối không kiểm tra link chết, không ghi đè file cũ (để Tuyến 3 xử lý).
@@ -176,7 +176,7 @@ class BatchCollector {
 async function main() {
   console.log("=============================================================================");
   console.log(">>> TUYẾN 2: ĐỒNG BỘ NÂNG CẤP CHẤT LƯỢNG (4K, REMUX, BLU-RAY) <<<");
-  console.log(`Lịch chạy: 00:00 hàng ngày (Giờ VN) | Chế độ: ${DRY_RUN ? "DRY-RUN (chỉ đọc)" : "GHI DATABASE"}`);
+  console.log(`Lịch chạy: 12:00 & 00:00 hàng ngày (Giờ VN) | Chế độ: ${DRY_RUN ? "DRY-RUN (chỉ đọc)" : "GHI DATABASE"}`);
   console.log(`Tùy chọn: Type=${TYPE}, Delay=${DELAY_MS}ms, Batch=${BATCH_SIZE}, Limit=${LIMIT || "Không giới hạn"}`);
   console.log("=============================================================================\n");
 

@@ -2,8 +2,8 @@ name: upgrade-quality
 
 on:
   schedule:
-    # 17:00 UTC = 00:00 (nửa đêm) hàng ngày theo giờ Việt Nam (UTC+7)
-    - cron: '0 17 * * *'
+    # 05:00 UTC = 12:00 trưa (VN) và 17:00 UTC = 00:00 nửa đêm (VN) hàng ngày
+    - cron: '0 5,17 * * *'
   workflow_dispatch:
     inputs:
       type:
