@@ -27,6 +27,14 @@ jobs:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: node clean-dead.mjs | tail -5
+      - name: Đồng bộ phim mới từ Phim4K vào Turso DB
+        continue-on-error: true
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          echo "=== ĐỒNG BỘ PHIM MỚI & TẬP MỚI VÀO TURSO DB ==="
+          node backfill.mjs --type all --from-page 1 --to-page 3 --force --delay 200
       - name: Crawl (feed + inv + index tự cân bằng)
         shell: bash
         env:
