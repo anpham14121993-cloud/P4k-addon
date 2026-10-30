@@ -903,11 +903,15 @@ async function searchP4K(query, mediaType, cfg, ms) {
 }
 function catalogQuery(catalogId, page) {
   switch (catalogId) {
-    case "phim4k-otv-movies": return "movies?page=" + page;
-    case "phim4k-otv-series": return "tvseries?page=" + page;
-    case "phim4k-otv-series-latest": return "latest_tvseries?limit=20&page=" + page;
-    case "phim4k-otv-top": return "top_views?period=all&limit=20&page=" + page;
-    default: return null;
+    case "phim4k-otv-movies":
+    case "phim4k-otv-movies-latest":
+      return "latest_movies?limit=20&page=" + page;
+    case "phim4k-otv-series-latest":
+      return "latest_tvseries?limit=20&page=" + page;
+    case "phim4k-otv-top":
+      return "top_views?period=all&limit=20&page=" + page;
+    default:
+      return null;
   }
 }
 
@@ -1818,10 +1822,7 @@ function buildManifest() {
     types: ["movie", "series"],
     idPrefixes: PREFIXES,
     catalogs: [
-      { id: "phim4k-otv-movies", name: "Nothing-P • P4K · Phim lẻ", type: "movie",
-        extra: [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }],
-        extraSupported: ["search", "skip"] },
-      { id: "phim4k-otv-series", name: "Nothing-P • P4K · Phim bộ", type: "series",
+      { id: "phim4k-otv-movies", name: "Nothing-P • P4K · Phim lẻ mới nhất", type: "movie",
         extra: [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }],
         extraSupported: ["search", "skip"] },
       { id: "phim4k-otv-series-latest", name: "Nothing-P • P4K · Phim bộ mới nhất", type: "series",
