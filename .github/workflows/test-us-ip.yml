@@ -54,4 +54,24 @@ jobs:
           curl -s -I "https://svpc.cryboiz.workers.dev" || true
 
           echo -e "\n=== 8. WORKER _DIAG TỪ US IP ==="
-          curl -s "https://phim4k-addon.notthingp.workers.dev/_diag" || true
+          curl -s "https://phim4k-addon.notthingp.workers.dev/_diag" | tee /tmp/diag.json || true
+          echo ""
+
+          echo -e "\n=== 9. TEST PHÁT VIDEO (HTTP 206) TỪ US IP ==="
+          echo "-> Test 9.1: Tải thử Range Hugging Face stream:"
+          curl -s -I -r 0-1024 "https://huggingface.co/datasets/truongmai2003/truongmai2003/resolve/main/QMN5IUFC6L5OO49.hdf5" || true
+
+          echo "-> Test 9.2: Tải thử Range Node stream từ Resolver gốc:"
+          node -e '
+            const diag = JSON.parse(require("fs").readFileSync("/tmp/diag.json"));
+            const rawBody = diag.direct?.body || "";
+            let streamUrl = "";
+            try { streamUrl = JSON.parse(rawBody).url; } catch {}
+            if (!streamUrl && diag.mint?.[0]?.node) {
+              streamUrl = "http://" + diag.mint[0].node + "/JE2TRZGY7TCW99A";
+            }
+            console.log("Stream URL to test:", streamUrl);
+            if (streamUrl) {
+              require("child_process").execSync(`curl -s -I -r 0-1024 "${streamUrl}"`, { stdio: "inherit" });
+            }
+          '
