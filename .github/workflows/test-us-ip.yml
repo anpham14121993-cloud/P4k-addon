@@ -61,17 +61,46 @@ jobs:
           echo "-> Test 9.1: Tải thử Range Hugging Face stream:"
           curl -s -I -r 0-1024 "https://huggingface.co/datasets/truongmai2003/truongmai2003/resolve/main/QMN5IUFC6L5OO49.hdf5" || true
 
-          echo "-> Test 9.2: Tải thử Range Node stream từ Resolver gốc:"
+          echo "-> Test 9.2: Mint vé trực tiếp & tải Range video từ Resolver gốc:"
           node -e '
-            const diag = JSON.parse(require("fs").readFileSync("/tmp/diag.json"));
-            const rawBody = diag.direct?.body || "";
-            let streamUrl = "";
-            try { streamUrl = JSON.parse(rawBody).url; } catch {}
-            if (!streamUrl && diag.mint?.[0]?.node) {
-              streamUrl = "http://" + diag.mint[0].node + "/JE2TRZGY7TCW99A";
+            async function test() {
+              // Gọi genVideoUrl như core.mjs
+              const crypto = require("crypto");
+              const enc = new TextEncoder();
+              const secret = "fbcbaadfbdfccbcbaadfbdfc"; // secret của svpc
+              const fileName = "JE2TRZGY7TCW99A";
+              const host = "https://svpc.cryboiz.workers.dev";
+              
+              const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+              const keyBytes = crypto.createHash("sha256").update(secret).digest();
+              const iv = crypto.createHash("sha256").update("iv:" + secret).digest().subarray(0, 12);
+              const cipher = crypto.createCipheriv("aes-256-gcm", keyBytes, iv);
+              const ct = Buffer.concat([cipher.update(secret + ":" + dateStr, "utf8"), cipher.final()]);
+              const tag = cipher.getAuthTag();
+              const signingSecret = secret + ":" + Buffer.concat([ct, tag]).toString("hex");
+
+              const mask = crypto.createHmac("sha256", signingSecret).update("otp-ts-mask").digest().subarray(0, 4);
+              const now = Math.floor(Date.now() / 1000);
+              const token = crypto.createHmac("sha256", signingSecret).update(fileName + ":" + now).digest("hex");
+              
+              // xorIntToHex8
+              const v = (now >>> 0) ^ mask.readUInt32BE(0);
+              const b = Buffer.alloc(4);
+              b.writeUInt32BE(v >>> 0, 0);
+              const ts = b.toString("hex");
+
+              const signedUrl = host + "/" + fileName + "?token=" + token + "&ts=" + ts;
+              console.log("Signed URL:", signedUrl);
+
+              const r = await fetch(signedUrl, { headers: { "Accept": "application/json" } });
+              console.log("Resolver HTTP status:", r.status);
+              const j = await r.json();
+              console.log("Minted video URL:", j.url);
+
+              if (j.url) {
+                // Test tải Range 0-1024 bytes từ US IP
+                require("child_process").execSync(`curl -s -I -r 0-1024 "${j.url}"`, { stdio: "inherit" });
+              }
             }
-            console.log("Stream URL to test:", streamUrl);
-            if (streamUrl) {
-              require("child_process").execSync(`curl -s -I -r 0-1024 "${streamUrl}"`, { stdio: "inherit" });
-            }
+            test().catch(console.error);
           '
