@@ -1,0 +1,54 @@
+name: health-check
+
+on:
+  schedule:
+    # 20:00 UTC = 03:00 sáng hàng ngày theo giờ Việt Nam (UTC+7)
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Giới hạn số phim quét (0 = tự động adaptive 1/30 kho)"
+        default: "0"
+        required: false
+      dry_run:
+        description: "Chỉ kiểm tra, không ghi DB (true/false)"
+        default: "false"
+        required: false
+
+concurrency:
+  group: health-check
+  cancel-in-progress: false
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Chạy bảo trì & sửa link hỏng (Tuyến 3)
+        shell: bash
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          set -o pipefail
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.limit }}" != "" ] && [ "${{ github.event.inputs.limit }}" != "0" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --limit ${{ github.event.inputs.limit }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --dry-run"
+          fi
+
+          node health-check.mjs --delay 150 --batch-size 30 $EXTRA_ARGS 2>&1 | tee health.log
+
+      - name: Báo cáo kết quả
+        if: always()
+        run: |
+          echo "### Kết quả Bảo trì Link hỏng (Tuyến 3)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          grep -A 10 "TỔNG KẾT TUYẾN 3" health.log >> "$GITHUB_STEP_SUMMARY" || tail -20 health.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
