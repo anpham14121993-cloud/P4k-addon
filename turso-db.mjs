@@ -95,6 +95,10 @@ export function tursoDb(env) {
   /* ═══════════════ 2. TRUY VẤN BẢNG TITLES (PHIM & CATALOG) ═══════════════ */
 
   async function getCatalog(catalogId, page = 1, limit = 20) {
+    const cacheKey = `${catalogId}:${page}:${limit}`;
+    const hit = await cacheGet("cat", cacheKey);
+    if (hit && hit.rows) return hit.rows;
+
     const offset = Math.max(0, (page - 1) * limit);
     let sql = "";
     const args = [];
@@ -114,7 +118,11 @@ export function tursoDb(env) {
       return [];
     }
     const r = await c.exec(sql, args);
-    return r.rows || [];
+    const rows = r.rows || [];
+    if (rows.length > 0) {
+      await cachePut("cat", cacheKey, { at: Date.now(), rows });
+    }
+    return rows;
   }
 
   async function search(query, mediaType, limit = 20) {
@@ -143,15 +151,23 @@ export function tursoDb(env) {
   async function getTitle(id) {
     const numId = parseInt(id, 10);
     if (!numId) return null;
+    const hit = await cacheGet("title", String(numId));
+    if (hit && hit.row) return hit.row;
     const r = await c.exec("SELECT * FROM titles WHERE id = ? LIMIT 1", [numId]);
-    return r.rows[0] || null;
+    const row = r.rows[0] || null;
+    if (row) await cachePut("title", String(numId), { at: Date.now(), row });
+    return row;
   }
 
   async function getTitleByImdb(imdbId) {
     if (!imdbId) return null;
     const cleanImdb = String(imdbId).startsWith("tt") ? String(imdbId) : "tt" + imdbId;
+    const hit = await cacheGet("imdb", cleanImdb);
+    if (hit && hit.row) return hit.row;
     const r = await c.exec("SELECT * FROM titles WHERE imdb_id = ? LIMIT 1", [cleanImdb]);
-    return r.rows[0] || null;
+    const row = r.rows[0] || null;
+    if (row) await cachePut("imdb", cleanImdb, { at: Date.now(), row });
+    return row;
   }
 
   /* ═══════════════ 3. TRUY VẤN BẢNG EPISODES_STREAMS (TẬP & LUỒNG PHÁT) ═══════════════ */
@@ -159,11 +175,15 @@ export function tursoDb(env) {
   async function getSeriesEpisodes(titleId) {
     const numId = parseInt(titleId, 10);
     if (!numId) return [];
+    const hit = await cacheGet("eps", String(numId));
+    if (hit && hit.rows) return hit.rows;
     const r = await c.exec(
       "SELECT season, episode, label FROM episodes_streams WHERE title_id = ? GROUP BY season, episode ORDER BY season ASC, episode ASC",
       [numId]
     );
-    return r.rows || [];
+    const rows = r.rows || [];
+    if (rows.length > 0) await cachePut("eps", String(numId), { at: Date.now(), rows });
+    return rows;
   }
 
   async function getStreams(titleId, season = 1, episode = 1) {
@@ -171,13 +191,18 @@ export function tursoDb(env) {
     if (!numId) return [];
     const s = parseInt(season, 10) || 1;
     const e = parseInt(episode, 10) || 1;
+    const cacheKey = `${numId}:${s}:${e}`;
+    const hit = await cacheGet("stream", cacheKey);
+    if (hit && hit.rows) return hit.rows;
     const r = await c.exec(
       "SELECT s.id, s.title_id, s.season, s.episode, s.file_id, s.label, s.container, s.quality, s.subtitles, t.title, t.quality as release_quality " +
         "FROM episodes_streams s JOIN titles t ON s.title_id = t.id " +
         "WHERE s.title_id = ? AND s.season = ? AND s.episode = ? ORDER BY s.id ASC",
       [numId, s, e]
     );
-    return r.rows || [];
+    const rows = r.rows || [];
+    if (rows.length > 0) await cachePut("stream", cacheKey, { at: Date.now(), rows });
+    return rows;
   }
 
   return { row, variants, getCatalog, search, getTitle, getTitleByImdb, getSeriesEpisodes, getStreams };
