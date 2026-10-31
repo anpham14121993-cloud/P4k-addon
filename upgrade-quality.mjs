@@ -38,7 +38,7 @@ function hasFlag(name) {
 }
 
 const TYPE = (getArg("type", "all") || "all").toLowerCase(); // all | movie | series
-const DELAY_MS = Math.max(80, parseInt(getArg("delay", "150"), 10) || 150);
+const DELAY_MS = Math.max(150, parseInt(getArg("delay", "350"), 10) || 350);
 const BATCH_SIZE = Math.max(5, parseInt(getArg("batch-size", "30"), 10) || 30);
 const LIMIT = parseInt(getArg("limit", "0"), 10) || 0; // 0 = toàn bộ
 const DRY_RUN = hasFlag("dry-run");
@@ -110,27 +110,37 @@ const headers = {
   "User-Agent": "okhttp/4.9.0",
 };
 
-async function fetchWithRetry(url, maxRetries = 3) {
+let globalCoolUntil = 0;
+
+async function fetchWithRetry(url, maxRetries = 4) {
   for (let i = 0; i < maxRetries; i++) {
+    const now = Date.now();
+    if (globalCoolUntil > now) {
+      await sleep(globalCoolUntil - now);
+    }
     try {
       const r = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
       if (r.status === 429) {
-        console.warn(`[429 Rate Limit] Đang đợi ${2000 * (i + 1)}ms...`);
-        await sleep(2000 * (i + 1));
+        const ra = parseInt(r.headers.get("retry-after") || "0", 10);
+        const coolMs = ra > 0 ? ra * 1000 : 15000;
+        console.warn(`[429 Rate Limit] Phim4K giới hạn nhịp. Tạm nghỉ ${Math.round(coolMs / 1000)}s toàn cục...`);
+        globalCoolUntil = Date.now() + coolMs;
+        await sleep(coolMs);
         continue;
       }
       if (!r.ok) {
-        if (r.status >= 500) { await sleep(1000 * (i + 1)); continue; }
+        if (r.status >= 500) { await sleep(1500 * (i + 1)); continue; }
         return null;
       }
       const txt = await r.text();
       if (txt.includes("rate limited") || txt.includes("Cloudflare")) {
-        await sleep(2000 * (i + 1));
+        globalCoolUntil = Date.now() + 15000;
+        await sleep(15000);
         continue;
       }
       return JSON.parse(txt);
     } catch (e) {
-      await sleep(1000 * (i + 1));
+      await sleep(1500 * (i + 1));
     }
   }
   return null;
@@ -193,8 +203,12 @@ async function main() {
 
   // 1. Đồng bộ nâng cấp cho PHIM LẺ (Movies)
   if (TYPE === "all" || TYPE === "movie" || TYPE === "movies") {
-    console.log(`\n--- 1. BẮT ĐẦU KIỂM TRA PHIM LẺ (Năm phát hành >= ${cutoffYear}) ---`);
-    let movieSql = `SELECT id, title, release_year, quality FROM titles WHERE type = 'movie' AND release_year >= ? ORDER BY id DESC`;
+    console.log(`\n--- 1. BẮT ĐẦU KIỂM TRA PHIM LẺ (Năm >= ${cutoffYear}, chưa có 4K/Remux) ---`);
+    let movieSql = `SELECT id, title, release_year, quality FROM titles 
+                    WHERE type = 'movie' 
+                      AND release_year >= ? 
+                      AND (quality IS NULL OR (quality NOT LIKE '%4K%' AND quality NOT LIKE '%Remux%')) 
+                    ORDER BY id DESC`;
     if (LIMIT > 0) movieSql += ` LIMIT ${LIMIT}`;
 
     const movieRes = await client.exec(movieSql, [cutoffYear]);
@@ -264,13 +278,15 @@ async function main() {
 
   // 2. Đồng bộ nâng cấp cho PHIM BỘ (Series)
   if (TYPE === "all" || TYPE === "series" || TYPE === "tvseries") {
-    console.log(`\n--- 2. BẮT ĐẦU KIỂM TRA PHIM BỘ (Năm >= ${cutoffYear} hoặc cập nhật gần đây) ---`);
+    console.log(`\n--- 2. BẮT ĐẦU KIỂM TRA PHIM BỘ (Năm >= ${cutoffYear}, chưa có 4K/Remux) ---`);
     let seriesSql = `SELECT id, title, release_year, quality, updated_at FROM titles 
-                     WHERE type = 'series' AND (release_year >= ? OR updated_at >= ?) 
+                     WHERE type = 'series' 
+                       AND release_year >= ? 
+                       AND (quality IS NULL OR (quality NOT LIKE '%4K%' AND quality NOT LIKE '%Remux%')) 
                      ORDER BY id DESC`;
     if (LIMIT > 0) seriesSql += ` LIMIT ${LIMIT}`;
 
-    const seriesRes = await client.exec(seriesSql, [cutoffYear, oneYearAgoMs]);
+    const seriesRes = await client.exec(seriesSql, [cutoffYear]);
     const seriesList = seriesRes.rows || [];
     console.log(`Tìm thấy ${seriesList.length} phim bộ cần đối soát nâng cấp chất lượng.`);
 

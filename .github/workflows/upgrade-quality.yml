@@ -50,7 +50,7 @@ jobs:
             EXTRA_ARGS="$EXTRA_ARGS --dry-run"
           fi
 
-          node upgrade-quality.mjs --delay 150 --batch-size 30 $EXTRA_ARGS 2>&1 | tee upgrade.log
+          node upgrade-quality.mjs --delay 350 --batch-size 30 $EXTRA_ARGS 2>&1 | tee upgrade.log
 
       - name: Báo cáo kết quả
         if: always()

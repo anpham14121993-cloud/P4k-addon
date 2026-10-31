@@ -43,7 +43,7 @@ jobs:
             EXTRA_ARGS="$EXTRA_ARGS --dry-run"
           fi
 
-          node health-check.mjs --delay 150 --batch-size 30 $EXTRA_ARGS 2>&1 | tee health.log
+          node health-check.mjs --delay 350 --batch-size 30 $EXTRA_ARGS 2>&1 | tee health.log
 
       - name: Báo cáo kết quả
         if: always()

@@ -37,7 +37,7 @@ function hasFlag(name) {
   return args.includes("--" + name);
 }
 
-const DELAY_MS = Math.max(80, parseInt(getArg("delay", "150"), 10) || 150);
+const DELAY_MS = Math.max(150, parseInt(getArg("delay", "350"), 10) || 350);
 const BATCH_SIZE = Math.max(5, parseInt(getArg("batch-size", "30"), 10) || 30);
 const OVERRIDE_LIMIT = parseInt(getArg("limit", "0"), 10) || 0;
 const DRY_RUN = hasFlag("dry-run");
@@ -109,27 +109,37 @@ const headers = {
   "User-Agent": "okhttp/4.9.0",
 };
 
-async function fetchWithRetry(url, maxRetries = 3) {
+let globalCoolUntil = 0;
+
+async function fetchWithRetry(url, maxRetries = 4) {
   for (let i = 0; i < maxRetries; i++) {
+    const now = Date.now();
+    if (globalCoolUntil > now) {
+      await sleep(globalCoolUntil - now);
+    }
     try {
       const r = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
       if (r.status === 429) {
-        console.warn(`[429 Rate Limit] Đang đợi ${2000 * (i + 1)}ms...`);
-        await sleep(2000 * (i + 1));
+        const ra = parseInt(r.headers.get("retry-after") || "0", 10);
+        const coolMs = ra > 0 ? ra * 1000 : 15000;
+        console.warn(`[429 Rate Limit] Phim4K giới hạn nhịp. Tạm nghỉ ${Math.round(coolMs / 1000)}s toàn cục...`);
+        globalCoolUntil = Date.now() + coolMs;
+        await sleep(coolMs);
         continue;
       }
       if (!r.ok) {
-        if (r.status >= 500) { await sleep(1000 * (i + 1)); continue; }
+        if (r.status >= 500) { await sleep(1500 * (i + 1)); continue; }
         return null;
       }
       const txt = await r.text();
       if (txt.includes("rate limited") || txt.includes("Cloudflare")) {
-        await sleep(2000 * (i + 1));
+        globalCoolUntil = Date.now() + 15000;
+        await sleep(15000);
         continue;
       }
       return JSON.parse(txt);
     } catch (e) {
-      await sleep(1000 * (i + 1));
+      await sleep(1500 * (i + 1));
     }
   }
   return null;
