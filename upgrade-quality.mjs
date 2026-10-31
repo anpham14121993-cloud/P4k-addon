@@ -98,6 +98,9 @@ function episodeInfo(seasonEntry, ep) {
   }
 
   if (season === null) season = 1;
+  if (episode === null && seasonEntry && Array.isArray(seasonEntry.episodes) && seasonEntry.episodes.length === 1) {
+    episode = 1;
+  }
   return { season, episode, episodeEnd };
 }
 
