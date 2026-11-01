@@ -305,8 +305,16 @@ async function main() {
         await sleep(DELAY_MS);
 
         const detailUrl = `https://api.phim4k.space/rest-api/v130/single_details?type=${detailType}&id=${vId}`;
-        const d = await fetchWithRetry(detailUrl);
-        if (!d || !d.videos_id) continue;
+        let d = null;
+        try {
+          d = await fetchWithRetry(detailUrl);
+        } catch (e) {
+          console.warn(`[single_details] Lỗi khi tải chi tiết ID ${vId}: ${e.message}`);
+        }
+        if (!d || !d.videos_id) {
+          console.warn(`  [${listPath}: p${page}] [${i + 1}/${list.length}] [${vId}] Không lấy được chi tiết, bỏ qua ID này.`);
+          continue;
+        }
 
         const cleanTitle = normalizeText(d.title);
         const year = parseInt(String(d.release || "").slice(0, 4), 10) || null;

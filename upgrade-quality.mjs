@@ -245,7 +245,12 @@ async function main() {
 
       await sleep(DELAY_MS);
       const detailUrl = `https://api.phim4k.space/rest-api/v130/single_details?type=movie&id=${m.id}`;
-      const d = await fetchWithRetry(detailUrl);
+      let d = null;
+      try {
+        d = await fetchWithRetry(detailUrl);
+      } catch (e) {
+        console.warn(`[upgrade] Lỗi khi tải chi tiết phim lẻ ${m.id}: ${e.message}`);
+      }
       if (!d || !Array.isArray(d.videos)) continue;
 
       let newStreamsForMovie = 0;
@@ -320,7 +325,12 @@ async function main() {
 
       await sleep(DELAY_MS);
       const detailUrl = `https://api.phim4k.space/rest-api/v130/single_details?type=tvseries&id=${sItem.id}`;
-      const d = await fetchWithRetry(detailUrl);
+      let d = null;
+      try {
+        d = await fetchWithRetry(detailUrl);
+      } catch (e) {
+        console.warn(`[upgrade] Lỗi khi tải chi tiết phim bộ ${sItem.id}: ${e.message}`);
+      }
       if (!d || !Array.isArray(d.season)) continue;
 
       let newStreamsForSeries = 0;
