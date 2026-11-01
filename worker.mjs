@@ -6,6 +6,33 @@ let ready = false;
 
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === "/api-proxy" || url.pathname.startsWith("/api-proxy/")) {
+      const targetPath = url.searchParams.get("path") || url.pathname.replace(/^\/api-proxy\/?/, "");
+      if (!targetPath) return new Response("Missing path", { status: 400 });
+      const targetUrl = "https://api.phim4k.space/rest-api/v130/" + targetPath.replace(/^\/+/, "");
+      try {
+        const upstream = await fetch(targetUrl, {
+          headers: {
+            "Accept": "application/json",
+            "API-KEY": "bbbb411dea44849",
+            "Authorization": "Basic " + btoa("admin:"),
+            "User-Agent": "okhttp/4.9.0",
+          },
+        });
+        const text = await upstream.text();
+        return new Response(text, {
+          status: upstream.status,
+          headers: {
+            "Content-Type": upstream.headers.get("content-type") || "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 502, headers: { "Content-Type": "application/json" } });
+      }
+    }
+
     if (!ready) {
       setEnv(env);
       setDb(tursoDb(env));
