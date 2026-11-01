@@ -47,6 +47,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      - name: Cài đặt Cloudflare WARP (Vượt tường lửa Cloudflare 403)
+        uses: fscarmen/warp-on-actions@v1.4
+      - name: Kiểm tra IP WARP
+        run: curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|ip="
       - name: Chạy Backfill vào Turso DB
         shell: bash
         env:
