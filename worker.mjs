@@ -8,9 +8,21 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === "/api-proxy" || url.pathname.startsWith("/api-proxy/")) {
-      const targetPath = url.searchParams.get("path") || url.pathname.replace(/^\/api-proxy\/?/, "");
+      let targetPath = url.pathname.replace(/^\/api-proxy\/?/, "");
+      let query = url.search;
+      if (url.searchParams.has("path")) {
+        const p = url.searchParams.get("path");
+        const qIndex = p.indexOf("?");
+        if (qIndex !== -1) {
+          targetPath = p.slice(0, qIndex);
+          query = p.slice(qIndex);
+        } else {
+          targetPath = p;
+          query = "";
+        }
+      }
       if (!targetPath) return new Response("Missing path", { status: 400 });
-      const targetUrl = "https://api.phim4k.space/rest-api/v130/" + targetPath.replace(/^\/+/, "");
+      const targetUrl = "https://api.phim4k.space/rest-api/v130/" + targetPath.replace(/^\/+/, "") + query;
       try {
         const upstream = await fetch(targetUrl, {
           headers: {
