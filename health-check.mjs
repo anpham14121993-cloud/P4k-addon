@@ -6,6 +6,7 @@
 
 import fs from "node:fs";
 import { tursoClient } from "./turso-http.mjs";
+import { vnProxy, IS_GH_ACTIONS } from "./vn-proxy.mjs";
 
 // Đọc env cục bộ nếu chạy dưới Termux/Local
 if (!process.env.TURSO_DATABASE_URL && fs.existsSync(".env.turso")) {
@@ -112,6 +113,10 @@ const headers = {
 let globalCoolUntil = 0;
 
 async function fetchWithRetry(url, maxRetries = 4) {
+  if (IS_GH_ACTIONS || vnProxy.activeProxy) {
+    return vnProxy.fetchJson(url, maxRetries);
+  }
+
   for (let i = 0; i < maxRetries; i++) {
     const now = Date.now();
     if (globalCoolUntil > now) {
@@ -128,16 +133,8 @@ async function fetchWithRetry(url, maxRetries = 4) {
         continue;
       }
       if (r.status === 403) {
-        const path = url.replace(/^https:\/\/api\.phim4k\.space\/rest-api\/v130\//, "");
-        const proxyUrl = `https://phim4k-addon.notthingp.workers.dev/api-proxy?path=${encodeURIComponent(path)}`;
-        try {
-          const pr = await fetch(proxyUrl, { signal: AbortSignal.timeout(15000) });
-          if (pr.ok) {
-            const txt = await pr.text();
-            return JSON.parse(txt);
-          }
-        } catch {}
-        return null;
+        console.warn(`[HTTP 403] Bị Cloudflare chặn IP trực tiếp. Tự động chuyển qua bộ xoay Proxy VN...`);
+        return vnProxy.fetchJson(url, maxRetries);
       }
       if (!r.ok) {
         if (r.status >= 500) { await sleep(1500 * (i + 1)); continue; }

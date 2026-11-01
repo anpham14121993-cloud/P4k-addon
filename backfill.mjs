@@ -3,6 +3,7 @@
 
 import fs from "fs";
 import { tursoClient } from "./turso-http.mjs";
+import { vnProxy, IS_GH_ACTIONS } from "./vn-proxy.mjs";
 
 /* ═══════════════════════ CẤU HÌNH & KẾT NỐI DB ═══════════════════════ */
 
@@ -126,6 +127,11 @@ const headers = {
 };
 
 async function fetchWithRetry(url, maxRetries = 4) {
+  // Trên GitHub Actions, IP datacenter US bị Cloudflare 403 nên đi thẳng qua Proxy VN
+  if (IS_GH_ACTIONS || vnProxy.activeProxy) {
+    return vnProxy.fetchJson(url, maxRetries);
+  }
+
   for (let i = 0; i < maxRetries; i++) {
     try {
       const r = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
@@ -136,21 +142,8 @@ async function fetchWithRetry(url, maxRetries = 4) {
         continue;
       }
       if (r.status === 403) {
-        console.warn(`[HTTP 403] Bị Cloudflare chặn IP trực tiếp. Đang chuyển hướng qua Worker Proxy...`);
-        const path = url.replace(/^https:\/\/api\.phim4k\.space\/rest-api\/v130\//, "");
-        const proxyUrl = `https://phim4k-addon.notthingp.workers.dev/api-proxy?path=${encodeURIComponent(path)}`;
-        try {
-          const pr = await fetch(proxyUrl, { signal: AbortSignal.timeout(15000) });
-          if (pr.ok) {
-            const txt = await pr.text();
-            return JSON.parse(txt);
-          } else {
-            console.warn(`[Worker Proxy HTTP ${pr.status}]`);
-          }
-        } catch (pe) {
-          console.warn(`[Worker Proxy Error] ${pe.message}`);
-        }
-        return null;
+        console.warn(`[HTTP 403] Bị Cloudflare chặn IP trực tiếp. Tự động chuyển qua bộ xoay Proxy VN...`);
+        return vnProxy.fetchJson(url, maxRetries);
       }
       if (!r.ok) {
         const bodyTxt = await r.text().catch(() => "");
