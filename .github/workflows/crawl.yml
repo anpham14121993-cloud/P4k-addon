@@ -51,7 +51,7 @@ jobs:
           P4K_FEED_LIMIT: "1000"
           P4K_BKT: "1"
           P4K_BKT_WORKERS: "4"
-          P4K_BKT_SWEEPS: "1"
+          P4K_BKT_SWEEPS: "2"
           P4K_BKT_EVERY: "600000"
           P4K_REPO_TTL: "21600000"
           P4K_REPO_TTL_NO_ID: "86400000"
