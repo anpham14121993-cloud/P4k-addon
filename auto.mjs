@@ -150,11 +150,13 @@ const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10
 let wFiles = 0;
 const stopState = { stop: false };
 // TTL động: has_id=1 (có file phim) 6h, has_id=0 (không có phim) 24h
-const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10)); // 6h
+const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10)); // idle 6h
 const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10)); // 24h
+const REPO_TTL_HOT_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_HOT || "3600000", 10)); // nóng 1h
 // Tách 2 tầng: has_id=1 đếm đầy đủ (nhỏ), has_id=0 đếm cap 10k (lớn nhưng không có file).
-let staleHasId = await countStaleHasId(db, Date.now() - REPO_TTL_HAS_ID_MS);
-let staleNoId = await countStaleNoId(db, Date.now() - REPO_TTL_NO_ID_MS);
+// due_at đã là hạn tuyệt đối (hot 1h / idle 6h / no_id 24h) nên chỉ cần so với now.
+let staleHasId = await countStaleHasId(db, Date.now());
+let staleNoId = await countStaleNoId(db, Date.now());
 let staleBacklog = staleHasId + staleNoId; // backlog recheck thật (đếm 1 lần, giảm dần)
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
 // refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
@@ -446,8 +448,8 @@ async function indexOne() {
   const now = Date.now();
   // Ưu tiên stale has_id=1 (TTL 6h), hết mới tới has_id=0 (TTL 24h)
   let stale = null, staleTier = -1;
-  if (staleHasId > 0) { stale = await claimRepoStale(db, "auto", now - REPO_TTL_HAS_ID_MS, 1); if (stale) staleTier = 1; }
-  if (!stale && staleNoId > 0) { stale = await claimRepoStale(db, "auto", now - REPO_TTL_NO_ID_MS, 0); if (stale) staleTier = 0; }
+  if (staleHasId > 0) { stale = await claimRepoStale(db, "auto", now, 1); if (stale) staleTier = 1; }
+  if (!stale && staleNoId > 0) { stale = await claimRepoStale(db, "auto", now, 0); if (stale) staleTier = 0; }
   const r = stale || (await claimRepo(db, "auto"));
   if (!r) return false;
   if (stale) {
@@ -533,7 +535,7 @@ async function indexWorker() {
 }
 
 // ---------------- main ----------------
-log(`AUTO start ttl_has_id=${REPO_TTL_HAS_ID_MS/3600000}h ttl_no_id=${REPO_TTL_NO_ID_MS/3600000}h db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} poll=${POLL_MS ? `${POLL_MS/1000}s/${Math.max(0, Math.round((POLL_END - START) / 1000))}s` : "off"} bkt=${ENABLE_BKT ? `${BKT_WORKERS}x${BKT_SWEEPS}/${BKT_EVERY_MS/1000}s` : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
+log(`AUTO start ttl_repo=hot${REPO_TTL_HOT_MS/3600000}h/idle${REPO_TTL_HAS_ID_MS/3600000}h/noid${REPO_TTL_NO_ID_MS/3600000}h db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} poll=${POLL_MS ? `${POLL_MS/1000}s/${Math.max(0, Math.round((POLL_END - START) / 1000))}s` : "off"} bkt=${ENABLE_BKT ? `${BKT_WORKERS}x${BKT_SWEEPS}/${BKT_EVERY_MS/1000}s` : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
 await refreshInv();
 await rebalance();
 let idleTicks = 0, tickN = 0;
@@ -544,9 +546,9 @@ const timer = setInterval(async () => {
   try { await flushTouches(db); } catch (e) { log("touch flush err " + (e.message || e)); }
   if (tickN % 30 === 0) {
     recoverStale(db, 300000).catch(() => {});
-    try { staleHasId = await countStaleHasId(db, Date.now() - REPO_TTL_HAS_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
+    try { staleHasId = await countStaleHasId(db, Date.now()); } catch (e) { log("stale resync err " + (e.message || e)); }
     if (tickN % 180 === 0) {
-      try { staleNoId = await countStaleNoId(db, Date.now() - REPO_TTL_NO_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
+      try { staleNoId = await countStaleNoId(db, Date.now()); } catch (e) { log("stale resync err " + (e.message || e)); }
     }
     staleBacklog = staleHasId + staleNoId;
   }

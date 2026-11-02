@@ -13,6 +13,17 @@ export const PHIM_EXT = new Set([
   ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp",
 ]);
 export const JUNK_EMPTY = parseInt(process.env.P4K_JUNK_EMPTY || "3", 10);
+const REPO_TTL_HOT_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_HOT || "3600000", 10));
+const REPO_TTL_HAS_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10));
+const REPO_TTL_NOID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10));
+const HOT_WINDOW_MS = Math.max(3600000, parseInt(process.env.P4K_REPO_HOT_WINDOW || "86400000", 10));
+const JITTER_MS = 1800000;
+const h32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+const dueAt = (hasId, updated, key) => {
+  const now = Date.now();
+  const ttl = !hasId ? REPO_TTL_NOID_MS : (updated && updated >= now - HOT_WINDOW_MS ? REPO_TTL_HOT_MS : REPO_TTL_HAS_MS);
+  return now + ttl - (h32(key) % JITTER_MS);
+};
 // isFarm (RỘNG): chữ+số (abc123), chữ+số+chữ (hoanglong2k5), chữ-only dài >=12 (nguyenthimaihuong).
 export const isFarm = (u) => { const s = String(u); return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s) || /^[a-z]{12,}$/i.test(s); };
 // isFarmStrict (cho feed quét toàn HF): BẮT BUỘC có số -> tránh kéo org/tên ML hợp lệ.
@@ -94,8 +105,6 @@ const SCHEMA_IDX_TRG = `CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(stat
            CREATE INDEX IF NOT EXISTS idx_accounts_next ON accounts(next_scan_at);
            CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at);
            CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC);
-           CREATE INDEX IF NOT EXISTS idx_repos_stale ON repos(junk, state, has_id DESC, indexed_at ASC);
-           CREATE INDEX IF NOT EXISTS idx_repos_stale_due ON repos(junk, state, indexed_at);
            CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile);
            CREATE INDEX IF NOT EXISTS idx_repos_junkfiles ON repos(junk, nfile);`;
 const SCHEMA_TRG = `DROP TRIGGER IF EXISTS trg_rep_ins;
@@ -129,6 +138,7 @@ export function ensureSchema(db) {
   addCol(db, "repos", "state", "TEXT DEFAULT 'new'");
   addCol(db, "repos", "has_id", "INTEGER DEFAULT 0");
   addCol(db, "repos", "indexed_at", "INTEGER DEFAULT 0");
+  addCol(db, "repos", "due_at", "INTEGER DEFAULT 0");
   addCol(db, "repos", "worker", "TEXT");
   addCol(db, "repos", "entries", "INTEGER DEFAULT 0");
   addCol(db, "repos", "sha", "TEXT");
@@ -138,6 +148,12 @@ export function ensureSchema(db) {
   addCol(db, "accounts", "next_scan_at", "INTEGER DEFAULT 0");
   db.exec(SCHEMA_IDX_TRG);
   db.exec(SCHEMA_TRG);
+  db.exec("DROP INDEX IF EXISTS idx_repos_stale; DROP INDEX IF EXISTS idx_repos_stale_due; CREATE INDEX IF NOT EXISTS idx_repos_due ON repos(junk, state, has_id DESC, due_at ASC)");
+  if (!metaGet(db, "due_at_v1")) {
+    const now = Date.now();
+    db.exec("UPDATE repos SET due_at = indexed_at + CASE WHEN has_id=0 THEN " + REPO_TTL_NOID_MS + " WHEN COALESCE(updated,0) >= " + (now - HOT_WINDOW_MS) + " THEN " + REPO_TTL_HOT_MS + " ELSE " + REPO_TTL_HAS_MS + " END - (RANDOM() & 2097151) WHERE state='done' AND (due_at IS NULL OR due_at=0)");
+    metaSet(db, "due_at_v1", "1");
+  }
   if (!metaGet(db, "prio_idx_v1")) {
     db.exec(`DROP INDEX IF EXISTS idx_repos_prio;
              DROP INDEX IF EXISTS idx_repos_prio_d;
@@ -331,9 +347,11 @@ export function finishRepo(db, id, kind, { n, size, dead, entries, sha, updated 
   retrySync(() => {
     if (dead) {
       db.prepare("DELETE FROM files WHERE repo_id=? AND kind=?").run(id, kind);
-      db.prepare("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=? AND state='fetching'").run(Date.now(), id, kind);
+      db.prepare("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=?, due_at=0 WHERE id=? AND kind=? AND state='fetching'").run(Date.now(), id, kind);
     } else {
-      db.prepare("UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind);
+      const hasId = n > 0 ? 1 : 0;
+      const due = dueAt(hasId, updated || 0, kind + ":" + id);
+      db.prepare("UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, due_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(hasId, n, size, entries || 0, Date.now(), due, sha ?? null, updated ?? null, id, kind);
     }
   });
 }
@@ -344,7 +362,8 @@ export function finishRepo(db, id, kind, { n, size, dead, entries, sha, updated 
 export function touchRepo(db, id, kind, sha, updated) {
   const now = Date.now();
   const block = Math.floor(now / 300000) * 300000;
-  return retrySync(() => db.prepare("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(block, sha ?? null, updated ?? null, id, kind).changes);
+  const jit = h32(kind + ":" + id) % JITTER_MS;
+  return retrySync(() => db.prepare("UPDATE repos SET state='done', indexed_at=?, due_at=? + CASE WHEN has_id=0 THEN ? WHEN COALESCE(?, updated) >= ? THEN ? ELSE ? END - ?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(block, block, REPO_TTL_NOID_MS, updated ?? null, now - HOT_WINDOW_MS, REPO_TTL_HOT_MS, REPO_TTL_HAS_MS, jit, sha ?? null, updated ?? null, id, kind).changes);
 }
 
 export function unclaimRepo(db, id, kind) { retrySync(() => db.prepare("UPDATE repos SET state='new', worker=NULL WHERE id=? AND kind=? AND state='fetching'").run(id, kind)); }
@@ -530,21 +549,21 @@ export function accountCounts(db) { const r = db.prepare("SELECT COUNT(*) c FROM
 export function getRepoPrev(db, id, kind) { return db.prepare("SELECT sha,updated FROM repos WHERE id=? AND kind=?").get(id, kind) || {}; }
 export function pendingAccountsAdaptive(db, cut) { return pendingAccounts(db, cut, true); }
 export function countPendingAdaptive(db, cut) { return countPending(db, cut, true); }
-export function countStaleHasId(db, cutHasId) { const r = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND indexed_at<=?").get(cutHasId); return r?.c || 0; }
-export function countStaleNoId(db, cutNoId, cap = 10000) { const r = db.prepare("SELECT COUNT(*) c FROM (SELECT 1 FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND indexed_at<=? LIMIT ?)").get(cutNoId, cap); return r?.c || 0; }
+export function countStaleHasId(db, now) { const r = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND due_at<=?").get(now); return r?.c || 0; }
+export function countStaleNoId(db, now, cap = 10000) { const r = db.prepare("SELECT COUNT(*) c FROM (SELECT 1 FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND due_at<=? LIMIT ?)").get(now, cap); return r?.c || 0; }
 export function countStale(db, cutHasId, cutNoId) { return countStaleHasId(db, cutHasId) + countStaleNoId(db, cutNoId); }
 export function claimRepoStale(db, worker, cut, hasId = null) {
   return retrySync(() => {
-    let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=?";
+    let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.due_at<=?";
     const params = [cut];
     if (hasId !== null) {
       sql += " AND r.has_id=?";
       params.push(hasId ? 1 : 0);
     }
-    sql += " ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT 1";
+    sql += " ORDER BY r.has_id DESC, r.due_at ASC LIMIT 1";
     const row = db.prepare(sql).get(params);
     if (!row) return null;
-    const u = db.prepare("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND indexed_at<=?").run(worker, Date.now(), row.id, row.kind, cut);
+    const u = db.prepare("UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE id=? AND kind=? AND state='done' AND due_at<=?").run(worker, Date.now(), row.id, row.kind, cut);
     return u.changes ? row : null;
   });
 }

@@ -12,6 +12,18 @@ export const PHIM_EXT = new Set([
   ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp",
 ]);
 export const JUNK_EMPTY = parseInt(process.env.P4K_JUNK_EMPTY || "3", 10);
+// TTL thích ứng: repo "nóng" (updated trong 24h) recheck 1h; repo idle 6h; has_id=0 24h.
+const REPO_TTL_HOT_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_HOT || "3600000", 10));
+const REPO_TTL_HAS_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10));
+const REPO_TTL_NOID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10));
+const HOT_WINDOW_MS = Math.max(3600000, parseInt(process.env.P4K_REPO_HOT_WINDOW || "86400000", 10));
+const JITTER_MS = 1800000;
+const h32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+const dueAt = (hasId, updated, key) => {
+  const now = Date.now();
+  const ttl = !hasId ? REPO_TTL_NOID_MS : (updated && updated >= now - HOT_WINDOW_MS ? REPO_TTL_HOT_MS : REPO_TTL_HAS_MS);
+  return now + ttl - (h32(key) % JITTER_MS);
+};
 export const isFarm = (u) => { const s = String(u); return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s) || /^[a-z]{12,}$/i.test(s); };
 export const isFarmStrict = (u) => { const s = String(u); return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s); };
 const LOW_NUM = /^[a-z]{2,}[0-9]{1,7}$/;
@@ -108,7 +120,7 @@ const ADD_COLS = [
   ["accounts", "nrepo", "INTEGER DEFAULT 0"], ["accounts", "junk", "INTEGER DEFAULT 0"],
   ["accounts", "scanned_at", "INTEGER DEFAULT 0"], ["accounts", "last_seen", "INTEGER DEFAULT 0"],
   ["repos", "last_modified", "INTEGER DEFAULT 0"], ["repos", "state", "TEXT DEFAULT 'new'"],
-  ["repos", "has_id", "INTEGER DEFAULT 0"], ["repos", "indexed_at", "INTEGER DEFAULT 0"],
+  ["repos", "has_id", "INTEGER DEFAULT 0"], ["repos", "indexed_at", "INTEGER DEFAULT 0"], ["repos", "due_at", "INTEGER DEFAULT 0"],
   ["repos", "worker", "TEXT"], ["repos", "entries", "INTEGER DEFAULT 0"], ["repos", "sha", "TEXT"],
   ["repos", "updated", "INTEGER DEFAULT 0"], ["repos", "prio", "INTEGER DEFAULT 0"],
   ["repos", "junk", "INTEGER DEFAULT 0"], ["accounts", "next_scan_at", "INTEGER DEFAULT 0"],
@@ -122,8 +134,7 @@ const IDX2 = [
   `CREATE INDEX IF NOT EXISTS idx_accounts_next ON accounts(next_scan_at)`,
   `CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos(state, junk, prio DESC, last_modified DESC)`,
-  `CREATE INDEX IF NOT EXISTS idx_repos_stale ON repos(junk, state, has_id DESC, indexed_at ASC)`,
-  `CREATE INDEX IF NOT EXISTS idx_repos_stale_due ON repos(junk, state, indexed_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_due ON repos(junk, state, has_id DESC, due_at ASC)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_junkfiles ON repos(junk, nfile)`,
 ];
@@ -137,6 +148,8 @@ const DROP_TRG = TRG_NAMES.map((t) => ({ sql: "DROP TRIGGER IF EXISTS " + t }));
 const DROP_IDX = [
   { sql: "DROP INDEX IF EXISTS idx_files_name" },
   { sql: "DROP INDEX IF EXISTS idx_files_repo" },
+  { sql: "DROP INDEX IF EXISTS idx_repos_stale" },
+  { sql: "DROP INDEX IF EXISTS idx_repos_stale_due" },
 ];
 
 export async function ensureSchema(db) {
@@ -181,6 +194,16 @@ export async function ensureSchema(db) {
     const r = await db.exec("UPDATE accounts SET next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE junk=0 AND scanned_at>0");
     await metaSet(db, "acct_ttl5h_v1", "1");
     log("acct_ttl5h_v1 xong, reschedule " + r.changes);
+  }
+  // due_at_v1: backfill hạn recheck thích ứng từ indexed_at + TTL (nóng 1h / idle 6h / no_id 24h).
+  if (!(await metaGet(db, "due_at_v1"))) {
+    const now = Date.now();
+    const r = await db.exec(
+      "UPDATE repos SET due_at = indexed_at + CASE WHEN has_id=0 THEN ? WHEN COALESCE(updated,0) >= ? THEN ? ELSE ? END - (RANDOM() & 2097151) WHERE state='done' AND (due_at IS NULL OR due_at=0)",
+      [REPO_TTL_NOID_MS, now - HOT_WINDOW_MS, REPO_TTL_HOT_MS, REPO_TTL_HAS_MS]
+    );
+    await metaSet(db, "due_at_v1", "1");
+    log("due_at_v1 backfill " + r.changes);
   }
 }
 
@@ -263,11 +286,14 @@ export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, up
   if (staleSeen.delete(kind + ":" + id)) staleDone.add(kind + ":" + id);
   if (dead) {
     await db.exec("DELETE FROM files WHERE repo_id=? AND kind=?", [id, kind]);
-    await db.exec("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=? WHERE id=? AND kind=? AND state IN ('fetching','done')", [Date.now(), id, kind]);
+    await db.exec("UPDATE repos SET state='dead', has_id=0, nfile=0, size=0, indexed_at=?, due_at=0 WHERE id=? AND kind=? AND state IN ('fetching','done')", [Date.now(), id, kind]);
+  } else {
+    const hasId = n > 0 ? 1 : 0;
+    const due = dueAt(hasId, updated || 0, kind + ":" + id);
+    await db.exec(
+      "UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, due_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state IN ('fetching','done')",
+      [hasId, n, size, entries || 0, Date.now(), due, sha ?? null, updated ?? null, id, kind]);
   }
-  else await db.exec(
-    "UPDATE repos SET state='done', has_id=?, nfile=?, size=?, entries=?, indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state IN ('fetching','done')",
-    [n > 0 ? 1 : 0, n, size, entries || 0, Date.now(), sha ?? null, updated ?? null, id, kind]);
 }
 
 // Chỉ cập nhật mốc recheck khi SHA/updated không đổi — giữ nguyên nfile/size/entries.
@@ -275,18 +301,20 @@ export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, up
 // (không đụng state/worker -> 2 index thay vì 6) và gom batch, flush bằng flushTouches().
 const touchBuf = [];
 const TOUCH_BATCH = 100;
-// Jitter tất định 0..30 phút để cohort TTL 6h không cùng hết hạn một phút (giảm đỉnh writes).
-const h32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+// Hạn recheck thích ứng, tính từ cột has_id/updated của dòng hiện tại + jitter tất định.
+const DUE_SQL = "? + CASE WHEN has_id=0 THEN ? WHEN COALESCE(?, updated) >= ? THEN ? ELSE ? END - ?";
 export async function touchRepo(db, id, kind, sha, updated) {
-  const block = Math.floor(Date.now() / 300000) * 300000 - (h32(kind + ":" + id) % 1800000);
+  const block = Math.floor(Date.now() / 300000) * 300000;
+  const jit = h32(kind + ":" + id) % JITTER_MS;
+  const dueArgs = [block, block, REPO_TTL_NOID_MS, updated ?? null, Date.now() - HOT_WINDOW_MS, REPO_TTL_HOT_MS, REPO_TTL_HAS_MS, jit];
   const key = kind + ":" + id;
   if (staleSeen.delete(key)) {
     staleDone.add(key);
-    touchBuf.push({ sql: "UPDATE repos SET indexed_at=?, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='done'", args: [block, sha ?? null, updated ?? null, id, kind] });
+    touchBuf.push({ sql: `UPDATE repos SET indexed_at=?, due_at=${DUE_SQL}, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='done'`, args: [...dueArgs, sha ?? null, updated ?? null, id, kind] });
     if (touchBuf.length >= TOUCH_BATCH) await flushTouches(db);
     return 1;
   }
-  const r = await db.exec("UPDATE repos SET state='done', indexed_at=?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'", [block, sha ?? null, updated ?? null, id, kind]);
+  const r = await db.exec(`UPDATE repos SET state='done', indexed_at=?, due_at=${DUE_SQL}, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'`, [...dueArgs, sha ?? null, updated ?? null, id, kind]);
   return r.changes;
 }
 
@@ -493,14 +521,14 @@ export async function countPending(db, cut, adaptive = false) {
     : "SELECT COUNT(*) c FROM accounts WHERE junk=0 AND scanned_at<=?";
   return (await db.exec(sql, [cut])).rows[0].c;
 }
-export async function countStaleHasId(db, cutHasId) {
-  const r = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND indexed_at<=?", [cutHasId]);
+export async function countStaleHasId(db, now) {
+  const r = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND due_at<=?", [now]);
   return r.rows[0]?.c || 0;
 }
 // has_id=0 thường chiếm ~85k dòng (không có file) -> COUNT đầy đủ rất tốn read.
 // Chỉ cần biết "còn nhiều hay không": cap 10k dòng, quét tối đa 10k thay vì 85k.
-export async function countStaleNoId(db, cutNoId, cap = 10000) {
-  const r = await db.exec("SELECT COUNT(*) c FROM (SELECT 1 FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND indexed_at<=? LIMIT ?)", [cutNoId, cap]);
+export async function countStaleNoId(db, now, cap = 10000) {
+  const r = await db.exec("SELECT COUNT(*) c FROM (SELECT 1 FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND due_at<=? LIMIT ?)", [now, cap]);
   return r.rows[0]?.c || 0;
 }
 export async function countStale(db, cutHasId, cutNoId) {
@@ -518,13 +546,13 @@ export async function claimRepoStale(db, worker, cut, hasId = null) {
   if (!(staleQ.get(qk) || []).length) {
     if (!staleFill.has(qk)) staleFill.set(qk, (async () => {
       await flushTouches(db);
-      let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=?";
+      let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.due_at<=?";
       const params = [cut];
       if (hasId !== null) {
         sql += " AND r.has_id=?";
         params.push(hasId ? 1 : 0);
       }
-      sql += " ORDER BY r.has_id DESC, r.indexed_at ASC LIMIT " + STALE_BATCH;
+      sql += " ORDER BY r.has_id DESC, r.due_at ASC LIMIT " + STALE_BATCH;
       staleQ.set(qk, (await db.exec(sql, params)).rows);
     })().finally(() => staleFill.delete(qk)));
     await staleFill.get(qk);
