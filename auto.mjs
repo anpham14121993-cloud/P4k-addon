@@ -13,7 +13,7 @@ const {
   upsertRepoMeta, claimRepo, recoverStale, isFarm, isFarmStrict, isId, log, repoCounts,
   applyGitDiff, accountScore, getAccount, insertAccount, setScanned, pendingAccounts, countPending,
   countNew, stateCounts, getRepoPrev, pendingAccountsAdaptive, countPendingAdaptive,
-  claimRepoStale, clearJunk, markJunk, countStale, flushTouches, releaseStale,
+  claimRepoStale, clearJunk, markJunk, countStale, countStaleHasId, countStaleNoId, flushTouches, releaseStale,
 } = P;
 
 const db = openDB();
@@ -152,7 +152,10 @@ const stopState = { stop: false };
 // TTL động: has_id=1 (có file phim) 6h, has_id=0 (không có phim) 24h
 const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10)); // 6h
 const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10)); // 24h
-let staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); // backlog recheck thật (đếm 1 lần, giảm dần)
+// Tách 2 tầng: has_id=1 đếm đầy đủ (nhỏ), has_id=0 đếm cap 10k (lớn nhưng không có file).
+let staleHasId = await countStaleHasId(db, Date.now() - REPO_TTL_HAS_ID_MS);
+let staleNoId = await countStaleNoId(db, Date.now() - REPO_TTL_NO_ID_MS);
+let staleBacklog = staleHasId + staleNoId; // backlog recheck thật (đếm 1 lần, giảm dần)
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
 // refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
 // feed thêm account mới thì +1 -> KHÔNG cần COUNT quét accounts mỗi tick.
@@ -441,12 +444,18 @@ async function bktWorker() {
 let idxN = 0, idxInc = 0;
 async function indexOne() {
   const now = Date.now();
-  // Ưu tiên stale has_id=1 (TTL 1h), hết mới tới has_id=0 (TTL 12h)
-  let stale = staleBacklog > 0 ? await claimRepoStale(db, "auto", now - REPO_TTL_HAS_ID_MS, 1) : null;
-  if (!stale && staleBacklog > 0) stale = await claimRepoStale(db, "auto", now - REPO_TTL_NO_ID_MS, 0);
+  // Ưu tiên stale has_id=1 (TTL 6h), hết mới tới has_id=0 (TTL 24h)
+  let stale = null, staleTier = -1;
+  if (staleHasId > 0) { stale = await claimRepoStale(db, "auto", now - REPO_TTL_HAS_ID_MS, 1); if (stale) staleTier = 1; }
+  if (!stale && staleNoId > 0) { stale = await claimRepoStale(db, "auto", now - REPO_TTL_NO_ID_MS, 0); if (stale) staleTier = 0; }
   const r = stale || (await claimRepo(db, "auto"));
   if (!r) return false;
-  if (stale) { staleBusy++; if (staleBacklog > 0) staleBacklog--; }
+  if (stale) {
+    staleBusy++;
+    if (staleTier === 1) { if (staleHasId > 0) staleHasId--; }
+    else if (staleTier === 0) { if (staleNoId > 0) staleNoId--; }
+    staleBacklog = staleHasId + staleNoId;
+  }
   const prev = await getRepoPrev(db, r.id, r.kind);
   const info = await repoInfo(r.kind, r.id);
   let handled = false, changed = false;
@@ -535,7 +544,11 @@ const timer = setInterval(async () => {
   try { await flushTouches(db); } catch (e) { log("touch flush err " + (e.message || e)); }
   if (tickN % 30 === 0) {
     recoverStale(db, 300000).catch(() => {});
-    try { staleBacklog = await countStale(db, Date.now() - REPO_TTL_HAS_ID_MS, Date.now() - REPO_TTL_NO_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
+    try { staleHasId = await countStaleHasId(db, Date.now() - REPO_TTL_HAS_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
+    if (tickN % 180 === 0) {
+      try { staleNoId = await countStaleNoId(db, Date.now() - REPO_TTL_NO_ID_MS); } catch (e) { log("stale resync err " + (e.message || e)); }
+    }
+    staleBacklog = staleHasId + staleNoId;
   }
   const noWork = pending.inv === 0 && pending.index === 0 && staleBacklog === 0 && pending.feedPages === 0 && pending.bkt === 0 && !feedPolling && !bktWaiting();
   const quiet = inflight.feed + inflight.inv + inflight.index === 0 && bktBusy === 0;
@@ -560,7 +573,7 @@ log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 
 let statusRows = null;
 try {
   const c = JSON.parse((await metaGet(db, "state_counts_v1")) || "null");
-  if (c && Array.isArray(c.rows) && Date.now() - c.at < 6 * 3600e3) statusRows = c.rows;
+  if (c && Array.isArray(c.rows) && Date.now() - c.at < 24 * 3600e3) statusRows = c.rows;
 } catch { }
 if (!statusRows) {
   statusRows = await stateCounts(db);

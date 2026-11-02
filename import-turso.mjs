@@ -95,8 +95,6 @@ async function main() {
   // index sau khi nạp (nhanh hơn + ít rows written)
   log("tạo index...");
   await execAll([
-    "CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)",
-    "CREATE INDEX IF NOT EXISTS idx_files_repo ON files(repo_id)",
     "CREATE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path)",
     "CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(state)",
     "CREATE INDEX IF NOT EXISTS idx_repos_account ON repos(account)",

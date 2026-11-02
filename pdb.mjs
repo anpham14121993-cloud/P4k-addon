@@ -530,7 +530,9 @@ export function accountCounts(db) { const r = db.prepare("SELECT COUNT(*) c FROM
 export function getRepoPrev(db, id, kind) { return db.prepare("SELECT sha,updated FROM repos WHERE id=? AND kind=?").get(id, kind) || {}; }
 export function pendingAccountsAdaptive(db, cut) { return pendingAccounts(db, cut, true); }
 export function countPendingAdaptive(db, cut) { return countPending(db, cut, true); }
-export function countStale(db, cutHasId, cutNoId) { const r1 = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND indexed_at<=?").get(cutHasId); const r2 = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND indexed_at<=?").get(cutNoId); return (r1?.c || 0) + (r2?.c || 0); }
+export function countStaleHasId(db, cutHasId) { const r = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND indexed_at<=?").get(cutHasId); return r?.c || 0; }
+export function countStaleNoId(db, cutNoId, cap = 10000) { const r = db.prepare("SELECT COUNT(*) c FROM (SELECT 1 FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND indexed_at<=? LIMIT ?)").get(cutNoId, cap); return r?.c || 0; }
+export function countStale(db, cutHasId, cutNoId) { return countStaleHasId(db, cutHasId) + countStaleNoId(db, cutNoId); }
 export function claimRepoStale(db, worker, cut, hasId = null) {
   return retrySync(() => {
     let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.indexed_at<=?";

@@ -95,8 +95,6 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS accounts(username TEXT PRIMARY KEY, total_bytes INTEGER DEFAULT 0, nrepo INTEGER DEFAULT 0)`,
   `CREATE TABLE IF NOT EXISTS repos(id TEXT, kind TEXT, account TEXT, size INTEGER DEFAULT 0, nfile INTEGER DEFAULT 0, PRIMARY KEY(id, kind))`,
   `CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY AUTOINCREMENT, repo_id TEXT, kind TEXT, path TEXT, name TEXT, size INTEGER, off TEXT)`,
-  `CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)`,
-  `CREATE INDEX IF NOT EXISTS idx_files_repo ON files(repo_id)`,
   `CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, val TEXT)`,
   `CREATE TABLE IF NOT EXISTS stems(stem TEXT PRIMARY KEY, n INTEGER DEFAULT 0, scanned_at INTEGER DEFAULT 0, added INTEGER DEFAULT 0)`,
   `CREATE TABLE IF NOT EXISTS seen_ext(ext TEXT PRIMARY KEY, n INTEGER DEFAULT 0, farm_n INTEGER DEFAULT 0, sample TEXT)`,
@@ -134,6 +132,12 @@ const IDX2 = [
 // COUNT có index khi cần (đọc rẻ hơn ghi rất nhiều trong quota Turso).
 const TRG_NAMES = ["trg_rep_ins", "trg_rep_del", "trg_rep_upd", "trg_acc_ins", "trg_acc_del", "trg_acc_upd"];
 const DROP_TRG = TRG_NAMES.map((t) => ({ sql: "DROP TRIGGER IF EXISTS " + t }));
+// 2 index dư: idx_files_repo bị idx_files_rp(repo_id,kind,path) phủ; idx_files_name
+// bị idx_files_sizename(name,size) phủ. Bỏ để mỗi file chỉ còn 2 index (giảm ~40% writes).
+const DROP_IDX = [
+  { sql: "DROP INDEX IF EXISTS idx_files_name" },
+  { sql: "DROP INDEX IF EXISTS idx_files_repo" },
+];
 
 export async function ensureSchema(db) {
   await db.batch(SCHEMA.map((sql) => ({ sql })));
@@ -143,7 +147,7 @@ export async function ensureSchema(db) {
     if (!have) { try { await db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${d}`); } catch { /* đã có cột */ } }
   }
   await db.batch(IDX2.map((sql) => ({ sql })));
-  await db.batch(DROP_TRG);
+  await db.batch([...DROP_TRG, ...DROP_IDX]);
   await db.batch([
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('prio_idx_v1','1')" },
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('prio_backfill_v3','1')" },
@@ -161,7 +165,6 @@ export async function ensureSchema(db) {
   // Quét rác 1 lần: account không có phim (has_id=0) và đã index hết (không còn repo 'new')
   // -> junk vĩnh viễn. Sau bước này inv/index chỉ còn làm account thật.
   if (!(await metaGet(db, "junk_sweep_v1"))) {
-    await db.batch(DROP_TRG);
     const r = await db.exec("UPDATE accounts SET junk=1, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE junk=0 AND has_id=0 AND username NOT IN (SELECT account FROM repos WHERE state='new')", [Date.now()]);
     await db.exec("UPDATE repos SET junk=1 WHERE junk=0 AND account IN (SELECT username FROM accounts WHERE junk=1)");
     await metaSet(db, "junk_sweep_v1", "1");
@@ -185,7 +188,7 @@ export async function metaGet(db, k) { const r = await db.exec("SELECT val FROM 
 export async function metaSet(db, k, v) { await db.exec("INSERT OR REPLACE INTO meta(key,val) VALUES(?,?)", [k, String(v)]); }
 
 export async function storeTree(db, repoId, kind, files, off) {
-  const ins = [], extMap = new Map();
+  const want = new Map(), extMap = new Map();
   let n = 0, size = 0, hasPhim = false;
   for (const f of files) {
     if (f.type && f.type !== "file") continue;
@@ -198,13 +201,45 @@ export async function storeTree(db, repoId, kind, files, off) {
     hasPhim = true;
     const sz = f.size || 0;
     const oid = f.oid || f.xetHash || off || null;
-    ins.push({ sql: "INSERT INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
+    want.set(p, [bn, sz, oid]);
     n++; size += sz;
   }
-  const stmts = [{ sql: "DELETE FROM files WHERE repo_id=? AND kind=?", args: [repoId, kind] }, ...ins];
-  await db.batch(stmts, 500);
+  // Chỉ ghi phần thay đổi: đọc trạng thái hiện có (covering idx_files_rp) rồi so sánh.
+  // Repo lớn ít đổi (bucket updatedAt đổi nhưng đa số file y nguyên) giảm mạnh writes.
+  const cur = await db.exec("SELECT path,name,size,off FROM files WHERE repo_id=? AND kind=?", [repoId, kind]);
+  const have = new Map();
+  for (const r of cur.rows) have.set(r.path, [r.name, r.size, r.off]);
+  const existing = have.size;
+  const stmts = [];
+  let del = 0, ins = 0, upd = 0;
+  for (const [p, [bn, sz, oid]] of want) {
+    const h = have.get(p);
+    if (!h) {
+      stmts.push({ sql: "INSERT INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
+      ins++;
+      continue;
+    }
+    have.delete(p);
+    if (h[0] !== bn || h[1] !== sz || (h[2] ?? null) !== (oid ?? null)) {
+      stmts.push({ sql: "UPDATE files SET name=?,size=?,off=? WHERE repo_id=? AND kind=? AND path=?", args: [bn, sz, oid, repoId, kind, p] });
+      upd++;
+    }
+  }
+  for (const p of have.keys()) {
+    stmts.push({ sql: "DELETE FROM files WHERE repo_id=? AND kind=? AND path=?", args: [repoId, kind, p] });
+    del++;
+  }
+  const changed = del + ins + upd;
+  if (changed && changed * 2 > n + existing) {
+    // Đổi quá nửa: full rewrite rẻ hơn nhiều câu lẻ.
+    const full = [{ sql: "DELETE FROM files WHERE repo_id=? AND kind=?", args: [repoId, kind] }];
+    for (const [p, [bn, sz, oid]] of want) full.push({ sql: "INSERT INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
+    await db.batch(full, 500);
+  } else if (stmts.length) {
+    await db.batch(stmts, 500);
+  }
   await noteExts(db, extMap, hasPhim);
-  return { n, size };
+  return { n, size, del, ins, upd };
 }
 
 async function noteExts(db, extMap, hasPhim) {
@@ -240,8 +275,10 @@ export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, up
 // (không đụng state/worker -> 2 index thay vì 6) và gom batch, flush bằng flushTouches().
 const touchBuf = [];
 const TOUCH_BATCH = 100;
+// Jitter tất định 0..30 phút để cohort TTL 6h không cùng hết hạn một phút (giảm đỉnh writes).
+const h32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
 export async function touchRepo(db, id, kind, sha, updated) {
-  const block = Math.floor(Date.now() / 300000) * 300000;
+  const block = Math.floor(Date.now() / 300000) * 300000 - (h32(kind + ":" + id) % 1800000);
   const key = kind + ":" + id;
   if (staleSeen.delete(key)) {
     staleDone.add(key);
@@ -270,7 +307,23 @@ export async function recoverStale(db, ms = 300000) {
   return r.changes;
 }
 
+let noReturning = false;
 export async function claimRepo(db, worker, kind = null) {
+  // 1 câu UPDATE...RETURNING thay cho SELECT+UPDATE (bớt 1 read, atomic, hết race).
+  const where = kind
+    ? "state='new' AND kind=? AND junk=0"
+    : "state='new' AND kind IN ('dataset','bucket') AND junk=0";
+  const params = kind ? [worker, Date.now(), kind] : [worker, Date.now()];
+  if (!noReturning) {
+    try {
+      const r = await db.exec(
+        `UPDATE repos SET state='fetching', worker=?, indexed_at=? WHERE rowid=(SELECT rowid FROM repos WHERE ${where} ORDER BY prio DESC, last_modified DESC, rowid LIMIT 1) AND state='new' RETURNING id, account, kind`,
+        params
+      );
+      return r.rows[0] || null;
+    } catch { noReturning = true; }
+  }
+  // Turso cũ không hỗ trợ RETURNING -> fallback như trước.
   for (let i = 0; i < 50; i++) {
     const sql = kind
       ? "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='new' AND r.kind=? AND r.junk=0 ORDER BY r.prio DESC, r.last_modified DESC, r.rowid LIMIT 1"
@@ -440,10 +493,18 @@ export async function countPending(db, cut, adaptive = false) {
     : "SELECT COUNT(*) c FROM accounts WHERE junk=0 AND scanned_at<=?";
   return (await db.exec(sql, [cut])).rows[0].c;
 }
+export async function countStaleHasId(db, cutHasId) {
+  const r = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND indexed_at<=?", [cutHasId]);
+  return r.rows[0]?.c || 0;
+}
+// has_id=0 thường chiếm ~85k dòng (không có file) -> COUNT đầy đủ rất tốn read.
+// Chỉ cần biết "còn nhiều hay không": cap 10k dòng, quét tối đa 10k thay vì 85k.
+export async function countStaleNoId(db, cutNoId, cap = 10000) {
+  const r = await db.exec("SELECT COUNT(*) c FROM (SELECT 1 FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND indexed_at<=? LIMIT ?)", [cutNoId, cap]);
+  return r.rows[0]?.c || 0;
+}
 export async function countStale(db, cutHasId, cutNoId) {
-  const r1 = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND indexed_at<=?", [cutHasId]);
-  const r2 = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND indexed_at<=?", [cutNoId]);
-  return (r1.rows[0]?.c || 0) + (r2.rows[0]?.c || 0);
+  return (await countStaleHasId(db, cutHasId)) + (await countStaleNoId(db, cutNoId));
 }
 // Claim stale trong bộ nhớ (workflow crawl có concurrency group -> chỉ 1 crawler),
 // không ghi state='fetching'. Đọc theo lô; flush touch trước để lô mới không lặp repo vừa xử lý.
