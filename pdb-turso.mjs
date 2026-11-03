@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 
 export const IDF = /^[A-Z0-9]{10,17}$/;
+export const IS_TIMESTAMP = /^\d{8}T\d{4,6}Z?$/i;
 export const PHIM_EXT = new Set([
   ".h5", ".hdf5", ".pb", ".arrow", ".model", ".pth", ".safetensors",
   ".pt", ".ckpt", ".weights", ".tflite", ".onnx", ".keras", ".bin", ".pkl",
@@ -65,14 +66,15 @@ export function isId(name) {
   const b = String(name || "").split("/").pop();
   const m = b.match(/\.[^.]+$/);
   if (!m || !PHIM_EXT.has(m[0].toLowerCase())) return false;
-  return IDF.test(b.slice(0, b.length - m[0].length));
+  const base = b.slice(0, b.length - m[0].length);
+  return IDF.test(base) && !IS_TIMESTAMP.test(base);
 }
 export function idParts(name) {
   const bn = String(name || "").split("/").pop();
   const m = bn.match(/\.[^.]+$/);
   const ext = m ? m[0].toLowerCase() : "(no-ext)";
   const base = m ? bn.slice(0, bn.length - m[0].length) : bn;
-  return { ext, base, ok: IDF.test(base) };
+  return { ext, base, ok: IDF.test(base) && !IS_TIMESTAMP.test(base) };
 }
 
 // ---------- backend: Turso HTTP hoặc SQLite local (test) ----------
@@ -258,6 +260,7 @@ export async function storeTree(db, repoId, kind, files, off) {
     const full = [{ sql: "DELETE FROM files WHERE repo_id=? AND kind=?", args: [repoId, kind] }];
     for (const [p, [bn, sz, oid]] of want) full.push({ sql: "INSERT INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
     await db.batch(full, 500);
+    ins = n; del = existing; upd = 0;
   } else if (stmts.length) {
     await db.batch(stmts, 500);
   }

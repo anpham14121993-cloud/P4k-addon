@@ -487,8 +487,8 @@ async function indexOne() {
     if (!handled) {
       const t = await getTree(r.id, r.kind);
       if (t.ok && Array.isArray(t.data)) {
-        const { n, size } = await storeTree(db, r.id, r.kind, t.data, r.account);
-        wFiles += n;
+        const { n, size, ins, upd } = await storeTree(db, r.id, r.kind, t.data, r.account);
+        wFiles += (ins || 0) + (upd || 0);
         await finishRepo(db, r.id, r.kind, { n, size, entries: t.data.length, sha: info.sha || null, updated: info.lastModified || info.updatedAt || 0 });
         await reevalAccount(db, r.account);
       } else if (t.status === 404 || t.status === 401 || t.status === 403) {

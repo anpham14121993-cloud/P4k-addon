@@ -4,6 +4,7 @@ import fs from "fs";
 export const DB_PATH = process.env.P4K_DB || "/sdcard/Download/P4k/phim4k.db";
 export const SCAN_PATH = process.env.P4K_SCAN || "/tmp/opencode/aw/scan2.json";
 export const IDF = /^[A-Z0-9]{10,17}$/;
+export const IS_TIMESTAMP = /^\d{8}T\d{4,6}Z?$/i;
 // Đuôi hợp lệ của file phim (farm giấu video dưới đuôi ML/model hoặc video thật).
 // Loại ảnh/tài liệu/audio/data (.png .jpg .npy .json .md .wav .parquet .pdb ...).
 export const PHIM_EXT = new Set([
@@ -220,7 +221,7 @@ export function isId(name) {
   const b = String(name || "").split("/").pop();
   const m = b.match(/\.[^.]+$/);
   if (!m || !PHIM_EXT.has(m[0].toLowerCase())) return false;
-  return IDF.test(b.slice(0, b.length - m[0].length));
+  return IDF.test(b.slice(0, b.length - m[0].length)) && !IS_TIMESTAMP.test(b.slice(0, b.length - m[0].length));
 }
 // Tách đuôi + id của basename (ok = id khớp IDF, BẤT KỂ đuôi) — để ghi nhận đuôi lạ.
 export function idParts(name) {
@@ -228,7 +229,7 @@ export function idParts(name) {
   const m = bn.match(/\.[^.]+$/);
   const ext = m ? m[0].toLowerCase() : "(no-ext)";
   const base = m ? bn.slice(0, bn.length - m[0].length) : bn;
-  return { ext, base, ok: IDF.test(base) };
+  return { ext, base, ok: IDF.test(base) && !IS_TIMESTAMP.test(base) };
 }
 // Ghi nhận thống kê đuôi (MỌI đuôi, kể cả chưa whitelist) — để phát hiện đuôi phim MỚI.
 // farm_n = số file đuôi này nằm trong repo CÓ đuôi phim hợp lệ (dấu hiệu farm thật).
