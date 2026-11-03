@@ -541,32 +541,71 @@ const staleSeen = new Set();
 const staleDone = new Set();
 const staleQ = new Map();
 const staleFill = new Map();
+const staleCursor = new Map();
+const staleAtEnd = new Map();
 const STALE_BATCH = 200;
+
+export function resetStaleQueue(hasId = null) {
+  if (hasId === null) {
+    staleCursor.clear();
+    staleAtEnd.clear();
+    staleQ.clear();
+  } else {
+    const qk = String(hasId);
+    staleCursor.delete(qk);
+    staleAtEnd.delete(qk);
+    staleQ.delete(qk);
+  }
+}
+
 export async function claimRepoStale(db, worker, cut, hasId = null) {
   const qk = String(hasId);
-  if (!(staleQ.get(qk) || []).length) {
-    if (!staleFill.has(qk)) staleFill.set(qk, (async () => {
-      await flushTouches(db);
-      let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.due_at<=?";
-      const params = [cut];
-      if (hasId !== null) {
-        sql += " AND r.has_id=?";
-        params.push(hasId ? 1 : 0);
+  while (true) {
+    let q = staleQ.get(qk);
+    if (!q || !q.length) {
+      if (staleAtEnd.get(qk)) {
+        return null;
       }
-      sql += " ORDER BY r.has_id DESC, r.due_at ASC LIMIT " + STALE_BATCH;
-      staleQ.set(qk, (await db.exec(sql, params)).rows);
-    })().finally(() => staleFill.delete(qk)));
-    await staleFill.get(qk);
+      if (!staleFill.has(qk)) staleFill.set(qk, (async () => {
+        await flushTouches(db);
+        let sql = "SELECT r.id,r.account,r.kind,r.due_at FROM repos r WHERE r.state='done' AND r.junk=0 AND r.due_at<=?";
+        const params = [cut];
+        if (hasId !== null) {
+          sql += " AND r.has_id=?";
+          params.push(hasId ? 1 : 0);
+        }
+        const cursor = staleCursor.get(qk);
+        if (cursor) {
+          sql += " AND (r.due_at > ? OR (r.due_at = ? AND r.id > ?))";
+          params.push(cursor.due, cursor.due, cursor.id);
+        }
+        sql += " ORDER BY r.due_at ASC, r.id ASC LIMIT " + STALE_BATCH;
+        const rows = (await db.exec(sql, params)).rows;
+        if (rows.length) {
+          const last = rows[rows.length - 1];
+          staleCursor.set(qk, { due: last.due_at, id: last.id });
+        }
+        if (rows.length < STALE_BATCH) {
+          staleAtEnd.set(qk, true);
+        }
+        staleQ.set(qk, rows);
+      })().finally(() => staleFill.delete(qk)));
+      await staleFill.get(qk);
+      q = staleQ.get(qk) || [];
+    }
+
+    while (q.length) {
+      const row = q.shift();
+      const key = row.kind + ":" + row.id;
+      if (staleSeen.has(key) || staleDone.has(key)) continue;
+      staleSeen.add(key);
+      return row;
+    }
+
+    if (staleAtEnd.get(qk)) {
+      return null;
+    }
   }
-  const q = staleQ.get(qk) || [];
-  while (q.length) {
-    const row = q.shift();
-    const key = row.kind + ":" + row.id;
-    if (staleSeen.has(key) || staleDone.has(key)) continue;
-    staleSeen.add(key);
-    return row;
-  }
-  return null;
 }
 export function releaseStale(db, id, kind) {
   staleSeen.delete(kind + ":" + id);

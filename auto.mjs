@@ -13,7 +13,7 @@ const {
   upsertRepoMeta, claimRepo, recoverStale, isFarm, isFarmStrict, isId, log, repoCounts,
   applyGitDiff, accountScore, getAccount, insertAccount, setScanned, pendingAccounts, countPending,
   countNew, stateCounts, getRepoPrev, pendingAccountsAdaptive, countPendingAdaptive,
-  claimRepoStale, clearJunk, markJunk, countStale, countStaleHasId, countStaleNoId, flushTouches, releaseStale,
+  claimRepoStale, clearJunk, markJunk, countStale, countStaleHasId, countStaleNoId, flushTouches, releaseStale, resetStaleQueue,
 } = P;
 
 const db = openDB();
@@ -447,10 +447,21 @@ async function indexOne() {
   const now = Date.now();
   // Ưu tiên stale has_id=1 (TTL 6h), hết mới tới has_id=0 (TTL 24h)
   let stale = null, staleTier = -1;
-  if (staleHasId > 0) { stale = await claimRepoStale(db, "auto", now, 1); if (stale) staleTier = 1; }
-  if (!stale && staleNoId > 0) { stale = await claimRepoStale(db, "auto", now, 0); if (stale) staleTier = 0; }
+  if (staleHasId > 0) {
+    stale = await claimRepoStale(db, "auto", now, 1);
+    if (stale) staleTier = 1;
+    else staleHasId = 0;
+  }
+  if (!stale && staleNoId > 0) {
+    stale = await claimRepoStale(db, "auto", now, 0);
+    if (stale) staleTier = 0;
+    else staleNoId = 0;
+  }
   const r = stale || (await claimRepo(db, "auto"));
-  if (!r) return false;
+  if (!r) {
+    staleBacklog = staleHasId + staleNoId;
+    return false;
+  }
   if (stale) {
     staleBusy++;
     if (staleTier === 1) { if (staleHasId > 0) staleHasId--; }
@@ -545,9 +556,25 @@ const timer = setInterval(async () => {
   try { await flushTouches(db); } catch (e) { log("touch flush err " + (e.message || e)); }
   if (tickN % 30 === 0) {
     recoverStale(db, 300000).catch(() => {});
-    try { staleHasId = await countStaleHasId(db, Date.now()); } catch (e) { log("stale resync err " + (e.message || e)); }
+    try {
+      const cnt = await countStaleHasId(db, Date.now());
+      if (cnt > 0) {
+        if (resetStaleQueue) resetStaleQueue(1);
+        staleHasId = cnt;
+      } else {
+        staleHasId = 0;
+      }
+    } catch (e) { log("stale resync err " + (e.message || e)); }
     if (tickN % 180 === 0) {
-      try { staleNoId = await countStaleNoId(db, Date.now()); } catch (e) { log("stale resync err " + (e.message || e)); }
+      try {
+        const cnt0 = await countStaleNoId(db, Date.now());
+        if (cnt0 > 0) {
+          if (resetStaleQueue) resetStaleQueue(0);
+          staleNoId = cnt0;
+        } else {
+          staleNoId = 0;
+        }
+      } catch (e) { log("stale resync err " + (e.message || e)); }
     }
     staleBacklog = staleHasId + staleNoId;
   }

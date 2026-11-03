@@ -552,6 +552,7 @@ export function countPendingAdaptive(db, cut) { return countPending(db, cut, tru
 export function countStaleHasId(db, now) { const r = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND due_at<=?").get(now); return r?.c || 0; }
 export function countStaleNoId(db, now, cap = 10000) { const r = db.prepare("SELECT COUNT(*) c FROM (SELECT 1 FROM repos WHERE state='done' AND junk=0 AND has_id=0 AND due_at<=? LIMIT ?)").get(now, cap); return r?.c || 0; }
 export function countStale(db, cutHasId, cutNoId) { return countStaleHasId(db, cutHasId) + countStaleNoId(db, cutNoId); }
+export function resetStaleQueue(hasId = null) {}
 export function claimRepoStale(db, worker, cut, hasId = null) {
   return retrySync(() => {
     let sql = "SELECT r.id,r.account,r.kind FROM repos r WHERE r.state='done' AND r.junk=0 AND r.due_at<=?";
