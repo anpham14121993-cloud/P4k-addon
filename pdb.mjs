@@ -14,10 +14,10 @@ export const PHIM_EXT = new Set([
   ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp",
 ]);
 export const JUNK_EMPTY = parseInt(process.env.P4K_JUNK_EMPTY || "3", 10);
-// TTL: repo có phim (has_id=1) 1h; repo không có phim (has_id=0) 24h.
-const REPO_TTL_HAS_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "3600000", 10));
+// TTL: repo có phim (has_id=1) 6h; repo không có phim (has_id=0) 24h.
+const REPO_TTL_HAS_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10));
 const REPO_TTL_NOID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10));
-const JITTER_MS = 600000;
+const JITTER_MS = 3600000;
 const h32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
 const dueAt = (hasId, updated, key) => {
   const now = Date.now();
