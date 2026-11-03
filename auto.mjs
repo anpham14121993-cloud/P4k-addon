@@ -34,7 +34,7 @@ const FEED_TOP = process.env.P4K_FEED_TOP === "1";
 // 1 trang top đủ phát hiện dataset mới (1000 item ~ 8-9h ở nhịp hiện tại).
 const POLL_MS = Math.max(0, parseInt(process.env.P4K_POLL_MS || "0", 10));
 const POLL_PAGES = Math.max(1, parseInt(process.env.P4K_POLL_PAGES || "1", 10));
-const POLL_END = Math.min(DEADLINE, START + Math.max(0, parseInt(process.env.P4K_POLL_UNTIL || "1800", 10)) * 1000);
+const POLL_END = Math.min(DEADLINE, START + Math.max(0, parseInt(process.env.P4K_POLL_UNTIL || "3000", 10)) * 1000);
 // Lane bucket: mỗi account 1 request /api/buckets/{user}, xoay vòng 1 lượt/run.
 const ENABLE_BKT = process.env.P4K_BKT !== "0";
 const BKT_WORKERS = Math.max(1, parseInt(process.env.P4K_BKT_WORKERS || "4", 10));
