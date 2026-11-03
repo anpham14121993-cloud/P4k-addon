@@ -544,7 +544,15 @@ async function indexWorker() {
   while (!stopState.stop) {
     if (limits.index < 1 || (pending.index === 0 && staleBacklog === 0)) { await sleep(1000); continue; }
     await slot("index");
-    try { if (!(await indexOne())) { done("index"); await sleep(1500); continue; } } catch (e) { if (e instanceof Stop) { stopState.stop = true; } else log("index err " + (e.message || e)); } finally { done("index"); }
+    try {
+      const ok = await indexOne();
+      if (!ok) { await sleep(1500); continue; }
+    } catch (e) {
+      if (e instanceof Stop) { stopState.stop = true; }
+      else log("index err " + (e.message || e));
+    } finally {
+      done("index");
+    }
   }
 }
 

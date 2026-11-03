@@ -137,6 +137,7 @@ const IDX2 = [
   `CREATE INDEX IF NOT EXISTS idx_repos_due ON repos(junk, state, has_id DESC, due_at ASC)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_junkfiles ON repos(junk, nfile)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_account_junk ON repos(account, junk)`,
 ];
 // Triggers counter ĐÃ BỎ: chúng ghi +4 dòng counters mỗi lần repo đổi state/junk
 // (mỗi repo stale đổi state 2 lần -> 8 dòng), là nguồn write lớn nhất. Thay bằng
@@ -433,7 +434,7 @@ export async function reevalAccount(db, u) {
 export async function markJunk(db, u) {
   const now = Date.now();
   const r = await db.exec("UPDATE accounts SET junk=1, scanned_at=?, next_scan_at=? + " + JUNK_RETRY_MS + " WHERE username=?", [now, now, u]);
-  await db.exec("UPDATE repos SET junk=1 WHERE account=? AND junk=0", [u]);
+  await db.exec("UPDATE repos INDEXED BY idx_repos_account_junk SET junk=1 WHERE account=? AND junk=0", [u]);
   return r.changes;
 }
 
@@ -612,7 +613,7 @@ export function releaseStale(db, id, kind) {
 }
 export async function clearJunk(db, u) {
   const r = await db.exec("UPDATE accounts SET junk=0, next_scan_at=scanned_at + CASE WHEN has_id=1 THEN 18000000 WHEN nrepo>0 THEN 604800000 ELSE 1209600000 END WHERE username=?", [u]);
-  await db.exec("UPDATE repos SET junk=0 WHERE account=? AND junk=1", [u]);
+  await db.exec("UPDATE repos INDEXED BY idx_repos_account_junk SET junk=0 WHERE account=? AND junk=1", [u]);
   return r.changes;
 }
 export async function getRepoPrev(db, id, kind) {
