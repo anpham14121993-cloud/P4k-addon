@@ -149,12 +149,11 @@ let staleBusy = 0;
 const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10));
 let wFiles = 0;
 const stopState = { stop: false };
-// TTL động: has_id=1 (có file phim) 1h, has_id=0 (không có phim) 24h, nóng (updated 24h) 30m
-const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "3600000", 10)); // idle 1h
+// TTL: has_id=1 (có file phim) 1h, has_id=0 (không có phim) 24h
+const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "3600000", 10)); // 1h
 const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10)); // 24h
-const REPO_TTL_HOT_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_HOT || "1800000", 10)); // nóng 30m
 // Tách 2 tầng: has_id=1 đếm đầy đủ (nhỏ), has_id=0 đếm cap 10k (lớn nhưng không có file).
-// due_at đã là hạn tuyệt đối (hot 30m / idle 1h / no_id 24h) nên chỉ cần so với now.
+// due_at đã là hạn tuyệt đối (has_id 1h / no_id 24h) nên chỉ cần so với now.
 let staleHasId = await countStaleHasId(db, Date.now());
 let staleNoId = await countStaleNoId(db, Date.now());
 let staleBacklog = staleHasId + staleNoId; // backlog recheck thật (đếm 1 lần, giảm dần)
@@ -535,7 +534,7 @@ async function indexWorker() {
 }
 
 // ---------------- main ----------------
-log(`AUTO start ttl_repo=hot${REPO_TTL_HOT_MS/3600000}h/idle${REPO_TTL_HAS_ID_MS/3600000}h/noid${REPO_TTL_NO_ID_MS/3600000}h db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} poll=${POLL_MS ? `${POLL_MS/1000}s/${Math.max(0, Math.round((POLL_END - START) / 1000))}s` : "off"} bkt=${ENABLE_BKT ? `${BKT_WORKERS}x${BKT_SWEEPS}/${BKT_EVERY_MS/1000}s` : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
+log(`AUTO start ttl_repo=has${REPO_TTL_HAS_ID_MS/3600000}h/noid${REPO_TTL_NO_ID_MS/3600000}h db=${process.env.P4K_DB || "default"} tokens=${lanes.length} gap=${GAP} slots/token=${SLOTS_PER_TOKEN} total=${TOTAL} ttl=${FIXED == null ? "adaptive" : FIXED} feed=${ENABLE_FEED ? (FEED_MAX_PAGES || "inf") : "off"} poll=${POLL_MS ? `${POLL_MS/1000}s/${Math.max(0, Math.round((POLL_END - START) / 1000))}s` : "off"} bkt=${ENABLE_BKT ? `${BKT_WORKERS}x${BKT_SWEEPS}/${BKT_EVERY_MS/1000}s` : "off"} budget=${BUDGET === 1e9 ? "inf" : BUDGET / 1000 + "s"} idle_exit=${IDLE_EXIT / 1000}s`);
 await refreshInv();
 await rebalance();
 let idleTicks = 0, tickN = 0;

@@ -55,7 +55,6 @@ jobs:
           P4K_BKT_EVERY: "600000"
           P4K_REPO_TTL: "3600000"
           P4K_REPO_TTL_NO_ID: "86400000"
-          P4K_REPO_TTL_HOT: "1800000"
           P4K_IDLE_EXIT: "60"
           P4K_WRITE_CAP: "200000"
         run: |

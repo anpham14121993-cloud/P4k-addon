@@ -13,16 +13,14 @@ export const PHIM_EXT = new Set([
   ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp",
 ]);
 export const JUNK_EMPTY = parseInt(process.env.P4K_JUNK_EMPTY || "3", 10);
-// TTL thích ứng: repo "nóng" (updated trong 24h) recheck 30m; repo idle has_id=1 1h; has_id=0 24h.
-const REPO_TTL_HOT_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_HOT || "1800000", 10));
+// TTL: repo có phim (has_id=1) 1h; repo không có phim (has_id=0) 24h.
 const REPO_TTL_HAS_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "3600000", 10));
 const REPO_TTL_NOID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10));
-const HOT_WINDOW_MS = Math.max(3600000, parseInt(process.env.P4K_REPO_HOT_WINDOW || "86400000", 10));
 const JITTER_MS = 600000;
 const h32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
 const dueAt = (hasId, updated, key) => {
   const now = Date.now();
-  const ttl = !hasId ? REPO_TTL_NOID_MS : (updated && updated >= now - HOT_WINDOW_MS ? REPO_TTL_HOT_MS : REPO_TTL_HAS_MS);
+  const ttl = hasId ? REPO_TTL_HAS_MS : REPO_TTL_NOID_MS;
   return now + ttl - (h32(key) % JITTER_MS);
 };
 export const isFarm = (u) => { const s = String(u); return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s) || /^[a-z]{12,}$/i.test(s); };
@@ -197,12 +195,11 @@ export async function ensureSchema(db) {
     await metaSet(db, "acct_ttl5h_v1", "1");
     log("acct_ttl5h_v1 xong, reschedule " + r.changes);
   }
-  // due_at_v1: backfill hạn recheck thích ứng từ indexed_at + TTL (nóng 1h / idle 6h / no_id 24h).
+  // due_at_v1: backfill hạn recheck từ indexed_at + TTL (has_id 1h / no_id 24h).
   if (!(await metaGet(db, "due_at_v1"))) {
-    const now = Date.now();
     const r = await db.exec(
-      "UPDATE repos SET due_at = indexed_at + CASE WHEN has_id=0 THEN ? WHEN COALESCE(updated,0) >= ? THEN ? ELSE ? END - (RANDOM() & 2097151) WHERE state='done' AND (due_at IS NULL OR due_at=0)",
-      [REPO_TTL_NOID_MS, now - HOT_WINDOW_MS, REPO_TTL_HOT_MS, REPO_TTL_HAS_MS]
+      "UPDATE repos SET due_at = indexed_at + CASE WHEN has_id=0 THEN ? ELSE ? END - (RANDOM() & 2097151) WHERE state='done' AND (due_at IS NULL OR due_at=0)",
+      [REPO_TTL_NOID_MS, REPO_TTL_HAS_MS]
     );
     await metaSet(db, "due_at_v1", "1");
     log("due_at_v1 backfill " + r.changes);
@@ -305,11 +302,12 @@ export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, up
 const touchBuf = [];
 const TOUCH_BATCH = 100;
 // Hạn recheck thích ứng, tính từ cột has_id/updated của dòng hiện tại + jitter tất định.
-const DUE_SQL = "? + CASE WHEN has_id=0 THEN ? WHEN COALESCE(?, updated) >= ? THEN ? ELSE ? END - ?";
+// Hạn recheck: has_id=1 1h, has_id=0 24h + jitter tất định.
+const DUE_SQL = "? + CASE WHEN has_id=0 THEN ? ELSE ? END - ?";
 export async function touchRepo(db, id, kind, sha, updated) {
   const block = Math.floor(Date.now() / 300000) * 300000;
   const jit = h32(kind + ":" + id) % JITTER_MS;
-  const dueArgs = [block, block, REPO_TTL_NOID_MS, updated ?? null, Date.now() - HOT_WINDOW_MS, REPO_TTL_HOT_MS, REPO_TTL_HAS_MS, jit];
+  const dueArgs = [block, block, REPO_TTL_NOID_MS, REPO_TTL_HAS_MS, jit];
   const key = kind + ":" + id;
   if (staleSeen.delete(key)) {
     staleDone.add(key);

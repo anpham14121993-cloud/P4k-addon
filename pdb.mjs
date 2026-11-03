@@ -14,15 +14,14 @@ export const PHIM_EXT = new Set([
   ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp",
 ]);
 export const JUNK_EMPTY = parseInt(process.env.P4K_JUNK_EMPTY || "3", 10);
-const REPO_TTL_HOT_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_HOT || "1800000", 10));
+// TTL: repo có phim (has_id=1) 1h; repo không có phim (has_id=0) 24h.
 const REPO_TTL_HAS_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "3600000", 10));
 const REPO_TTL_NOID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10));
-const HOT_WINDOW_MS = Math.max(3600000, parseInt(process.env.P4K_REPO_HOT_WINDOW || "86400000", 10));
 const JITTER_MS = 600000;
 const h32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
 const dueAt = (hasId, updated, key) => {
   const now = Date.now();
-  const ttl = !hasId ? REPO_TTL_NOID_MS : (updated && updated >= now - HOT_WINDOW_MS ? REPO_TTL_HOT_MS : REPO_TTL_HAS_MS);
+  const ttl = hasId ? REPO_TTL_HAS_MS : REPO_TTL_NOID_MS;
   return now + ttl - (h32(key) % JITTER_MS);
 };
 // isFarm (RỘNG): chữ+số (abc123), chữ+số+chữ (hoanglong2k5), chữ-only dài >=12 (nguyenthimaihuong).
@@ -152,7 +151,7 @@ export function ensureSchema(db) {
   db.exec("DROP INDEX IF EXISTS idx_repos_stale; DROP INDEX IF EXISTS idx_repos_stale_due; CREATE INDEX IF NOT EXISTS idx_repos_due ON repos(junk, state, has_id DESC, due_at ASC)");
   if (!metaGet(db, "due_at_v1")) {
     const now = Date.now();
-    db.exec("UPDATE repos SET due_at = indexed_at + CASE WHEN has_id=0 THEN " + REPO_TTL_NOID_MS + " WHEN COALESCE(updated,0) >= " + (now - HOT_WINDOW_MS) + " THEN " + REPO_TTL_HOT_MS + " ELSE " + REPO_TTL_HAS_MS + " END - (RANDOM() & 2097151) WHERE state='done' AND (due_at IS NULL OR due_at=0)");
+    db.exec("UPDATE repos SET due_at = indexed_at + CASE WHEN has_id=0 THEN " + REPO_TTL_NOID_MS + " ELSE " + REPO_TTL_HAS_MS + " END - (RANDOM() & 2097151) WHERE state='done' AND (due_at IS NULL OR due_at=0)");
     metaSet(db, "due_at_v1", "1");
   }
   if (!metaGet(db, "prio_idx_v1")) {
@@ -364,7 +363,7 @@ export function touchRepo(db, id, kind, sha, updated) {
   const now = Date.now();
   const block = Math.floor(now / 300000) * 300000;
   const jit = h32(kind + ":" + id) % JITTER_MS;
-  return retrySync(() => db.prepare("UPDATE repos SET state='done', indexed_at=?, due_at=? + CASE WHEN has_id=0 THEN ? WHEN COALESCE(?, updated) >= ? THEN ? ELSE ? END - ?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(block, block, REPO_TTL_NOID_MS, updated ?? null, now - HOT_WINDOW_MS, REPO_TTL_HOT_MS, REPO_TTL_HAS_MS, jit, sha ?? null, updated ?? null, id, kind).changes);
+  return retrySync(() => db.prepare("UPDATE repos SET state='done', indexed_at=?, due_at=? + CASE WHEN has_id=0 THEN ? ELSE ? END - ?, worker=NULL, sha=COALESCE(?, sha), updated=COALESCE(?, updated) WHERE id=? AND kind=? AND state='fetching'").run(block, block, REPO_TTL_NOID_MS, REPO_TTL_HAS_MS, jit, sha ?? null, updated ?? null, id, kind).changes);
 }
 
 export function unclaimRepo(db, id, kind) { retrySync(() => db.prepare("UPDATE repos SET state='new', worker=NULL WHERE id=? AND kind=? AND state='fetching'").run(id, kind)); }
