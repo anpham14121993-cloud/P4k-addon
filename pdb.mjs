@@ -100,7 +100,7 @@ function reposComposite(db) {
 
 const SCHEMA_IDX_TRG = `CREATE INDEX IF NOT EXISTS idx_repos_state ON repos(state);
            CREATE INDEX IF NOT EXISTS idx_repos_account ON repos(account);
-           CREATE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path);
+           CREATE UNIQUE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path);
            CREATE TABLE IF NOT EXISTS counters(k TEXT PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0);
            CREATE INDEX IF NOT EXISTS idx_accounts_next ON accounts(next_scan_at);
            CREATE INDEX IF NOT EXISTS idx_accounts_scan ON accounts(junk, scanned_at);
@@ -248,7 +248,7 @@ export function storeTree(db, repoId, kind, files, off) {
       db.exec("DROP TABLE IF EXISTS _keep; CREATE TEMP TABLE _keep(path TEXT PRIMARY KEY)");
       const keepIns = db.prepare("INSERT OR IGNORE INTO _keep(path) VALUES(?)");
       const up = db.prepare("UPDATE files SET name=?, size=?, off=? WHERE repo_id=? AND kind=? AND path=?");
-      const ins = db.prepare("INSERT INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)");
+      const ins = db.prepare("INSERT OR REPLACE INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)");
       let n = 0, size = 0, hasPhim = false;
       const extMap = new Map();
       for (const f of files) {
@@ -333,7 +333,7 @@ export function applyGitDiff(db, repoId, kind, diff) {
       const del = db.prepare("DELETE FROM files WHERE repo_id=? AND kind=? AND path=?");
       for (const p of dels) del.run(repoId, kind, p);
       const up = db.prepare("UPDATE files SET name=?, size=?, off=? WHERE repo_id=? AND kind=? AND path=?");
-      const ins = db.prepare("INSERT INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)");
+      const ins = db.prepare("INSERT OR REPLACE INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)");
       for (const [p, bn, sz, oid] of ups) { const ch = up.run(bn, sz, oid, repoId, kind, p); if (!ch.changes) ins.run(repoId, kind, p, bn, sz, oid); }
       const repoHasPhim = !!(db.prepare("SELECT 1 FROM files WHERE repo_id=? AND kind=? LIMIT 1").get(repoId, kind)) || [...extMap.keys()].some((e) => PHIM_EXT.has(e));
       noteExts(db, extMap, repoHasPhim);
@@ -427,8 +427,9 @@ export function upsertRepoMeta(db, id, account, kind, lastModified) {
     }
     if (lm > (ex.last_modified || 0) || ex.state === "dead") {
       // Repo từng bị đánh dead nhưng vẫn xuất hiện trong listing -> sống lại, đưa vào hàng đợi index.
-      db.prepare("UPDATE repos SET last_modified=CASE WHEN ? > COALESCE(last_modified,0) THEN ? ELSE last_modified END, state='new', account=?, junk=?, prio=? WHERE id=? AND kind=?").run(lm, lm, account, acc.junk ? 1 : 0, prio, id, kind);
-      return true;
+      const newState = ex.state === "fetching" ? "fetching" : "new";
+      db.prepare("UPDATE repos SET last_modified=CASE WHEN ? > COALESCE(last_modified,0) THEN ? ELSE last_modified END, state=?, account=?, junk=?, prio=? WHERE id=? AND kind=?").run(lm, lm, newState, account, acc.junk ? 1 : 0, prio, id, kind);
+      return newState === "new";
     }
     if (ex.state === "new" && prio > (ex.prio || 0)) db.prepare("UPDATE repos SET prio=? WHERE id=? AND kind=?").run(prio, id, kind);
     return ex.state === "new";

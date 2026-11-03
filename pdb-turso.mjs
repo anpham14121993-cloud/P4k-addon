@@ -111,7 +111,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS stems(stem TEXT PRIMARY KEY, n INTEGER DEFAULT 0, scanned_at INTEGER DEFAULT 0, added INTEGER DEFAULT 0)`,
   `CREATE TABLE IF NOT EXISTS seen_ext(ext TEXT PRIMARY KEY, n INTEGER DEFAULT 0, farm_n INTEGER DEFAULT 0, sample TEXT)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_account ON repos(account)`,
-  `CREATE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_files_rp ON files(repo_id, kind, path)`,
   `CREATE INDEX IF NOT EXISTS idx_files_sizename ON files(name, size)`,
 ];
 // Cột bổ sung (DB import từ SQLite đã có; DB mới thì CREATE ở trên thiếu cột -> thêm mềm).
@@ -238,7 +238,7 @@ export async function storeTree(db, repoId, kind, files, off) {
   for (const [p, [bn, sz, oid]] of want) {
     const h = have.get(p);
     if (!h) {
-      stmts.push({ sql: "INSERT INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
+      stmts.push({ sql: "INSERT OR REPLACE INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
       ins++;
       continue;
     }
@@ -256,7 +256,7 @@ export async function storeTree(db, repoId, kind, files, off) {
   if (changed && changed * 2 > n + existing) {
     // Đổi quá nửa: full rewrite rẻ hơn nhiều câu lẻ.
     const full = [{ sql: "DELETE FROM files WHERE repo_id=? AND kind=?", args: [repoId, kind] }];
-    for (const [p, [bn, sz, oid]] of want) full.push({ sql: "INSERT INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
+    for (const [p, [bn, sz, oid]] of want) full.push({ sql: "INSERT OR REPLACE INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
     await db.batch(full, 100);
     ins = n; del = existing; upd = 0;
   } else if (stmts.length) {
@@ -391,8 +391,10 @@ export async function upsertRepoMeta(db, id, account, kind, lastModified) {
   }
   if (lm > (ex.last_modified || 0) || ex.state === "dead") {
     // Repo từng bị đánh dead nhưng vẫn xuất hiện trong listing -> sống lại, đưa vào hàng đợi index.
-    await db.exec("UPDATE repos SET last_modified=CASE WHEN ? > COALESCE(last_modified,0) THEN ? ELSE last_modified END, state='new', account=?, junk=?, prio=? WHERE id=? AND kind=?", [lm, lm, account, acc.junk ? 1 : 0, prio, id, kind]);
-    return true;
+    // Không hạ state 'fetching' về 'new' khi worker đang xử lý (tránh race condition nhiều worker cùng cào).
+    const newState = ex.state === "fetching" ? "fetching" : "new";
+    await db.exec("UPDATE repos SET last_modified=CASE WHEN ? > COALESCE(last_modified,0) THEN ? ELSE last_modified END, state=?, account=?, junk=?, prio=? WHERE id=? AND kind=?", [lm, lm, newState, account, acc.junk ? 1 : 0, prio, id, kind]);
+    return newState === "new";
   }
   if (ex.state === "new" && prio > (ex.prio || 0)) await db.exec("UPDATE repos SET prio=? WHERE id=? AND kind=?", [prio, id, kind]);
   return ex.state === "new";

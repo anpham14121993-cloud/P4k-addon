@@ -447,6 +447,7 @@ async function bktWorker() {
 
 // ---------------- role: index ----------------
 let idxN = 0, idxInc = 0;
+const indexBusy = new Set();
 async function indexOne() {
   const now = Date.now();
   // Ưu tiên stale has_id=1 (TTL 6h), hết mới tới has_id=0 (TTL 24h)
@@ -466,6 +467,13 @@ async function indexOne() {
     staleBacklog = staleHasId + staleNoId;
     return false;
   }
+  const rKey = r.kind + ":" + r.id;
+  if (indexBusy.has(rKey)) {
+    if (stale) releaseStale(db, r.id, r.kind);
+    else await unclaimRepo(db, r.id, r.kind);
+    return false;
+  }
+  indexBusy.add(rKey);
   if (stale) {
     staleBusy++;
     if (staleTier === 1) { if (staleHasId > 0) staleHasId--; }
@@ -512,7 +520,7 @@ async function indexOne() {
       else { if (stale) releaseStale(db, r.id, r.kind); else await unclaimRepo(db, r.id, r.kind); await sleep(1500); }
     } else if (changed && r.account) await reevalAccount(db, r.account);
   } catch (e) { if (stale) releaseStale(db, r.id, r.kind); else await unclaimRepo(db, r.id, r.kind); throw e; }
-  finally { if (stale) staleBusy--; }
+  finally { indexBusy.delete(rKey); if (stale) staleBusy--; }
   if (++idxN % 20 === 0) log(`index ${idxN} (last ${r.kind}:${r.id}) inc=${idxInc} upd=${stale ? "yes" : "no"}`);
   return true;
 }
