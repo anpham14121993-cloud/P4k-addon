@@ -247,8 +247,12 @@ async function feedOne() {
     if (feedIds.has(id)) { feedDup++; continue; } // trùng trong run: đã xử lý rồi, khỏi đọc DB lại
     feedIds.add(id);
     if (!isFarmStrict(author)) continue;
-    const acc = await accOf(author);
-    if (acc?.junk) continue;
+    let acc = await accOf(author);
+    if (acc?.junk) {
+      await clearJunk(db, author);
+      accCache.delete(author);
+      acc = await accOf(author);
+    }
     const hasId = !!(acc && acc.has_id);
     if (/^[A-Z]/.test(author) && !hasId) { feedStyle++; continue; }
     if (acc && acc.nrepo >= 20 && !hasId) { feedStyle++; continue; }
