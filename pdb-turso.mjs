@@ -256,10 +256,10 @@ export async function storeTree(db, repoId, kind, files, off) {
     // Đổi quá nửa: full rewrite rẻ hơn nhiều câu lẻ.
     const full = [{ sql: "DELETE FROM files WHERE repo_id=? AND kind=?", args: [repoId, kind] }];
     for (const [p, [bn, sz, oid]] of want) full.push({ sql: "INSERT INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
-    await db.batch(full, 500);
+    await db.batch(full, 100);
     ins = n; del = existing; upd = 0;
   } else if (stmts.length) {
-    await db.batch(stmts, 500);
+    await db.batch(stmts, 100);
   }
   await noteExts(db, extMap, hasPhim);
   return { n, size, del, ins, upd };
@@ -272,7 +272,7 @@ async function noteExts(db, extMap, hasPhim) {
     sql: "INSERT INTO seen_ext(ext,n,farm_n,sample) VALUES(?,?,?,?) ON CONFLICT(ext) DO UPDATE SET n=n+excluded.n, farm_n=farm_n+excluded.farm_n",
     args: [ext, c, hasPhim ? c : 0, sample],
   });
-  await db.batch(st, 500);
+  await db.batch(st, 100);
 }
 
 export async function repoCounts(db, id, kind) {
@@ -322,7 +322,7 @@ export async function touchRepo(db, id, kind, sha, updated) {
 export async function flushTouches(db) {
   if (!touchBuf.length) return 0;
   const st = touchBuf.splice(0);
-  try { await db.batch(st, 500); } catch (e) { touchBuf.unshift(...st); throw e; }
+  try { await db.batch(st, 100); } catch (e) { touchBuf.unshift(...st); throw e; }
   return st.length;
 }
 
