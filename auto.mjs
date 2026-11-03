@@ -150,7 +150,7 @@ const WRITE_CAP = Math.max(0, parseInt(process.env.P4K_WRITE_CAP || "250000", 10
 let wFiles = 0;
 const stopState = { stop: false };
 // TTL: has_id=1 (có file phim) 1h, has_id=0 (không có phim) 24h
-const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "86400000", 10)); // 24h
+const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "3600000", 10)); // 1h
 const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10)); // 24h
 // Tách 2 tầng: has_id=1 đếm đầy đủ (nhỏ), has_id=0 đếm cap 10k (lớn nhưng không có file).
 // due_at đã là hạn tuyệt đối (has_id 1h / no_id 24h) nên chỉ cần so với now.
