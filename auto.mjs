@@ -151,7 +151,7 @@ let wFiles = 0;
 const stopState = { stop: false };
 // TTL: has_id=1 (có file phim) 6h, has_id=0 (không có phim) 24h
 const REPO_TTL_HAS_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10)); // 6h
-const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10)); // 24h
+const REPO_TTL_NO_ID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "604800000", 10)); // 7 ngày
 // Tách 2 tầng: has_id=1 đếm đầy đủ (nhỏ), has_id=0 đếm cap 10k (lớn nhưng không có file).
 // due_at đã là hạn tuyệt đối (has_id 1h / no_id 24h) nên chỉ cần so với now.
 let staleHasId = await countStaleHasId(db, Date.now());
@@ -160,8 +160,14 @@ let staleBacklog = staleHasId + staleNoId; // backlog recheck thật (đếm 1 l
 // pending.index = counter (1 dòng). pending.inv giữ bằng ước lượng trong tiến trình:
 // refreshInv đặt theo số dòng vừa đọc (đã phải đọc rồi), mỗi account xử lý xong thì trừ 1,
 // feed thêm account mới thì +1 -> KHÔNG cần COUNT quét accounts mỗi tick.
+let lastDemandAt = 0;
 async function demand() {
-  pending.index = wFiles >= WRITE_CAP ? 0 : await countNew(db);
+  const now = Date.now();
+  if (wFiles >= WRITE_CAP) pending.index = 0;
+  else if (now - lastDemandAt > 60000 || pending.index === 0) {
+    pending.index = await countNew(db);
+    lastDemandAt = now;
+  }
 }
 async function rebalance() {
   await demand();
@@ -210,7 +216,7 @@ let feedPageCap = FEED_MAX_PAGES, feedPolling = false, feedPollN = 0, feedPagesA
 // Chẩn đoán feed: đếm item trùng trong cùng run + mốc lastModified mỗi trang và của cursor.
 let feedDup = 0, feedCurLt = "-", feedNoLink = 0, feedNoLinkStreak = 0;
 const feedIds = new Set();
-const accCache = new Map();
+const accCache = P.accCache || new Map();
 async function accOf(u) {
   if (!accCache.has(u)) accCache.set(u, (await getAccount(db, u)) || null);
   return accCache.get(u);
@@ -378,6 +384,10 @@ async function invOne(a) {
 let bktRows = [], bktIdx = 0, bktDone = 0, bktEnq = 0, bktErr = 0, bkt404 = 0, bktBusy = 0, bktSweeps = 0, bktNextAt = 0, bktLoaded = false, bktAtEnd = false, bktLoading = null;
 const bktWaiting = () => bktAtEnd && bktRows.length > 0 && bktSweeps > 0 && bktSweeps < BKT_SWEEPS && bktNextAt + 60000 < DEADLINE;
 async function loadBkt() {
+  if (P.preloadBucketMeta) {
+    const preloaded = await P.preloadBucketMeta(db);
+    log(`bkt preload done=${preloaded}`);
+  }
   const rows = (await db.exec("SELECT username FROM accounts WHERE junk=0 ORDER BY username")).rows.map((r) => r.username);
   bktRows = rows;
   const saved = parseInt((await metaGet(db, "bkt_cursor")) || "0", 10) || 0;
@@ -509,7 +519,8 @@ async function indexOne() {
     if (!handled) {
       const t = await getTree(r.id, r.kind);
       if (t.ok && Array.isArray(t.data)) {
-        const { n, size, ins, upd } = await storeTree(db, r.id, r.kind, t.data, r.account);
+        const isNew = !prev || !prev.nfile;
+        const { n, size, ins, upd } = await storeTree(db, r.id, r.kind, t.data, r.account, isNew);
         wFiles += (ins || 0) + (upd || 0);
         await finishRepo(db, r.id, r.kind, { n, size, entries: t.data.length, sha: info.sha || null, updated: info.lastModified || info.updatedAt || 0 });
         await reevalAccount(db, r.account);

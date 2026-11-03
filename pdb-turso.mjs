@@ -15,7 +15,7 @@ export const PHIM_EXT = new Set([
 export const JUNK_EMPTY = parseInt(process.env.P4K_JUNK_EMPTY || "3", 10);
 // TTL: repo có phim (has_id=1) 6h; repo không có phim (has_id=0) 24h.
 const REPO_TTL_HAS_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10));
-const REPO_TTL_NOID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10));
+const REPO_TTL_NOID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "604800000", 10)); // 7 ngày cho repo không có phim
 const JITTER_MS = 3600000;
 const h32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
 const dueAt = (hasId, updated, key) => {
@@ -210,7 +210,7 @@ export async function ensureSchema(db) {
 export async function metaGet(db, k) { const r = await db.exec("SELECT val FROM meta WHERE key=?", [k]); return r.rows[0] ? r.rows[0].val : null; }
 export async function metaSet(db, k, v) { await db.exec("INSERT OR REPLACE INTO meta(key,val) VALUES(?,?)", [k, String(v)]); }
 
-export async function storeTree(db, repoId, kind, files, off) {
+export async function storeTree(db, repoId, kind, files, off, isNew = false) {
   const want = new Map(), extMap = new Map();
   let n = 0, size = 0, hasPhim = false;
   for (const f of files) {
@@ -227,9 +227,8 @@ export async function storeTree(db, repoId, kind, files, off) {
     want.set(p, [bn, sz, oid]);
     n++; size += sz;
   }
-  // Chỉ ghi phần thay đổi: đọc trạng thái hiện có (covering idx_files_rp) rồi so sánh.
-  // Repo lớn ít đổi (bucket updatedAt đổi nhưng đa số file y nguyên) giảm mạnh writes.
-  const cur = await db.exec("SELECT path,name,size,off FROM files WHERE repo_id=? AND kind=?", [repoId, kind]);
+  // Chỉ ghi phần thay đổi: nếu là repo mới tinh (isNew) thì không cần SELECT đối chiếu.
+  const cur = isNew ? { rows: [] } : await db.exec("SELECT path,name,size,off FROM files WHERE repo_id=? AND kind=?", [repoId, kind]);
   const have = new Map();
   for (const r of cur.rows) have.set(r.path, [r.name, r.size, r.off]);
   const existing = have.size;
@@ -255,9 +254,9 @@ export async function storeTree(db, repoId, kind, files, off) {
   const changed = del + ins + upd;
   if (changed && changed * 2 > n + existing) {
     // Đổi quá nửa: full rewrite rẻ hơn nhiều câu lẻ.
-    const full = [{ sql: "DELETE FROM files WHERE repo_id=? AND kind=?", args: [repoId, kind] }];
+    const full = isNew ? [] : [{ sql: "DELETE FROM files WHERE repo_id=? AND kind=?", args: [repoId, kind] }];
     for (const [p, [bn, sz, oid]] of want) full.push({ sql: "INSERT OR REPLACE INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
-    await db.batch(full, 100);
+    if (full.length) await db.batch(full, 100);
     ins = n; del = existing; upd = 0;
   } else if (stmts.length) {
     await db.batch(stmts, 100);
@@ -267,13 +266,8 @@ export async function storeTree(db, repoId, kind, files, off) {
 }
 
 async function noteExts(db, extMap, hasPhim) {
-  if (!extMap || extMap.size === 0) return;
-  const st = [];
-  for (const [ext, [c, sample]] of extMap) st.push({
-    sql: "INSERT INTO seen_ext(ext,n,farm_n,sample) VALUES(?,?,?,?) ON CONFLICT(ext) DO UPDATE SET n=n+excluded.n, farm_n=farm_n+excluded.farm_n",
-    args: [ext, c, hasPhim ? c : 0, sample],
-  });
-  await db.batch(st, 100);
+  // seen_ext chỉ dùng cho phân tích offline pipeline.mjs, bỏ qua trong runtime crawler để tiết kiệm Turso writes.
+  return;
 }
 
 export async function repoCounts(db, id, kind) {
@@ -301,7 +295,7 @@ export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, up
 // Turso tính write theo dòng + mỗi index bị đổi: repo stale chỉ SET indexed_at/sha/updated
 // (không đụng state/worker -> 2 index thay vì 6) và gom batch, flush bằng flushTouches().
 const touchBuf = [];
-const TOUCH_BATCH = 100;
+const TOUCH_BATCH = 250;
 // Hạn recheck thích ứng, tính từ cột has_id/updated của dòng hiện tại + jitter tất định.
 // Hạn recheck: has_id=1 1h, has_id=0 24h + jitter tất định.
 const DUE_SQL = "? + CASE WHEN has_id=0 THEN ? ELSE ? END - ?";
@@ -367,14 +361,30 @@ export async function claimRepo(db, worker, kind = null) {
   return null;
 }
 
-const lmSeen = new Map(); // kind:id -> lastModified đã xử lý trong run
+export const lmSeen = new Map(); // kind:id -> lastModified đã xử lý trong run
+export const accCache = new Map();
+
+export async function preloadBucketMeta(db) {
+  try {
+    const r = await db.exec("SELECT id, last_modified FROM repos WHERE kind='bucket' AND state='done'");
+    for (const row of r.rows) {
+      if (row.last_modified != null) {
+        lmSeen.set("bucket:" + row.id, Number(row.last_modified) || 0);
+      }
+    }
+    return r.rows.length;
+  } catch {
+    return 0;
+  }
+}
+
 export async function upsertRepoMeta(db, id, account, kind, lastModified) {
   const lm = lastModified ? Date.parse(lastModified) || 0 : 0;
   // Cùng repo xuất hiện lại trong run (feed trùng, bucket sweep #2, feed chồng
   // bucket) với cùng lastModified thì kết quả không đổi -> bỏ lượt đọc PK.
   const seenKey = kind + ":" + id;
   if (lmSeen.get(seenKey) === lm) return false;
-  if (lmSeen.size > 50000) lmSeen.clear();
+  if (lmSeen.size > 100000) lmSeen.clear();
   lmSeen.set(seenKey, lm);
   if (!accCache.has(account)) {
     const a = await db.exec("SELECT has_id,nrepo,junk FROM accounts WHERE username=?", [account]);
@@ -399,7 +409,6 @@ export async function upsertRepoMeta(db, id, account, kind, lastModified) {
   if (ex.state === "new" && prio > (ex.prio || 0)) await db.exec("UPDATE repos SET prio=? WHERE id=? AND kind=?", [prio, id, kind]);
   return ex.state === "new";
 }
-const accCache = new Map();
 
 const verifiedAccounts = new WeakMap();
 function verifiedSet(db) {
@@ -619,7 +628,7 @@ export async function clearJunk(db, u) {
   return r.changes;
 }
 export async function getRepoPrev(db, id, kind) {
-  return (await db.exec("SELECT sha,updated FROM repos WHERE id=? AND kind=?", [id, kind])).rows[0] || {};
+  return (await db.exec("SELECT sha,updated,nfile FROM repos WHERE id=? AND kind=?", [id, kind])).rows[0] || {};
 }
 export async function countNew(db) {
   const r = await db.exec("SELECT COUNT(*) c FROM repos WHERE state='new' AND junk=0");

@@ -14,9 +14,9 @@ export const PHIM_EXT = new Set([
   ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp",
 ]);
 export const JUNK_EMPTY = parseInt(process.env.P4K_JUNK_EMPTY || "3", 10);
-// TTL: repo có phim (has_id=1) 6h; repo không có phim (has_id=0) 24h.
+// TTL: repo có phim (has_id=1) 6h; repo không có phim (has_id=0) 7 ngày.
 const REPO_TTL_HAS_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL || "21600000", 10));
-const REPO_TTL_NOID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "86400000", 10));
+const REPO_TTL_NOID_MS = Math.max(600000, parseInt(process.env.P4K_REPO_TTL_NO_ID || "604800000", 10));
 const JITTER_MS = 3600000;
 const h32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
 const dueAt = (hasId, updated, key) => {
@@ -233,21 +233,22 @@ export function idParts(name) {
 // Ghi nhận thống kê đuôi (MỌI đuôi, kể cả chưa whitelist) — để phát hiện đuôi phim MỚI.
 // farm_n = số file đuôi này nằm trong repo CÓ đuôi phim hợp lệ (dấu hiệu farm thật).
 export function noteExts(db, extMap, hasPhim) {
-  if (!extMap || extMap.size === 0) return;
-  const ins = db.prepare("INSERT INTO seen_ext(ext,n,farm_n,sample) VALUES(?,?,?,?) ON CONFLICT(ext) DO UPDATE SET n=n+excluded.n, farm_n=farm_n+excluded.farm_n");
-  for (const [ext, [c, sample]] of extMap) ins.run(ext, c, hasPhim ? c : 0, sample);
+  // seen_ext chỉ dùng cho phân tích offline pipeline.mjs, bỏ qua trong runtime crawler để tối ưu writes.
+  return;
 }
 
 // Lưu file id của 1 tree: chỉ giữ file khớp id + đuôi thuộc PHIM_EXT (loại ảnh/doc/audio).
 // MERGE (không xoá-ghi-lại): upsert theo (repo_id,kind,path) + chỉ xoá path vắng mặt.
 // Toàn bộ nằm trong 1 transaction -> addon không bao giờ thấy repo bị rỗng giữa chừng.
-export function storeTree(db, repoId, kind, files, off) {
+export function storeTree(db, repoId, kind, files, off, isNew = false) {
   return retrySync(() => {
     try {
       db.exec("BEGIN IMMEDIATE");
-      db.exec("DROP TABLE IF EXISTS _keep; CREATE TEMP TABLE _keep(path TEXT PRIMARY KEY)");
-      const keepIns = db.prepare("INSERT OR IGNORE INTO _keep(path) VALUES(?)");
-      const up = db.prepare("UPDATE files SET name=?, size=?, off=? WHERE repo_id=? AND kind=? AND path=?");
+      if (!isNew) {
+        db.exec("DROP TABLE IF EXISTS _keep; CREATE TEMP TABLE _keep(path TEXT PRIMARY KEY)");
+      }
+      const keepIns = isNew ? null : db.prepare("INSERT OR IGNORE INTO _keep(path) VALUES(?)");
+      const up = isNew ? null : db.prepare("UPDATE files SET name=?, size=?, off=? WHERE repo_id=? AND kind=? AND path=?");
       const ins = db.prepare("INSERT OR REPLACE INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)");
       let n = 0, size = 0, hasPhim = false;
       const extMap = new Map();
@@ -260,15 +261,21 @@ export function storeTree(db, repoId, kind, files, off) {
         const e = extMap.get(ip.ext) || [0, bn]; e[0]++; extMap.set(ip.ext, e);
         if (!PHIM_EXT.has(ip.ext)) continue;
         hasPhim = true;
-        keepIns.run(p);
+        if (keepIns) keepIns.run(p);
         const sz = f.size || 0;
         const oid = f.oid || f.xetHash || off || null;
-        const ch = up.run(bn, sz, oid, repoId, kind, p);
-        if (!ch.changes) ins.run(repoId, kind, p, bn, sz, oid);
+        if (!isNew) {
+          const ch = up.run(bn, sz, oid, repoId, kind, p);
+          if (!ch.changes) ins.run(repoId, kind, p, bn, sz, oid);
+        } else {
+          ins.run(repoId, kind, p, bn, sz, oid);
+        }
         n++; size += sz;
       }
       noteExts(db, extMap, hasPhim);
-      db.prepare("DELETE FROM files WHERE repo_id=? AND kind=? AND path NOT IN (SELECT path FROM _keep)").run(repoId, kind);
+      if (!isNew) {
+        db.prepare("DELETE FROM files WHERE repo_id=? AND kind=? AND path NOT IN (SELECT path FROM _keep)").run(repoId, kind);
+      }
       db.exec("COMMIT");
       return { n, size };
     } catch (e) { try { db.exec("ROLLBACK"); } catch {} throw e; }
@@ -547,7 +554,7 @@ export function countPending(db, cut, adaptive = true) {
 export function countNew(db) { const r = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='new' AND junk=0").get(); return r ? r.c : 0; }
 export function stateCounts(db) { return db.prepare("SELECT state, COUNT(*) c FROM repos GROUP BY state").all(); }
 export function accountCounts(db) { const r = db.prepare("SELECT COUNT(*) c FROM accounts WHERE junk=0").get(); return r ? r.c : 0; }
-export function getRepoPrev(db, id, kind) { return db.prepare("SELECT sha,updated FROM repos WHERE id=? AND kind=?").get(id, kind) || {}; }
+export function getRepoPrev(db, id, kind) { return db.prepare("SELECT sha,updated,nfile FROM repos WHERE id=? AND kind=?").get(id, kind) || {}; }
 export function pendingAccountsAdaptive(db, cut) { return pendingAccounts(db, cut, true); }
 export function countPendingAdaptive(db, cut) { return countPending(db, cut, true); }
 export function countStaleHasId(db, now) { const r = db.prepare("SELECT COUNT(*) c FROM repos WHERE state='done' AND junk=0 AND has_id=1 AND due_at<=?").get(now); return r?.c || 0; }
