@@ -11,7 +11,7 @@ const dec = (cell) => {
   return cell.value; // text
 };
 
-export function tursoClient({ url, token, timeout = parseInt(process.env.TURSO_TIMEOUT || "60000", 10) }) {
+export function tursoClient({ url, token, timeout = parseInt(process.env.TURSO_TIMEOUT || "20000", 10) }) {
   if (!url || !token) throw new Error("turso: thiếu TURSO_DATABASE_URL / TURSO_AUTH_TOKEN");
   const endpoint = String(url).replace(/^libsql:\/\//i, "https://").replace(/\/+$/, "") + "/v2/pipeline";
 
@@ -25,8 +25,8 @@ export function tursoClient({ url, token, timeout = parseInt(process.env.TURSO_T
         signal: AbortSignal.timeout(timeout),
       });
     } catch (e) {
-      if (attempt < 5) {
-        const waitMs = Math.min(10000, 1000 * Math.pow(2, attempt) + Math.floor(Math.random() * 500));
+      if (attempt < 2) {
+        const waitMs = Math.min(3000, 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 300));
         await new Promise((r) => setTimeout(r, waitMs));
         return pipeline(requests, attempt + 1);
       }
@@ -34,9 +34,9 @@ export function tursoClient({ url, token, timeout = parseInt(process.env.TURSO_T
       throw new Error("turso fetch: " + (e && e.message ? e.message : e) + cause);
     }
     if (res.status === 429 || res.status >= 500) {
-      if (attempt < 5) {
+      if (attempt < 2) {
         const ra = parseInt(res.headers.get("retry-after") || "0", 10);
-        const waitMs = ra > 0 ? ra * 1000 : Math.min(10000, 1000 * Math.pow(2, attempt) + Math.floor(Math.random() * 500));
+        const waitMs = ra > 0 ? ra * 1000 : Math.min(3000, 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 300));
         await new Promise((r) => setTimeout(r, waitMs));
         return pipeline(requests, attempt + 1);
       }

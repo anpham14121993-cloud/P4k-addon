@@ -295,7 +295,8 @@ export async function finishRepo(db, id, kind, { n, size, dead, entries, sha, up
 // Turso tính write theo dòng + mỗi index bị đổi: repo stale chỉ SET indexed_at/sha/updated
 // (không đụng state/worker -> 2 index thay vì 6) và gom batch, flush bằng flushTouches().
 const touchBuf = [];
-const TOUCH_BATCH = 250;
+const TOUCH_BATCH = 100;
+let flushingTouches = false;
 // Hạn recheck thích ứng, tính từ cột has_id/updated của dòng hiện tại + jitter tất định.
 // Hạn recheck: has_id=1 1h, has_id=0 24h + jitter tất định.
 const DUE_SQL = "? + CASE WHEN has_id=0 THEN ? ELSE ? END - ?";
@@ -315,10 +316,18 @@ export async function touchRepo(db, id, kind, sha, updated) {
 }
 
 export async function flushTouches(db) {
-  if (!touchBuf.length) return 0;
+  if (!touchBuf.length || flushingTouches) return 0;
+  flushingTouches = true;
   const st = touchBuf.splice(0);
-  try { await db.batch(st, 100); } catch (e) { touchBuf.unshift(...st); throw e; }
-  return st.length;
+  try {
+    await db.batch(st, 50);
+    return st.length;
+  } catch (e) {
+    // Không unshift lại toàn bộ để tránh đầu độc buffer gây loop timeout; repo nào sót sẽ được touch ở run sau.
+    return 0;
+  } finally {
+    flushingTouches = false;
+  }
 }
 
 export async function unclaimRepo(db, id, kind) {
@@ -579,7 +588,7 @@ export async function claimRepoStale(db, worker, cut, hasId = null) {
         return null;
       }
       if (!staleFill.has(qk)) staleFill.set(qk, (async () => {
-        await flushTouches(db);
+        try { await flushTouches(db); } catch { }
         let sql = "SELECT r.id,r.account,r.kind,r.due_at FROM repos r WHERE r.state='done' AND r.junk=0 AND r.due_at<=?";
         const params = [cut];
         if (hasId !== null) {

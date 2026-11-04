@@ -623,7 +623,7 @@ if (ENABLE_BKT) for (let i = 0; i < BKT_WORKERS; i++) workers.push(bktWorker());
 for (let i = 0; i < MAXW; i++) { workers.push(invWorker()); workers.push(indexWorker()); }
 try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e && e.stack ? e.stack : e)); process.exit(1); }
 clearInterval(timer);
-await flushTouches(db);
+try { await flushTouches(db); } catch { }
 log(`AUTO done feed pages=${feedPagesAll} enq=${feedEnq} poll=${feedPollN} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | bkt done=${bktDone} sweeps=${bktSweeps} enq=${bktEnq} err=${bktErr} 404=${bkt404} | ${stat()}`);
 log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPagesAll, feed_poll: feedPollN, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, bkt_done: bktDone, bkt_sweeps: bktSweeps, bkt_enq: bktEnq, bkt_err: bktErr, bkt_404: bkt404, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 // STATUS chỉ để theo dõi; GROUP BY state quét covering index toàn bộ repos
