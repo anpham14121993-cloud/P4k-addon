@@ -258,10 +258,10 @@ export async function storeTree(db, repoId, kind, files, off, isNew = false) {
     // Đổi quá nửa: full rewrite rẻ hơn nhiều câu lẻ.
     const full = isNew ? [] : [{ sql: "DELETE FROM files WHERE repo_id=? AND kind=?", args: [repoId, kind] }];
     for (const [p, [bn, sz, oid]] of want) full.push({ sql: "INSERT OR REPLACE INTO files(repo_id,kind,path,name,size,off) VALUES(?,?,?,?,?,?)", args: [repoId, kind, p, bn, sz, oid] });
-    if (full.length) await db.batch(full, 100);
+    if (full.length) await db.batch(full, 250);
     ins = n; del = existing; upd = 0;
   } else if (stmts.length) {
-    await db.batch(stmts, 100);
+    await db.batch(stmts, 250);
   }
   await noteExts(db, extMap, hasPhim);
   return { n, size, del, ins, upd };

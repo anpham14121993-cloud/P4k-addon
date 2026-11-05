@@ -15,7 +15,7 @@ export function tursoClient({
   url,
   token,
   timeout = parseInt(process.env.TURSO_TIMEOUT || "45000", 10),
-  maxConcurrent = parseInt(process.env.TURSO_MAX_CONCURRENT || "3", 10),
+  maxConcurrent = parseInt(process.env.TURSO_MAX_CONCURRENT || "8", 10),
 }) {
   if (!url || !token) throw new Error("turso: thiếu TURSO_DATABASE_URL / TURSO_AUTH_TOKEN");
   const endpoint = String(url).replace(/^libsql:\/\//i, "https://").replace(/\/+$/, "") + "/v2/pipeline";
