@@ -190,6 +190,8 @@ const dec = new TextDecoder();
 
 let dynamicCache = { at: 0, value: null };
 let resolveCache = new Map();   // filename -> {url, at}
+let deadResolveCache = new Map(); // filename -> epoch ms khi node trả về 404/source unavailable
+const DEAD_RESOLVE_TTL_MS = 15 * 60 * 1000;
 let poolDeadMs = 0;             // epoch ms khi phát hiện resolver toàn-503 → bỏ direct tạm thời
 const POOL_DEAD_WINDOW_MS = 60 * 1000; // nhớ "pool chết" trong 60s
 const EGRESS_ALWAYS = false;    // bật true = mint egress luôn, không thử resolver trước
@@ -563,6 +565,19 @@ async function healthProbe(url) {
   } catch { return { ok: false, error: "probe failed" }; }
 }
 
+// Kiểm tra nhanh luồng video dự phòng có thực sự phát được (HTTP 200 hoặc 206) không.
+// Nếu node trả về 404 (source unavailable) hoặc lỗi mạng thì loại bỏ ngay để không trả luồng chết cho client.
+async function isStreamPlayable(url, timeoutMs = 2500) {
+  try {
+    const res = await fetchWithTimeout(url, { headers: { Range: "bytes=0-0" } }, timeoutMs);
+    const ok = res.status === 200 || res.status === 206;
+    discardResponse(res);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 async function resolveOnce(fileName, cfg, opts = {}) {
   const resolvers = resolverList(cfg);
   const attemptDirect = async (host) => {
@@ -705,6 +720,11 @@ async function resolveCdnUrl(fileUrl, cfg, opts = {}) {
   const fileName = fileNameFrom(fileUrl);
   if (!fileName) throw new HttpError(502, "bad cdn file url");
 
+  if (deadResolveCache.has(fileName)) {
+    if (Date.now() - deadResolveCache.get(fileName) < DEAD_RESOLVE_TTL_MS) return null;
+    deadResolveCache.delete(fileName);
+  }
+
   const prefer = opts.prefer !== false;
   const cached = resolveCache.get(fileName);
   if (cached && Date.now() - cached.at < RESOLVE_CACHE_TTL_MS) {
@@ -719,7 +739,15 @@ async function resolveCdnUrl(fileUrl, cfg, opts = {}) {
     try { got = await resolveOnce(fileName, cfg, opts); }
     catch (e) { lastErr = e; await sleep(200 + attempt * 250); continue; }
 
-    const cand = { url: await applyNodeFallback(got.url), expiresIn: got.expires_in };
+    const nodeUrl = await applyNodeFallback(got.url);
+    // Kiểm tra nhanh node có nguồn video phát được không (tránh 404 source unavailable của Phim4K)
+    const isLive = await isStreamPlayable(nodeUrl, 2500);
+    if (!isLive) {
+      lastErr = new HttpError(404, "source unavailable");
+      continue;
+    }
+
+    const cand = { url: nodeUrl, expiresIn: got.expires_in };
 
     // Node đầu tiên đủ dùng là trả luôn (1 request), không tải thử gì thêm.
     if (!prefer || isGoodEnough(cand, cfg)) {
@@ -733,8 +761,8 @@ async function resolveCdnUrl(fileUrl, cfg, opts = {}) {
   }
 
   if (candidates.length === 0) {
-    if (cached && cached.url) return cached.url;
-    throw lastErr || new HttpError(502, "cdn resolve failed");
+    deadResolveCache.set(fileName, Date.now());
+    return null;
   }
 
   candidates.sort((a, b) => scoreCandidate(b, cfg) - scoreCandidate(a, cfg));
