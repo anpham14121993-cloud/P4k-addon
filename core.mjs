@@ -67,7 +67,7 @@ function hfDirectUrl(row) {
   return HF_ENDPOINT + "/" + repo + "/resolve/main/" + p;
 }
 
-const VERSION = "2.1.3-oracle";
+const VERSION = "2.1.4-oracle";
 
 /* ═══════════════════════ 1. CẤU HÌNH ═══════════════════════ */
 
@@ -1602,7 +1602,44 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
   const page = Math.floor((skip || 0) / 20) + 1;
   const forceType = (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") ? "series" : null;
 
-  // 1. Phim lẻ, Phim bộ & Top xem: Đọc từ Oracle / Turso DB độc lập
+  // 1. Riêng danh mục "phim4k-otv-top" (Bảng xếp hạng Top Lượt Xem):
+  // Lấy trực tiếp từ API gốc Phim4K theo số lượt xem thực tế (có Edge Cache 1 giờ).
+  // Nếu API gốc lỗi -> Tự động fallback sang Oracle DB (xếp theo điểm IMDb).
+  if (catalogId === "phim4k-otv-top" && !query) {
+    const topCacheKey = "cat/top_views/" + page;
+    const cachedTop = await cacheGetJSON(topCacheKey);
+    if (cachedTop && Array.isArray(cachedTop.metas) && cachedTop.metas.length > 0) {
+      return cachedTop;
+    }
+    try {
+      const data = await getJson("top_views?period=all&limit=20&page=" + page, cfg, ms);
+      const topList = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
+      if (topList.length > 0) {
+        const topResult = {
+          metas: topList.filter((m) => m && (m.videos_id || m.id)).map((m) => {
+            const t = forceType || (String(m.is_tvseries) === "1" ? "series" : (m.type || "movie"));
+            return {
+              id: "otv:" + (m.videos_id || m.id),
+              type: t,
+              name: m.title || "",
+              poster: m.thumbnail_url || m.poster_url || "",
+              background: m.poster_url || m.thumbnail_url || "",
+              year: parseInt(m.release || m.release_year, 10) || undefined,
+              releaseInfo: m.video_quality || m.quality || undefined,
+              imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
+              description: m.description || m.overview || undefined,
+            };
+          }),
+        };
+        await cachePutJSON(topCacheKey, topResult, 3600);
+        return topResult;
+      }
+    } catch (topErr) {
+      console.warn("Lỗi tải top_views từ API gốc, fallback sang DB:", topErr && topErr.message);
+    }
+  }
+
+  // 2. Phim lẻ, Phim bộ & Fallback Top xem: Đọc từ Oracle DB độc lập
   if (DB && typeof DB.getCatalog === "function") {
     try {
       let dbList = [];
@@ -1634,15 +1671,6 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
       }
     } catch (err) {
       console.warn("DB catalog error:", err && err.message);
-    }
-  }
-
-  // 2. Với "phim4k-otv-top": Kiểm tra Edge Cache trước (cache 1 giờ = 3600s)
-  if (catalogId === "phim4k-otv-top" && !query) {
-    const topCacheKey = "cat/top_views/" + page;
-    const cachedTop = await cacheGetJSON(topCacheKey);
-    if (cachedTop && Array.isArray(cachedTop.metas) && cachedTop.metas.length > 0) {
-      return cachedTop;
     }
   }
 
