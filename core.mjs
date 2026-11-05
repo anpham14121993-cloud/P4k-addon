@@ -67,7 +67,7 @@ function hfDirectUrl(row) {
   return HF_ENDPOINT + "/" + repo + "/resolve/main/" + p;
 }
 
-const VERSION = "2.1.4-oracle";
+const VERSION = "2.1.5-oracle";
 
 /* ═══════════════════════ 1. CẤU HÌNH ═══════════════════════ */
 
@@ -1606,7 +1606,7 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
   // Lấy trực tiếp từ API gốc Phim4K theo số lượt xem thực tế (có Edge Cache 1 giờ).
   // Nếu API gốc lỗi -> Tự động fallback sang Oracle DB (xếp theo điểm IMDb).
   if (catalogId === "phim4k-otv-top" && !query) {
-    const topCacheKey = "cat/top_views/" + page;
+    const topCacheKey = "cat/top_views_v4/" + page;
     const cachedTop = await cacheGetJSON(topCacheKey);
     if (cachedTop && Array.isArray(cachedTop.metas) && cachedTop.metas.length > 0) {
       return cachedTop;
