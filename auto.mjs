@@ -50,7 +50,11 @@ const BKT_SWEEPS = Math.max(1, parseInt(process.env.P4K_BKT_SWEEPS || "1", 10));
 const BKT_EVERY_MS = Math.max(60000, parseInt(process.env.P4K_BKT_EVERY || "900000", 10));
 const IDLE_EXIT = Math.max(10, parseInt(process.env.P4K_IDLE_EXIT || "30", 10)) * 1000;
 const RECOVER_MS = parseInt(process.env.P4K_RECOVER_MS || "300000", 10);
-await recoverStale(db, RECOVER_MS);
+try {
+  await recoverStale(db, RECOVER_MS);
+} catch (e) {
+  log("Cảnh báo recoverStale: " + (e.message || e));
+}
 const FIXED = process.env.P4K_INV_TTL ? parseInt(process.env.P4K_INV_TTL, 10) : null;
 const base = "https://huggingface.co/api";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

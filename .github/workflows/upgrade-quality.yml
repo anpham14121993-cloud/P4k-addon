@@ -20,7 +20,7 @@ on:
         required: false
 
 concurrency:
-  group: upgrade-quality
+  group: p4k-db-job
   cancel-in-progress: false
 
 jobs:

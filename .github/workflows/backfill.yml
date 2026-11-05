@@ -35,7 +35,7 @@ on:
         default: "50"
 
 concurrency:
-  group: backfill
+  group: p4k-db-job
   cancel-in-progress: false
 
 jobs:

@@ -138,6 +138,7 @@ const IDX2 = [
   `CREATE INDEX IF NOT EXISTS idx_repos_deadfiles ON repos(state, nfile)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_junkfiles ON repos(junk, nfile)`,
   `CREATE INDEX IF NOT EXISTS idx_repos_account_junk ON repos(account, junk)`,
+  `CREATE INDEX IF NOT EXISTS idx_repos_fetching_indexed ON repos(state, indexed_at)`,
 ];
 // Triggers counter ĐÃ BỎ: chúng ghi +4 dòng counters mỗi lần repo đổi state/junk
 // (mỗi repo stale đổi state 2 lần -> 8 dòng), là nguồn write lớn nhất. Thay bằng

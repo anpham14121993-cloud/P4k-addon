@@ -9,7 +9,7 @@ on:
         default: "3600"
 
 concurrency:
-  group: crawl
+  group: p4k-db-job
   cancel-in-progress: false
 
 jobs:
