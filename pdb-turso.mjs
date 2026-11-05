@@ -154,6 +154,7 @@ const DROP_IDX = [
 ];
 
 export async function ensureSchema(db) {
+  if (await metaGet(db, "schema_ready_v1")) return;
   await db.batch(SCHEMA.map((sql) => ({ sql })));
   for (const [t, c, d] of ADD_COLS) {
     let have = false;
@@ -168,6 +169,7 @@ export async function ensureSchema(db) {
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('prio_score_v1','1')" },
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('acct_hasid_v1','1')" },
     { sql: "INSERT OR IGNORE INTO meta(key,val) VALUES('acct_nrepo_v1','1')" },
+    { sql: "INSERT OR REPLACE INTO meta(key,val) VALUES('schema_ready_v1','1')" },
   ]);
   if (!(await metaGet(db, "counters_v1"))) {
     // Backfill 1 lần: đồng bộ repos.junk theo account junk + hẹn lịch quét.

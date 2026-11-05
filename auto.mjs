@@ -17,7 +17,15 @@ const {
 } = P;
 
 const db = openDB();
-await ensureSchema(db);
+for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    await ensureSchema(db);
+    break;
+  } catch (e) {
+    if (attempt === 3) log("ensureSchema warning: " + (e.message || e));
+    else await sleep(2000);
+  }
+}
 
 const TOKENS = String(process.env.HF_TOKEN || "").split(",").map((x) => x.trim()).filter(Boolean);
 const GAP = Math.max(30, parseInt(process.env.P4K_GAP || "150", 10));
