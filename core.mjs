@@ -67,7 +67,7 @@ function hfDirectUrl(row) {
   return HF_ENDPOINT + "/" + repo + "/resolve/main/" + p;
 }
 
-const VERSION = "2.1.2-oracle";
+const VERSION = "2.1.3-oracle";
 
 /* ═══════════════════════ 1. CẤU HÌNH ═══════════════════════ */
 
@@ -1306,8 +1306,8 @@ function detailToMeta(d, type) {
     type,
     name: cleanText(d.title) || "Untitled",
     description: cleanText(d.description),
-    poster: cleanText(d.poster_url),
-    background: cleanText(d.thumbnail_url),
+    poster: cleanText(d.thumbnail_url || d.poster_url),
+    background: cleanText(d.poster_url || d.thumbnail_url),
     releaseInfo: [d.video_quality, d.runtime].filter(Boolean).join(" · ") || undefined,
     imdbRating: d.imdb_rating != null && String(d.imdb_rating).trim() !== ""
       ? String(d.imdb_rating) : undefined,
@@ -1619,8 +1619,8 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
               id: "otv:" + m.id,
               type: t,
               name: m.title || "",
-              poster: m.poster_url || "",
-              background: m.thumbnail_url || "",
+              poster: m.thumbnail_url || m.poster_url || "",
+              background: m.poster_url || m.thumbnail_url || "",
               year: parseInt(m.release_year, 10) || undefined,
               releaseInfo: m.quality || undefined,
               imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
@@ -1671,8 +1671,8 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
         id: "otv:" + (m.videos_id || m.id),
         type: t,
         name: m.title || "",
-        poster: m.poster_url || "",
-        background: m.thumbnail_url || "",
+        poster: m.thumbnail_url || m.poster_url || "",
+        background: m.poster_url || m.thumbnail_url || "",
         year: parseInt(m.release || m.release_year, 10) || undefined,
         releaseInfo: m.video_quality || m.quality || undefined,
         imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
@@ -1713,8 +1713,8 @@ async function handleMeta(type, id, cfg, ms) {
           type: titleRow.type,
           name: cleanText(titleRow.title) || "Untitled",
           description: cleanText(titleRow.overview),
-          poster: cleanText(titleRow.poster_url),
-          background: cleanText(titleRow.thumbnail_url),
+          poster: cleanText(titleRow.thumbnail_url || titleRow.poster_url),
+          background: cleanText(titleRow.poster_url || titleRow.thumbnail_url),
           releaseInfo: cleanText(titleRow.quality) || undefined,
           imdbRating: titleRow.imdb_rating != null ? String(titleRow.imdb_rating) : undefined,
           genres: Array.isArray(genres) ? genres : [],
