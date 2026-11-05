@@ -9,6 +9,7 @@ const baseOf = (id) => (id.includes(".") ? id.slice(0, id.lastIndexOf(".")) : id
 
 function normalizeText(v) {
   return String(v || "")
+    .replace(/[đĐ]/g, "d")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
@@ -17,7 +18,12 @@ function normalizeText(v) {
 }
 
 export function tursoDb(env) {
-  const c = tursoClient({ url: env.TURSO_DATABASE_URL, token: env.TURSO_AUTH_TOKEN });
+  const c = tursoClient({
+    url: env.TURSO_DATABASE_URL,
+    token: env.TURSO_AUTH_TOKEN,
+    timeout: 10000,
+    maxConcurrent: 16,
+  });
   const mem = new Map(); // "<kind>:<id>" -> { at, ... }
   const cache = typeof caches !== "undefined" && caches.default ? caches.default : null;
   const keyOf = (kind, id) => new Request("https://p4k-db.internal/" + CACHE_VER + "/" + kind + "/" + encodeURIComponent(id));
@@ -108,7 +114,7 @@ export function tursoDb(env) {
       sql =
         "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'movie' ORDER BY id DESC LIMIT ? OFFSET ?";
       args.push(limit, offset);
-    } else if (catalogId === "phim4k-otv-series-latest") {
+    } else if (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") {
       // Phim bộ mới nhất: sắp xếp theo ID giảm dần (phim mới đăng vào kho)
       sql =
         "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'series' ORDER BY id DESC LIMIT ? OFFSET ?";

@@ -67,7 +67,7 @@ function hfDirectUrl(row) {
   return HF_ENDPOINT + "/" + repo + "/resolve/main/" + p;
 }
 
-const VERSION = "2.1.1-oracle";
+const VERSION = "2.1.2-oracle";
 
 /* ═══════════════════════ 1. CẤU HÌNH ═══════════════════════ */
 
@@ -1602,9 +1602,8 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
   const page = Math.floor((skip || 0) / 20) + 1;
   const forceType = (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") ? "series" : null;
 
-  // 1. Phim lẻ & Phim bộ: Ưu tiên đọc từ Turso DB độc lập
-  // Riêng "phim4k-otv-top": Là bảng xếp hạng lượt xem thời gian thực -> Lấy trực tiếp từ API gốc Phim4K
-  if (DB && typeof DB.getCatalog === "function" && catalogId !== "phim4k-otv-top") {
+  // 1. Phim lẻ, Phim bộ & Top xem: Đọc từ Oracle / Turso DB độc lập
+  if (DB && typeof DB.getCatalog === "function") {
     try {
       let dbList = [];
       if (query) {
@@ -1629,8 +1628,13 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
             };
           }),
         };
+      } else if (!query) {
+        // Duyệt catalog theo trang: nếu DB đã hết trang -> trả về rỗng ngay (HTTP 200), không gọi upstream
+        return { metas: [] };
       }
-    } catch {}
+    } catch (err) {
+      console.warn("DB catalog error:", err && err.message);
+    }
   }
 
   // 2. Với "phim4k-otv-top": Kiểm tra Edge Cache trước (cache 1 giờ = 3600s)
@@ -1642,25 +1646,23 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
     }
   }
 
-  // 3. Gọi upstream Phim4K
-  let list;
+  // 3. Fallback: Khi tìm kiếm (query) mà DB chưa có kết quả -> thử tìm thêm trên Phim4K
+  let list = [];
   if (query) {
-    list = await searchP4K(query, type, cfg, ms);
+    try {
+      list = await searchP4K(query, type, cfg, ms);
+    } catch {}
   } else {
     const path = catalogQuery(catalogId, page);
-    if (!path) throw new HttpError(404, "unknown catalog: " + catalogId);
-    try {
-      const data = await getJson(path, cfg, ms);
-      list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
-    } catch (e) {
-      // Nếu API gốc lỗi và có DB: Fallback sang Turso DB
-      if (DB && typeof DB.getCatalog === "function") {
-        const dbList = await DB.getCatalog(catalogId, page, 20).catch(() => []);
-        if (dbList.length > 0) list = dbList;
-      }
-      if (!list) throw e;
+    if (path) {
+      try {
+        const data = await getJson(path, cfg, ms);
+        list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
+      } catch {}
     }
   }
+
+  if (!Array.isArray(list)) list = [];
 
   const result = {
     metas: list.filter((m) => m && (m.videos_id || m.id)).map((m) => {
@@ -1679,7 +1681,7 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
     }),
   };
 
-  // Lưu cache cho topview
+  // Lưu cache cho topview nếu có kết quả từ upstream
   if (catalogId === "phim4k-otv-top" && !query && result.metas.length > 0) {
     await cachePutJSON("cat/top_views/" + page, result, 3600);
   }
@@ -1949,7 +1951,11 @@ export const addon = {
           search: url.searchParams.get("search"),
           skip: url.searchParams.get("skip"),
         };
-        return json(await handleCatalog(type, catalogId, extras, params, cfg, ms));
+        try {
+          return json(await handleCatalog(type, catalogId, extras, params, cfg, ms));
+        } catch (catErr) {
+          return json({ metas: [] });
+        }
       }
       if (segments[0] === "meta" && segments.length >= 3) {
         const type = segments[1];

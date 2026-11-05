@@ -14,8 +14,8 @@ const dec = (cell) => {
 export function tursoClient({
   url,
   token,
-  timeout = parseInt(process.env.TURSO_TIMEOUT || "90000", 10),
-  maxConcurrent = parseInt(process.env.TURSO_MAX_CONCURRENT || "3", 10),
+  timeout = typeof process !== "undefined" && process?.env?.TURSO_TIMEOUT ? parseInt(process.env.TURSO_TIMEOUT, 10) : 15000,
+  maxConcurrent = typeof process !== "undefined" && process?.env?.TURSO_MAX_CONCURRENT ? parseInt(process.env.TURSO_MAX_CONCURRENT, 10) : 10,
 }) {
   if (!url || !token) throw new Error("turso: thiếu TURSO_DATABASE_URL / TURSO_AUTH_TOKEN");
   const endpoint = String(url).replace(/^libsql:\/\//i, "https://").replace(/\/+$/, "") + "/v2/pipeline";

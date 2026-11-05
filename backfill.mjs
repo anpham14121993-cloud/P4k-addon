@@ -52,7 +52,7 @@ const startTime = Date.now();
 
 function cleanText(v) { return v ? String(v).trim() : null; }
 function normalizeText(v) {
-  return String(v || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  return String(v || "").replace(/[đĐ]/g, "d").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 function fileNameFrom(url) {
   const s = String(url || "").trim();
