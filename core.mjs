@@ -1590,7 +1590,14 @@ function buildStreamTitle(src) {
   });
   const name = cleanText(src.title);
   const icon = m.quality === "4K" ? "💎" : m.quality === "FHD" ? "⭐" : "🎬";
-  const ep = src.season != null && src.episode != null ? ` (Mùa ${src.season} · Tập ${src.episode})` : "";
+  let ep = "";
+  if (src.episode != null) {
+    if (src.season != null && src.season !== "") {
+      ep = ` (Mùa ${src.season} · Tập ${src.episode})`;
+    } else {
+      ep = ` (Tập ${src.episode})`;
+    }
+  }
   const l1 = icon + " " + (name || "Phim") + ep;
   const vid = [m.quality, m.source, m.video, ...m.hdr, m.container].filter((x) => x && x !== "-").join(" · ");
   const l2 = "💿 " + (vid || "HD").toUpperCase();
@@ -1818,6 +1825,7 @@ async function handleStream(type, id, cfg, ms, opts) {
         const e = parsed.episode != null ? parsed.episode : 1;
         const dbStreams = await DB.getStreams(vId, s, e);
         if (Array.isArray(dbStreams) && dbStreams.length > 0) {
+          const isSeries = metaType === "series";
           const items = dbStreams.map((item) => {
             let subs = null;
             try {
@@ -1825,6 +1833,8 @@ async function handleStream(type, id, cfg, ms, opts) {
             } catch {}
             const srcObj = {
               title: item.title,
+              season: isSeries ? (item.season != null ? item.season : s) : undefined,
+              episode: isSeries ? (item.episode != null ? item.episode : e) : undefined,
               source: item.label,
               subtitle: subs,
               container: item.container,
