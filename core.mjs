@@ -67,7 +67,7 @@ function hfDirectUrl(row) {
   return HF_ENDPOINT + "/" + repo + "/resolve/main/" + p;
 }
 
-const VERSION = "2.1.0-app-dyn";
+const VERSION = "2.1.1-oracle";
 
 /* ═══════════════════════ 1. CẤU HÌNH ═══════════════════════ */
 
@@ -1840,7 +1840,7 @@ function buildManifest() {
     name: ADDON_NAME,
     description: "Nguồn phim FHD + 4K • resolver có cache & retry",
     resources: [
-      { name: "catalog", types: ["movie", "series"], idPrefixes: PREFIXES },
+      { name: "catalog", types: ["movie", "series"] },
       { name: "meta", types: ["movie", "series"], idPrefixes: PREFIXES },
       { name: "stream", types: ["movie", "series"], idPrefixes: PREFIXES },
     ],
