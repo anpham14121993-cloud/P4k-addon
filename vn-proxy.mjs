@@ -80,88 +80,80 @@ export class VNProxyManager {
       return null;
     }
 
-    for (let round = 1; round <= 2; round++) {
-      let candidates = list.filter(p => !this.deadProxies.has(p));
-      if (candidates.length === 0) {
-        console.warn(`[Proxy VN] Toàn bộ ${this.deadProxies.size} proxy đã bị đánh dấu hỏng, reset bộ nhớ và quét lại vòng ${round}...`);
-        this.deadProxies.clear();
-        candidates = list.slice();
-      }
-
-      console.log(`[Proxy VN] Đang tìm proxy VN sống (vòng ${round}, còn ${candidates.length} ứng viên)...`);
-      // Ưu tiên SOCKS5 > HTTP/HTTPS > SOCKS4
-      candidates.sort((a, b) => {
-        const score = (p) => p.startsWith("socks5://") ? 2 : (p.startsWith("http") ? 1 : 0);
-        return score(b) - score(a);
-      });
-
-      const batchSize = 15;
-      for (let i = 0; i < candidates.length; i += batchSize) {
-        const batch = candidates.slice(i, i + batchSize);
-        try {
-          const winner = await Promise.any(
-            batch.map(p => new Promise((resolve, reject) => {
-              const cmd = `curl -s -x "${p}" --compressed --connect-timeout 4 -m 10 -H "Accept: application/json" -H "API-KEY: bbbb411dea44849" -H "Authorization: Basic YWRtaW46" -H "User-Agent: okhttp/4.9.0" "https://api.phim4k.space/rest-api/v130/movies?page=1"`;
-              execAsync(cmd)
-                .then(({ stdout }) => {
-                  if (stdout && stdout.startsWith("[") && stdout.includes("videos_id")) {
-                    resolve({ proxy: p, sample: stdout });
-                  } else {
-                    this.deadProxies.add(p);
-                    reject(new Error("invalid payload"));
-                  }
-                })
-                .catch((err) => {
-                  this.deadProxies.add(p);
-                  reject(err);
-                });
-            }))
-          );
-
-          this.activeProxy = winner.proxy;
-          console.log(`[Proxy VN] => Đã kết nối thành công qua Proxy VN: ${this.activeProxy}`);
-          return winner;
-        } catch {}
-      }
+    let candidates = list.filter(p => !this.deadProxies.has(p));
+    if (candidates.length === 0) {
+      this.deadProxies.clear();
+      candidates = list.slice();
     }
 
-    console.warn("[Proxy VN] Cảnh báo: Không tìm thấy proxy VN nào phản hồi 200 OK sau 2 vòng quét!");
+    // Ưu tiên SOCKS5 > HTTP/HTTPS > SOCKS4, chỉ thử tối đa 25 proxy nhanh nhất để không treo runner
+    candidates.sort((a, b) => {
+      const score = (p) => p.startsWith("socks5://") ? 2 : (p.startsWith("http") ? 1 : 0);
+      return score(b) - score(a);
+    });
+    const pool = candidates.slice(0, 25);
+    console.log(`[Proxy VN] Đang tìm proxy VN sống (kiểm tra nhanh ${pool.length} ứng viên)...`);
+
+    const batchSize = 10;
+    for (let i = 0; i < pool.length; i += batchSize) {
+      const batch = pool.slice(i, i + batchSize);
+      try {
+        const winner = await Promise.any(
+          batch.map(p => new Promise((resolve, reject) => {
+            const cmd = `curl -s -x "${p}" --compressed --connect-timeout 3 -m 6 -H "Accept: application/json" -H "API-KEY: bbbb411dea44849" -H "Authorization: Basic YWRtaW46" -H "User-Agent: okhttp/4.9.0" "https://api.phim4k.space/rest-api/v130/movies?page=1"`;
+            execAsync(cmd)
+              .then(({ stdout }) => {
+                if (stdout && stdout.startsWith("[") && stdout.includes("videos_id")) {
+                  resolve({ proxy: p, sample: stdout });
+                } else {
+                  this.deadProxies.add(p);
+                  reject(new Error("invalid payload"));
+                }
+              })
+              .catch((err) => {
+                this.deadProxies.add(p);
+                reject(err);
+              });
+          }))
+        );
+
+        this.activeProxy = winner.proxy;
+        console.log(`[Proxy VN] => Đã kết nối thành công qua Proxy VN: ${this.activeProxy}`);
+        return winner;
+      } catch {}
+    }
+
+    console.warn("[Proxy VN] Không tìm thấy proxy VN nào phản hồi 200 OK (dừng tìm kiếm để tránh treo máy).");
     return null;
   }
 
-  async fetchJson(url, maxRetries = 3) {
+  async fetchJson(url, maxRetries = 2) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       if (!this.activeProxy) {
         const win = await this.findWorkingProxy();
         if (!win || !win.proxy) {
-          console.warn(`[Proxy VN] Chưa tìm được proxy khả dụng (lần thử ${attempt}/${maxRetries})...`);
-          continue;
+          console.warn(`[Proxy VN] Chưa tìm được proxy khả dụng.`);
+          return null;
         }
         if (url.includes("movies?page=1") && win && win.sample) {
           try { return JSON.parse(win.sample); } catch {}
         }
       }
 
-      // Cho activeProxy thử tối đa 2 lần trước khi hủy bỏ
-      for (let sub = 1; sub <= 2; sub++) {
-        const cmd = `curl -s -x "${this.activeProxy}" --compressed --connect-timeout 8 -m 25 -H "Accept: application/json" -H "API-KEY: bbbb411dea44849" -H "Authorization: Basic YWRtaW46" -H "User-Agent: okhttp/4.9.0" "${url}"`;
-        try {
-          const { stdout } = await execAsync(cmd);
-          if (!stdout || stdout.trim().length === 0) throw new Error("Empty response");
-          const data = JSON.parse(stdout);
-          if (data && (Array.isArray(data) || data.videos_id || data.status !== "error")) {
-            return data;
-          }
-          throw new Error("Invalid payload: " + stdout.slice(0, 100));
-        } catch (e) {
-          if (sub === 1) {
-            console.warn(`[Proxy VN] Proxy ${this.activeProxy} chập chờn (${e.message}), thử lại lần 2...`);
-          } else {
-            console.warn(`[Proxy VN] Proxy ${this.activeProxy} thất bại sau 2 lần (${e.message}), chuyển proxy khác (lần thử ${attempt}/${maxRetries})...`);
-            this.deadProxies.add(this.activeProxy);
-            this.activeProxy = null;
-          }
+      // Cho activeProxy thử 1 lần
+      const cmd = `curl -s -x "${this.activeProxy}" --compressed --connect-timeout 5 -m 12 -H "Accept: application/json" -H "API-KEY: bbbb411dea44849" -H "Authorization: Basic YWRtaW46" -H "User-Agent: okhttp/4.9.0" "${url}"`;
+      try {
+        const { stdout } = await execAsync(cmd);
+        if (!stdout || stdout.trim().length === 0) throw new Error("Empty response");
+        const data = JSON.parse(stdout);
+        if (data && (Array.isArray(data) || data.videos_id || data.status !== "error")) {
+          return data;
         }
+        throw new Error("Invalid payload: " + stdout.slice(0, 100));
+      } catch (e) {
+        console.warn(`[Proxy VN] Proxy ${this.activeProxy} thất bại (${e.message}), hủy proxy.`);
+        this.deadProxies.add(this.activeProxy);
+        this.activeProxy = null;
       }
     }
     return null;

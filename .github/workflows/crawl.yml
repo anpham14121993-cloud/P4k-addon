@@ -28,6 +28,7 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: node clean-dead.mjs | tail -5
       - name: Đồng bộ phim mới từ Phim4K vào Turso DB
+        timeout-minutes: 5
         continue-on-error: true
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}

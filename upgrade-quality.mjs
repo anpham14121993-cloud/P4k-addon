@@ -116,9 +116,25 @@ const headers = {
 
 let globalCoolUntil = 0;
 
-async function fetchWithRetry(url, maxRetries = 4) {
-  if (IS_GH_ACTIONS || vnProxy.activeProxy) {
-    return vnProxy.fetchJson(url, maxRetries);
+async function fetchViaCfProxy(url) {
+  try {
+    const proxyUrl = url.replace(
+      "https://api.phim4k.space/rest-api/v130/",
+      "https://phim4k-addon.notthingp.workers.dev/api-proxy/"
+    );
+    const r = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) });
+    if (r.ok) {
+      const data = await r.json();
+      if (data && (Array.isArray(data) || data.videos_id || data.title)) return data;
+    }
+  } catch {}
+  return null;
+}
+
+async function fetchWithRetry(url, maxRetries = 3) {
+  if (vnProxy.activeProxy) {
+    const data = await vnProxy.fetchJson(url, maxRetries);
+    if (data) return data;
   }
 
   for (let i = 0; i < maxRetries; i++) {
@@ -127,7 +143,7 @@ async function fetchWithRetry(url, maxRetries = 4) {
       await sleep(globalCoolUntil - now);
     }
     try {
-      const r = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (r.status === 429) {
         const ra = parseInt(r.headers.get("retry-after") || "0", 10);
         const coolMs = ra > 0 ? ra * 1000 : 15000;
@@ -137,21 +153,33 @@ async function fetchWithRetry(url, maxRetries = 4) {
         continue;
       }
       if (r.status === 403) {
-        console.warn(`[HTTP 403] Bị Cloudflare chặn IP trực tiếp. Tự động chuyển qua bộ xoay Proxy VN...`);
-        return vnProxy.fetchJson(url, maxRetries);
+        console.warn(`[HTTP 403] Bị chặn trực tiếp. Thử qua Cloudflare Worker API proxy...`);
+        const cfData = await fetchViaCfProxy(url);
+        if (cfData) return cfData;
+        console.warn(`[CF Proxy] Thất bại, thử xoay Proxy VN...`);
+        return vnProxy.fetchJson(url, 2);
       }
       if (!r.ok) {
         if (r.status >= 500) { await sleep(1500 * (i + 1)); continue; }
+        const cfData = await fetchViaCfProxy(url);
+        if (cfData) return cfData;
         return null;
       }
       const txt = await r.text();
       if (txt.includes("rate limited") || txt.includes("Cloudflare")) {
+        const cfData = await fetchViaCfProxy(url);
+        if (cfData) return cfData;
         globalCoolUntil = Date.now() + 15000;
         await sleep(15000);
         continue;
       }
       return JSON.parse(txt);
     } catch (e) {
+      const cfData = await fetchViaCfProxy(url);
+      if (cfData) return cfData;
+      if (i === maxRetries - 1) {
+        return vnProxy.fetchJson(url, 2);
+      }
       await sleep(1500 * (i + 1));
     }
   }

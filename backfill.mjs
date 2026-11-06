@@ -126,40 +126,65 @@ const headers = {
   "User-Agent": "okhttp/4.9.0",
 };
 
-async function fetchWithRetry(url, maxRetries = 4) {
-  // Trên GitHub Actions, IP datacenter US bị Cloudflare 403 nên đi thẳng qua Proxy VN
-  if (IS_GH_ACTIONS || vnProxy.activeProxy) {
-    return vnProxy.fetchJson(url, maxRetries);
+async function fetchViaCfProxy(url) {
+  try {
+    const proxyUrl = url.replace(
+      "https://api.phim4k.space/rest-api/v130/",
+      "https://phim4k-addon.notthingp.workers.dev/api-proxy/"
+    );
+    const r = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) });
+    if (r.ok) {
+      const data = await r.json();
+      if (data && (Array.isArray(data) || data.videos_id || data.title)) return data;
+    }
+  } catch {}
+  return null;
+}
+
+async function fetchWithRetry(url, maxRetries = 3) {
+  // 1. Nếu đã có activeProxy được xác nhận sống -> dùng tiếp
+  if (vnProxy.activeProxy) {
+    const data = await vnProxy.fetchJson(url, maxRetries);
+    if (data) return data;
   }
 
+  // 2. Thử gọi trực tiếp trước (kể cả trên GitHub Actions — okhttp + auth thường qua được)
   for (let i = 0; i < maxRetries; i++) {
     try {
-      const r = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (r.status === 429) {
         console.warn(`[429 Rate Limit] Đang đợi ${2000 * (i + 1)}ms...`);
-        const backoff = 2000 * (i + 1);
-        await sleep(backoff);
+        await sleep(2000 * (i + 1));
         continue;
       }
       if (r.status === 403) {
-        console.warn(`[HTTP 403] Bị Cloudflare chặn IP trực tiếp. Tự động chuyển qua bộ xoay Proxy VN...`);
-        return vnProxy.fetchJson(url, maxRetries);
+        console.warn(`[HTTP 403] Bị chặn trực tiếp. Thử qua Cloudflare Worker API proxy...`);
+        const cfData = await fetchViaCfProxy(url);
+        if (cfData) return cfData;
+        console.warn(`[CF Proxy] Thất bại, thử xoay Proxy VN...`);
+        return vnProxy.fetchJson(url, 2);
       }
       if (!r.ok) {
-        const bodyTxt = await r.text().catch(() => "");
-        console.warn(`[HTTP ${r.status}] Gọi ${url} thất bại: ${bodyTxt.slice(0, 200)}`);
         if (r.status >= 500) { await sleep(1000 * (i + 1)); continue; }
+        const cfData = await fetchViaCfProxy(url);
+        if (cfData) return cfData;
         return null;
       }
       const txt = await r.text();
       if (txt.includes("rate limited") || txt.includes("Cloudflare")) {
         console.warn(`[Cloudflare WAF] Bị chặn tạm thời: ${txt.slice(0, 150)}`);
+        const cfData = await fetchViaCfProxy(url);
+        if (cfData) return cfData;
         await sleep(2000 * (i + 1));
         continue;
       }
       return JSON.parse(txt);
     } catch (e) {
-      console.warn(`[Network/Fetch Error] ${e.message || e}`);
+      const cfData = await fetchViaCfProxy(url);
+      if (cfData) return cfData;
+      if (i === maxRetries - 1) {
+        return vnProxy.fetchJson(url, 2);
+      }
       await sleep(1000 * (i + 1));
     }
   }
