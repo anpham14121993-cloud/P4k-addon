@@ -6,6 +6,8 @@ workers_dev = true
 [vars]
 HF_ENDPOINT = "https://huggingface.co"
 
-# Mỗi giờ: crawler chạy ngắn (feed top + inv/index đến hạn) rồi tự idle-exit.
+# Cloudflare Cron Triggers: chạy mỗi 30 phút.
+# - Vào :00: dispatch crawl (1h/lần) + sync-realtime (30m/lần)
+# - Vào :30: dispatch sync-realtime (30m/lần)
 [triggers]
-crons = ["0 * * * *"]
+crons = ["*/30 * * * *"]
