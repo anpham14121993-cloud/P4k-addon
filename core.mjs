@@ -1637,22 +1637,32 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
   const page = Math.floor((skip || 0) / 20) + 1;
   const forceType = (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") ? "series" : null;
 
-  // 1. Riêng danh mục "phim4k-otv-top" (Bảng xếp hạng Top Lượt Xem):
-  // Lấy trực tiếp từ API gốc Phim4K theo số lượt xem thực tế (có Edge Cache 1 giờ).
-  // Nếu API gốc lỗi -> Tự động fallback sang Oracle DB (xếp theo điểm IMDb).
-  if (catalogId === "phim4k-otv-top" && !query) {
-    const topCacheKey = "cat/top_views_v4/" + page;
-    const cachedTop = await cacheGetJSON(topCacheKey);
-    if (cachedTop && Array.isArray(cachedTop.metas) && cachedTop.metas.length > 0) {
-      return cachedTop;
+  // 1. Danh mục thời gian thực từ API gốc Phim4K (Real-time Catalog với Edge Cache):
+  // Áp dụng cho: Phim lẻ mới nhất (latest_movies), Phim bộ mới nhất (latest_tvseries) và Top xem nhiều (top_views).
+  // Đảm bảo thứ tự hiển thị và poster khớp 100% với ứng dụng gốc Phim4K và không bị ảnh hưởng bởi đợt reset ID.
+  // Nếu API gốc lỗi hoặc hết trang -> Tự động fallback sang Database.
+  if (!query && (catalogId === "phim4k-otv-movies" || catalogId === "phim4k-otv-movies-latest" || catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest" || catalogId === "phim4k-otv-top")) {
+    const isMovies = catalogId === "phim4k-otv-movies" || catalogId === "phim4k-otv-movies-latest";
+    const isTop = catalogId === "phim4k-otv-top";
+    const catEndpoint = isTop
+      ? "top_views?period=all&limit=20&page=" + page
+      : isMovies
+      ? "latest_movies?limit=20&page=" + page
+      : "latest_tvseries?limit=20&page=" + page;
+    const catCacheKey = "cat/rt_v5/" + catalogId + "/" + page;
+    const ttl = isTop ? 3600 : 900; // Top views cache 1h, Phim mới cache 15 phút
+
+    const cachedCat = await cacheGetJSON(catCacheKey);
+    if (cachedCat && Array.isArray(cachedCat.metas) && cachedCat.metas.length > 0) {
+      return cachedCat;
     }
     try {
-      const data = await getJson("top_views?period=all&limit=20&page=" + page, cfg, ms);
-      const topList = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
-      if (topList.length > 0) {
-        const topResult = {
-          metas: topList.filter((m) => m && (m.videos_id || m.id)).map((m) => {
-            const t = forceType || (String(m.is_tvseries) === "1" ? "series" : (m.type || "movie"));
+      const data = await getJson(catEndpoint, cfg, ms);
+      const catList = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
+      if (catList.length > 0) {
+        const catResult = {
+          metas: catList.filter((m) => m && (m.videos_id || m.id)).map((m) => {
+            const t = forceType || (String(m.is_tvseries) === "1" ? "series" : (m.type || (isMovies ? "movie" : "series")));
             return {
               id: "otv:" + (m.videos_id || m.id),
               type: t,
@@ -1666,11 +1676,11 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
             };
           }),
         };
-        await cachePutJSON(topCacheKey, topResult, 3600);
-        return topResult;
+        await cachePutJSON(catCacheKey, catResult, ttl);
+        return catResult;
       }
-    } catch (topErr) {
-      console.warn("Lỗi tải top_views từ API gốc, fallback sang DB:", topErr && topErr.message);
+    } catch (catErr) {
+      console.warn("Lỗi tải catalog từ API gốc, fallback sang DB:", catErr && catErr.message);
     }
   }
 
