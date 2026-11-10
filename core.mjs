@@ -116,8 +116,16 @@ let HMAC_SECRET = "";
 // allorigins/codetabs/allorigins2/webcors chết, whateverorigin 500, corsproxy 401,
 // cors.lol 429 — CHỈ r.jina còn mint được. Các mirror chết vừa tốn request vừa
 // giữ subrequest slot (gây "stalled response" / giảm tốc), nên bỏ khỏi danh sách.
+const DEFAULT_RELAY_URL = "https://p4k-relay.vercel.app/api/relay";
+const DEFAULT_RELAY_KEY = "p4k_sec_7a9f82d1e0b5c439";
+
 let EGRESS_MIRRORS = [
-  { name: "r.jina.ai", wrap: (u) => "https://r.jina.ai/" + u, ms: 6000, headers: {} },
+  {
+    name: "relay",
+    wrap: (u) => DEFAULT_RELAY_URL + "?url=" + encodeURIComponent(u),
+    ms: 6000,
+    headers: { Accept: "application/json", "x-relay-key": DEFAULT_RELAY_KEY },
+  },
 ];
 // Ghi chú (tạm giữ cấu hình cũ nếu cần bật lại một mirror khác):
 // { name: "allorigins", wrap: (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u), ms: 6000, headers: { Accept: "application/json" } },
@@ -148,20 +156,16 @@ function applySecrets(env) {
   HMAC_SECRET = HMAC_SECRETS["svatv.cryboiz.workers.dev"] || HMAC_SECRETS["svpc.cryboiz.workers.dev"] || "";
   TMDB_API_KEY = env.TMDB_API_KEY || "";
 
-  const relayUrl = (env && env.VERCEL_RELAY_URL) || "";
-  const relayKey = (env && env.VERCEL_RELAY_KEY) || "";
-  EGRESS_MIRRORS = [];
-  if (relayUrl) {
-    const headers = { Accept: "application/json" };
-    if (relayKey) headers["x-relay-key"] = relayKey;
-    EGRESS_MIRRORS.push({
+  const relayUrl = (env && env.VERCEL_RELAY_URL) || DEFAULT_RELAY_URL;
+  const relayKey = (env && env.VERCEL_RELAY_KEY) || DEFAULT_RELAY_KEY;
+  EGRESS_MIRRORS = [
+    {
       name: "relay",
       wrap: (u) => (relayUrl.includes("?") ? relayUrl + "&url=" : relayUrl + "?url=") + encodeURIComponent(u),
       ms: 6000,
-      headers,
-    });
-  }
-  EGRESS_MIRRORS.push({ name: "r.jina.ai", wrap: (u) => "https://r.jina.ai/" + u, ms: 6000, headers: {} });
+      headers: { Accept: "application/json", "x-relay-key": relayKey },
+    },
+  ];
 }
 applySecrets(PROCESS_ENV);
 
