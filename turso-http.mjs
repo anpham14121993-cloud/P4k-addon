@@ -14,8 +14,12 @@ const dec = (cell) => {
 export function tursoClient({
   url,
   token,
-  timeout = typeof process !== "undefined" && process?.env?.TURSO_TIMEOUT ? parseInt(process.env.TURSO_TIMEOUT, 10) : 15000,
-  maxConcurrent = typeof process !== "undefined" && process?.env?.TURSO_MAX_CONCURRENT ? parseInt(process.env.TURSO_MAX_CONCURRENT, 10) : 10,
+  timeout = typeof process !== "undefined" && process?.env?.TURSO_TIMEOUT
+    ? parseInt(process.env.TURSO_TIMEOUT, 10)
+    : (typeof process !== "undefined" ? 90000 : 15000),
+  maxConcurrent = typeof process !== "undefined" && process?.env?.TURSO_MAX_CONCURRENT
+    ? parseInt(process.env.TURSO_MAX_CONCURRENT, 10)
+    : (typeof process !== "undefined" ? 3 : 10),
 }) {
   if (!url || !token) throw new Error("turso: thiếu TURSO_DATABASE_URL / TURSO_AUTH_TOKEN");
   const endpoint = String(url).replace(/^libsql:\/\//i, "https://").replace(/\/+$/, "") + "/v2/pipeline";
@@ -59,8 +63,8 @@ export function tursoClient({
         signal: AbortSignal.timeout(timeout),
       });
     } catch (e) {
-      if (attempt < 2) {
-        const waitMs = Math.min(3000, 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 300));
+      if (attempt < 3) {
+        const waitMs = Math.min(5000, 1000 * Math.pow(2, attempt) + Math.floor(Math.random() * 500));
         await new Promise((r) => setTimeout(r, waitMs));
         return rawPipeline(requests, attempt + 1);
       }
@@ -68,9 +72,9 @@ export function tursoClient({
       throw new Error("turso fetch: " + (e && e.message ? e.message : e) + cause);
     }
     if (res.status === 429 || res.status >= 500) {
-      if (attempt < 2) {
+      if (attempt < 3) {
         const ra = parseInt(res.headers.get("retry-after") || "0", 10);
-        const waitMs = ra > 0 ? ra * 1000 : Math.min(3000, 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 300));
+        const waitMs = ra > 0 ? ra * 1000 : Math.min(5000, 1000 * Math.pow(2, attempt) + Math.floor(Math.random() * 500));
         await new Promise((r) => setTimeout(r, waitMs));
         return rawPipeline(requests, attempt + 1);
       }
@@ -93,9 +97,18 @@ export function tursoClient({
     return { rows, changes: result && result.affected_row_count || 0, lastInsertRowid: result && result.last_insert_rowid };
   }
 
-  async function exec(sql, args = []) {
+  async function exec(sql, args = [], retry = 0) {
     const rs = await pipeline([{ type: "execute", stmt: { sql, args: args.map(encArg) } }, { type: "close" }]);
-    return parseResult(rs[0]);
+    try {
+      return parseResult(rs[0]);
+    } catch (e) {
+      if (retry < 3 && /database is locked/i.test(e.message)) {
+        const wait = 600 * Math.pow(2, retry) + Math.floor(Math.random() * 400);
+        await new Promise((r) => setTimeout(r, wait));
+        return exec(sql, args, retry + 1);
+      }
+      throw e;
+    }
   }
 
   async function batch(statements, chunk = 100) {
@@ -104,7 +117,16 @@ export function tursoClient({
       const part = statements.slice(i, i + chunk);
       const reqs = part.map((s) => ({ type: "execute", stmt: { sql: s.sql, args: (s.args || []).map(encArg) } }));
       reqs.push({ type: "close" });
-      const rs = await pipeline(reqs);
+
+      let rs;
+      for (let attempt = 0; attempt <= 3; attempt++) {
+        rs = await pipeline(reqs);
+        const hasLocked = rs.some((r) => r && r.type !== "ok" && /database is locked/i.test(r.error?.message || ""));
+        if (!hasLocked || attempt === 3) break;
+        const wait = 800 * Math.pow(2, attempt) + Math.floor(Math.random() * 400);
+        await new Promise((r) => setTimeout(r, wait));
+      }
+
       for (let k = 0; k < part.length; k++) out.push(parseResult(rs[k]));
     }
     return out;
