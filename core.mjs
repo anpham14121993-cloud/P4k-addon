@@ -195,9 +195,9 @@ const dec = new TextDecoder();
 let dynamicCache = { at: 0, value: null };
 let resolveCache = new Map();   // filename -> {url, at}
 let deadResolveCache = new Map(); // filename -> epoch ms khi node trả về 404/source unavailable
-const DEAD_RESOLVE_TTL_MS = 15 * 60 * 1000;
+const DEAD_RESOLVE_TTL_MS = 10 * 1000;
 let poolDeadMs = 0;             // epoch ms khi phát hiện resolver toàn-503 → bỏ direct tạm thời
-const POOL_DEAD_WINDOW_MS = 60 * 1000; // nhớ "pool chết" trong 60s
+const POOL_DEAD_WINDOW_MS = 15 * 1000; // nhớ "pool chết" trong 15s
 const EGRESS_ALWAYS = false;    // bật true = mint egress luôn, không thử resolver trước
 // Lưu ý: nếu đặt EGRESS_ALWAYS=true thì bỏ luôn phần chờ thử resolver ~0.5s/request.
 
