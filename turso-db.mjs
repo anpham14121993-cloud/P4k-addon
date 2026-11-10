@@ -4,7 +4,7 @@ import { tursoClient } from "./turso-http.mjs";
 const TTL_MS = 30 * 60 * 1000;
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 const MAX_MEM = 5000;
-const CACHE_VER = "v4";
+const CACHE_VER = "v5";
 const baseOf = (id) => (id.includes(".") ? id.slice(0, id.lastIndexOf(".")) : id);
 
 function normalizeText(v) {
@@ -178,6 +178,16 @@ export function tursoDb(env) {
     return row;
   }
 
+  async function updateImdbId(id, imdbId) {
+    const numId = parseInt(id, 10);
+    if (!numId || !imdbId) return;
+    const cleanImdb = String(imdbId).startsWith("tt") ? String(imdbId) : "tt" + imdbId;
+    try {
+      await c.exec("UPDATE titles SET imdb_id = ? WHERE id = ? AND imdb_id IS NULL", [cleanImdb, numId]);
+      await cachePut("imdb", cleanImdb, { at: Date.now(), row: { id: numId } });
+    } catch {}
+  }
+
   /* ═══════════════ 3. TRUY VẤN BẢNG EPISODES_STREAMS (TẬP & LUỒNG PHÁT) ═══════════════ */
 
   async function getSeriesEpisodes(titleId) {
@@ -213,5 +223,5 @@ export function tursoDb(env) {
     return rows;
   }
 
-  return { row, variants, getCatalog, search, getTitle, getTitleByImdb, getSeriesEpisodes, getStreams };
+  return { row, variants, getCatalog, search, getTitle, getTitleByImdb, updateImdbId, getSeriesEpisodes, getStreams };
 }

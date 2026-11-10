@@ -1765,6 +1765,22 @@ async function handleMeta(type, id, cfg, ms) {
         titleRow = await DB.getTitle(parsed.cleanId);
       } else if (parsed.baseId && parsed.baseId.startsWith("tt") && DB.getTitleByImdb) {
         titleRow = await DB.getTitleByImdb(parsed.baseId);
+        if (!titleRow && DB.search) {
+          try {
+            const cm = await cinemetaFetch(metaType, parsed.baseId, ms);
+            if (cm && cm.name) {
+              const cmYear = parseInt(cm.year || (cm.released && cm.released.slice(0, 4)), 10) || null;
+              const hits = await DB.search(cm.name, metaType, 10);
+              if (Array.isArray(hits) && hits.length > 0) {
+                const exact = hits.find((h) => cmYear && h.release_year === cmYear);
+                titleRow = exact || hits[0];
+                if (titleRow && DB.updateImdbId) {
+                  DB.updateImdbId(titleRow.id, parsed.baseId).catch(() => {});
+                }
+              }
+            }
+          } catch {}
+        }
       }
       if (titleRow) {
         let genres = [];
@@ -1817,7 +1833,23 @@ async function handleStream(type, id, cfg, ms, opts) {
       if (parsed.internal) {
         vId = parsed.cleanId;
       } else if (parsed.baseId && parsed.baseId.startsWith("tt") && DB.getTitleByImdb) {
-        const tRow = await DB.getTitleByImdb(parsed.baseId);
+        let tRow = await DB.getTitleByImdb(parsed.baseId);
+        if (!tRow && DB.search) {
+          try {
+            const cm = await cinemetaFetch(metaType, parsed.baseId, ms);
+            if (cm && cm.name) {
+              const cmYear = parseInt(cm.year || (cm.released && cm.released.slice(0, 4)), 10) || null;
+              const hits = await DB.search(cm.name, metaType, 10);
+              if (Array.isArray(hits) && hits.length > 0) {
+                const exact = hits.find((h) => cmYear && h.release_year === cmYear);
+                tRow = exact || hits[0];
+                if (tRow && DB.updateImdbId) {
+                  DB.updateImdbId(tRow.id, parsed.baseId).catch(() => {});
+                }
+              }
+            }
+          } catch {}
+        }
         if (tRow) vId = tRow.id;
       }
       if (vId) {
