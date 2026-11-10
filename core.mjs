@@ -2004,7 +2004,7 @@ async function diagAll(request) {
       dynMs: Date.now() - t0,
     };
   } catch (e) { out.configError = String(e.message || e).slice(0, 60); }
-  const probeTarget = "https://api.phim4k.space/rest-api/v130/movies?page=1";
+  const probeTarget = "https://svpc.cryboiz.workers.dev/";
   out.mirrors = await Promise.all(EGRESS_MIRRORS.map(async (m) => ({ name: m.name, ...await diagProbe(m, probeTarget) })));
   const fileName = "JE2TRZGY7TCW99A";
   const host = "https://svpc.cryboiz.workers.dev";

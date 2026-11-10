@@ -1,0 +1,4 @@
+{
+  "name": "p4k-relay",
+  "functions": { "api/relay.js": { "maxDuration": 30 } }
+}
