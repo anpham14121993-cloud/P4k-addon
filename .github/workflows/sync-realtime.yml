@@ -12,8 +12,8 @@ on:
         required: false
 
 concurrency:
-  group: p4k-db-job
-  cancel-in-progress: false
+  group: p4k-sync-realtime
+  cancel-in-progress: true
 
 jobs:
   sync:
