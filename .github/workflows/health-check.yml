@@ -33,6 +33,8 @@ jobs:
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TURSO_TIMEOUT: "90000"
+          TURSO_MAX_CONCURRENT: "2"
         run: |
           set -o pipefail
           EXTRA_ARGS=""

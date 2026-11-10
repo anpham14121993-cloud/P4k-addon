@@ -9,14 +9,14 @@ import { tursoClient } from "./turso-http.mjs";
 import { vnProxy, IS_GH_ACTIONS } from "./vn-proxy.mjs";
 
 // Đọc env cục bộ nếu chạy dưới Termux/Local
-if (!process.env.TURSO_DATABASE_URL && fs.existsSync(".env.turso")) {
+if (!process.env.GITHUB_ACTIONS && fs.existsSync(".env.turso")) {
   const lines = fs.readFileSync(".env.turso", "utf-8").split("\n");
   for (const line of lines) {
     const eq = line.indexOf("=");
     if (eq > 0) {
       const k = line.slice(0, eq).trim();
       const v = line.slice(eq + 1).trim();
-      if (!process.env[k]) process.env[k] = v;
+      if (k && v && !k.startsWith("#")) process.env[k] = v;
     }
   }
 }
@@ -112,9 +112,25 @@ const headers = {
 
 let globalCoolUntil = 0;
 
-async function fetchWithRetry(url, maxRetries = 4) {
-  if (IS_GH_ACTIONS || vnProxy.activeProxy) {
-    return vnProxy.fetchJson(url, maxRetries);
+async function fetchViaCfProxy(url) {
+  try {
+    const proxyUrl = url.replace(
+      "https://api.phim4k.space/rest-api/v130/",
+      "https://phim4k-addon.notthingp.workers.dev/api-proxy/"
+    );
+    const r = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) });
+    if (r.ok) {
+      const data = await r.json();
+      if (data && (Array.isArray(data) || data.videos_id || data.title)) return data;
+    }
+  } catch {}
+  return null;
+}
+
+async function fetchWithRetry(url, maxRetries = 3) {
+  if (vnProxy.activeProxy) {
+    const data = await vnProxy.fetchJson(url, maxRetries);
+    if (data) return data;
   }
 
   for (let i = 0; i < maxRetries; i++) {
@@ -123,7 +139,7 @@ async function fetchWithRetry(url, maxRetries = 4) {
       await sleep(globalCoolUntil - now);
     }
     try {
-      const r = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (r.status === 429) {
         const ra = parseInt(r.headers.get("retry-after") || "0", 10);
         const coolMs = ra > 0 ? ra * 1000 : 15000;
@@ -133,21 +149,33 @@ async function fetchWithRetry(url, maxRetries = 4) {
         continue;
       }
       if (r.status === 403) {
-        console.warn(`[HTTP 403] Bị Cloudflare chặn IP trực tiếp. Tự động chuyển qua bộ xoay Proxy VN...`);
-        return vnProxy.fetchJson(url, maxRetries);
+        console.warn(`[HTTP 403] Bị chặn trực tiếp. Thử qua Cloudflare Worker API proxy...`);
+        const cfData = await fetchViaCfProxy(url);
+        if (cfData) return cfData;
+        console.warn(`[CF Proxy] Thất bại, thử xoay Proxy VN...`);
+        return vnProxy.fetchJson(url, 2);
       }
       if (!r.ok) {
         if (r.status >= 500) { await sleep(1500 * (i + 1)); continue; }
+        const cfData = await fetchViaCfProxy(url);
+        if (cfData) return cfData;
         return null;
       }
       const txt = await r.text();
       if (txt.includes("rate limited") || txt.includes("Cloudflare")) {
+        const cfData = await fetchViaCfProxy(url);
+        if (cfData) return cfData;
         globalCoolUntil = Date.now() + 15000;
         await sleep(15000);
         continue;
       }
       return JSON.parse(txt);
     } catch (e) {
+      const cfData = await fetchViaCfProxy(url);
+      if (cfData) return cfData;
+      if (i === maxRetries - 1) {
+        return vnProxy.fetchJson(url, 2);
+      }
       await sleep(1500 * (i + 1));
     }
   }
@@ -224,6 +252,12 @@ async function main() {
     console.warn("Chưa đọc được meta con trỏ cũ, bắt đầu từ ID 0:", e.message);
   }
 
+  const overrideStartId = getArg("start-id", null);
+  if (overrideStartId !== null) {
+    lastId = Math.max(0, parseInt(overrideStartId, 10) || 0);
+    console.log(`[Ghi đè ID bắt đầu] Chỉ định quét từ ID: ${lastId}`);
+  }
+
   console.log(`[Chu kỳ hiện tại: Tháng thứ ${cycle}] Bắt đầu quét tiếp từ ID: ${lastId}`);
 
   // 3. Lấy danh sách phim tiếp theo cần kiểm tra
@@ -273,31 +307,73 @@ async function main() {
     if (t.type === "movie" && Array.isArray(d.videos)) {
       // Lấy danh sách stream trong DB
       const dbStreamsRes = await client.exec(
-        "SELECT id, file_id, label FROM episodes_streams WHERE title_id = ? AND season = 1 AND episode = 1",
+        "SELECT id, file_id, label, container, quality FROM episodes_streams WHERE title_id = ? AND season = 1 AND episode = 1",
         [t.id]
       );
       const dbStreams = dbStreamsRes.rows || [];
       totalStreamsChecked += dbStreams.length;
 
-      // Danh sách file_id hiện tại từ API
-      const apiFileIds = d.videos.map((v) => fileNameFrom(v.file_url)).filter(Boolean);
-      let titleFixed = false;
-
-      for (let sIdx = 0; sIdx < dbStreams.length; sIdx++) {
-        const dbS = dbStreams[sIdx];
-        // Nếu file_id trong DB không còn tồn tại trên API và API có file_id mới tương ứng
-        if (!apiFileIds.includes(dbS.file_id) && apiFileIds[sIdx] && apiFileIds[sIdx] !== dbS.file_id) {
-          const newFileId = apiFileIds[sIdx];
+      // 1. Phim chưa có bất kỳ stream nào trong DB (Orphan movie) -> Nạp mới ngay!
+      if (dbStreams.length === 0 && d.videos.length > 0) {
+        let inserted = 0;
+        for (const v of d.videos) {
+          const fid = fileNameFrom(v.file_url);
+          if (!fid) continue;
           await collector.add({
-            sql: "UPDATE episodes_streams SET file_id = ?, created_at = ? WHERE id = ?",
-            args: [newFileId, Date.now(), dbS.id],
+            sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            args: [
+              t.id, 1, 1, fid,
+              cleanText(v.label || d.title),
+              cleanText(v.file_type),
+              cleanText(d.video_quality),
+              Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
+              Date.now(),
+            ],
           });
-          console.log(`  [CỨU LINK PHIM LẺ] [${t.id}] ${t.title}: Sửa file_id cũ "${dbS.file_id}" -> mới "${newFileId}"`);
-          totalStreamsRepaired++;
-          titleFixed = true;
+          inserted++;
         }
+        if (inserted > 0) {
+          console.log(`  [HỒI SINH PHIM LẺ] [${t.id}] ${t.title}: Nạp mới ${inserted} luồng stream!`);
+          totalStreamsRepaired += inserted;
+          totalTitlesRepaired++;
+        }
+      } else if (dbStreams.length > 0) {
+        // 2. Phim đã có stream -> Đối soát cứu link bị đổi
+        const apiVideos = d.videos.map((v) => ({
+          file_id: fileNameFrom(v.file_url),
+          label: cleanText(v.label),
+          file_type: cleanText(v.file_type),
+        })).filter((v) => Boolean(v.file_id));
+
+        const apiFileIds = new Set(apiVideos.map((v) => v.file_id));
+        const dbFileIds = new Set(dbStreams.map((s) => s.file_id));
+        const unusedApiVideos = apiVideos.filter((v) => !dbFileIds.has(v.file_id));
+
+        let titleFixed = false;
+        for (const dbS of dbStreams) {
+          if (apiFileIds.has(dbS.file_id)) continue; // file cũ vẫn còn sống trên API
+
+          if (unusedApiVideos.length > 0) {
+            // Ưu tiên tìm video mới có label tương đồng nhất
+            let bestIdx = 0;
+            if (dbS.label) {
+              const lowerLabel = dbS.label.toLowerCase();
+              const found = unusedApiVideos.findIndex((v) => v.label && lowerLabel.includes(v.label.toLowerCase()));
+              if (found >= 0) bestIdx = found;
+            }
+            const chosen = unusedApiVideos.splice(bestIdx, 1)[0];
+            await collector.add({
+              sql: "UPDATE episodes_streams SET file_id = ?, label = COALESCE(?, label), created_at = ? WHERE id = ?",
+              args: [chosen.file_id, chosen.label, Date.now(), dbS.id],
+            });
+            console.log(`  [CỨU LINK PHIM LẺ] [${t.id}] ${t.title}: Sửa file_id cũ "${dbS.file_id}" -> mới "${chosen.file_id}"`);
+            totalStreamsRepaired++;
+            titleFixed = true;
+          }
+        }
+        if (titleFixed) totalTitlesRepaired++;
       }
-      if (titleFixed) totalTitlesRepaired++;
     }
 
     // 4.2 Xử lý PHIM BỘ
@@ -329,20 +405,45 @@ async function main() {
           const info = episodeInfo(s, ep);
           if (info.episode === null) continue;
 
-          const k = `${info.season}:${info.episode}`;
-          const existingList = dbStreamMap.get(k);
+          const from = info.episode;
+          const to = info.episodeEnd ? info.episodeEnd : from;
+          const span = Math.min(to, from + 60);
 
-          if (existingList && existingList.length > 0) {
-            // Kiểm tra xem file_id của tập này có bị thay đổi không
+          for (let epNum = from; epNum <= span; epNum++) {
+            const k = `${info.season}:${epNum}`;
+            const existingList = dbStreamMap.get(k) || [];
+
+            // 1. Tập chưa có stream trong DB -> Nạp mới luôn!
+            if (existingList.length === 0) {
+              await collector.add({
+                sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                args: [
+                  t.id, info.season, epNum, apiFileId,
+                  cleanText(ep.episodes_name || s.seasons_name),
+                  cleanText(ep.file_type),
+                  cleanText(d.video_quality),
+                  Array.isArray(ep.subtitle) && ep.subtitle.length ? JSON.stringify(ep.subtitle) : null,
+                  Date.now(),
+                ],
+              });
+              dbStreamMap.set(k, [{ id: 0, season: info.season, episode: epNum, file_id: apiFileId }]);
+              totalStreamsRepaired++;
+              titleFixed = true;
+              continue;
+            }
+
+            // 2. Tập đã có trong DB -> Kiểm tra xem file_id có bị đổi không
             const matchExact = existingList.some((x) => x.file_id === apiFileId);
-            if (!matchExact && existingList.length === 1) {
-              // Tập này chỉ có 1 stream và file_id đã bị đổi trên API -> Cứu link!
+            if (!matchExact) {
+              // Tìm luồng trong existingList chưa khớp để cứu (hỗ trợ cả tập có 1 hoặc nhiều luồng)
               const target = existingList[0];
               await collector.add({
                 sql: "UPDATE episodes_streams SET file_id = ?, created_at = ? WHERE id = ?",
                 args: [apiFileId, Date.now(), target.id],
               });
-              console.log(`  [CỨU LINK TẬP] [${t.id}] ${t.title} S${info.season}E${info.episode}: "${target.file_id}" -> "${apiFileId}"`);
+              console.log(`  [CỨU LINK TẬP] [${t.id}] ${t.title} S${info.season}E${epNum}: "${target.file_id}" -> "${apiFileId}"`);
+              target.file_id = apiFileId; // cập nhật local để không cứu trùng
               totalStreamsRepaired++;
               titleFixed = true;
             }
