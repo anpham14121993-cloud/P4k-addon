@@ -180,7 +180,7 @@ const UPSTREAM_TIMEOUT_MS = 10000;
 const RESOLVE_TIMEOUT_MS = 8000;
 const HEALTH_TIMEOUT_MS = 6000;   // kiểm host dự phòng có sống không
 const RESOLVE_ATTEMPTS = 2;      // số lần thử lấy node tốt
-const DIRECT_RESOLVE_BUDGET_MS = 1500; // chờ trực tiếp tối đa trước khi chuyển egress
+const DIRECT_RESOLVE_BUDGET_MS = 3500; // chờ trực tiếp tối đa trước khi chuyển egress
 const RESOLVE_CACHE_TTL_MS = 25 * 60 * 1000;
 const DYNAMIC_TTL_MS = 10 * 60 * 1000;
 
@@ -479,7 +479,7 @@ function isResolverFallback(url) {
  * sống, chỉ timeout/lỗi mạng mới coi là chết → giữ host gốc. Sức khoẻ host
  * cache 60s để không probe lại cho từng file. Đặt `to: ""` để tắt.
  */
-const NODE_FALLBACK = { from: "svvv.gboiz7.workers.dev", to: "sv.p4kzz.workers.dev" };
+const NODE_FALLBACK = { from: "svvv.gboiz7.workers.dev", to: "" };
 const HOST_HEALTH_TTL_MS = 60 * 1000;
 const hostHealth = new Map();   // hostname -> {ok, at}
 
@@ -703,7 +703,8 @@ function extractMint(text, attemptedHost) {
       if (c && typeof c.url === "string" && /^https?:\/\//.test(c.url)
           && cn !== rn
           && !isResolverFallback(c.url)
-          && !/dmm_vo_cc/.test(c.url)) return c;
+          && !/dmm_vo_cc/.test(c.url)
+          && !/p4kzz\.workers\.dev/i.test(cn)) return c;
     }
     return null;
   };
@@ -750,7 +751,7 @@ async function resolveCdnUrl(fileUrl, cfg, opts = {}) {
 
     const nodeUrl = await applyNodeFallback(got.url);
     // Kiểm tra nhanh node có nguồn video phát được không (tránh 404 source unavailable của Phim4K)
-    const isLive = await isStreamPlayable(nodeUrl, 2500);
+    const isLive = await isStreamPlayable(nodeUrl, 4500);
     if (!isLive) {
       lastErr = new HttpError(404, "source unavailable");
       continue;

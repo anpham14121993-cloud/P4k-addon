@@ -1,4 +1,5 @@
 {
   "name": "p4k-relay",
+  "regions": ["sin1"],
   "functions": { "api/relay.js": { "maxDuration": 30 } }
 }

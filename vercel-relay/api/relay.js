@@ -25,7 +25,10 @@ export default async function handler(req, res) {
     return;
   }
 
-  const fwdHeaders = { Accept: "application/json", "User-Agent": "Mozilla/5.0 (VercelRelay)" };
+  const fwdHeaders = {
+    Accept: "application/json",
+    "User-Agent": req.headers["x-user-agent"] || req.headers["user-agent"] || "okhttp/4.9.0"
+  };
   if (req.headers["api-key"]) fwdHeaders["API-KEY"] = req.headers["api-key"];
   if (req.headers["authorization"]) fwdHeaders["Authorization"] = req.headers["authorization"];
 
