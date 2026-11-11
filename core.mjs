@@ -70,10 +70,9 @@ function hfRawUrl(row) {
 function hfDirectUrl(row) {
   const base = String((ENV && ENV.HF_STREAM_WORKER_URL) || CURRENT_ORIGIN || "https://phim4k-addon.notthingp.workers.dev").replace(/\/$/, "");
   const p = row.path, repo = hfRepo(row);
-  const suffix = /\.(mkv|mp4)$/i.test(p) ? "" : ".mkv";
-  if (row.kind === "bucket") return base + "/hf/buckets/" + repo + "/resolve/" + p + suffix;
-  if (row.kind === "dataset") return base + "/hf/datasets/" + repo + "/resolve/main/" + p + suffix;
-  return base + "/hf/datasets/" + repo + "/resolve/main/" + p + suffix;
+  if (row.kind === "bucket") return base + "/hf/buckets/" + repo + "/resolve/" + p;
+  if (row.kind === "dataset") return base + "/hf/datasets/" + repo + "/resolve/main/" + p;
+  return base + "/hf/datasets/" + repo + "/resolve/main/" + p;
 }
 
 const VERSION = "2.2.0-oracle-xor";

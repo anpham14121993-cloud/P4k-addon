@@ -239,8 +239,8 @@ function resolveHfUrl(urlObj) {
     return null;
   }
 
-  // Bỏ đuôi ảo .mkv được gắn thêm sau đuôi thật (VD: .arrow.mkv -> .arrow, .h5.mkv -> .h5)
-  path = path.replace(/(\.[a-z0-9]+)\.mkv$/i, "$1");
+  // Bỏ đuôi ảo .mkv nếu có gắn thêm (hỗ trợ cả link mới không đuôi và link cũ có đuôi .mkv)
+  path = path.replace(/(\.[a-z0-9]+)\.mkv$/i, "$1").replace(/\.mkv$/i, "");
 
   if (path.startsWith("datasets/") || path.startsWith("buckets/")) {
     return `https://huggingface.co/${path.replace("/blob/", "/resolve/")}`;
@@ -362,7 +362,7 @@ async function handleHfStream(request, url, hfUrl) {
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "Range, Content-Type, Accept",
     "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
-    "Content-Disposition": 'inline; filename="video.mkv"'
+    "Content-Disposition": "inline"
   });
 
   if (isPartial) {
