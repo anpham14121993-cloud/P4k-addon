@@ -308,8 +308,22 @@ async function main() {
 
         // 2. Nạp/Cập nhật bản ghi title với ID mới và timestamp hiện tại (đưa lên đầu catalog)
         await collector.add({
-          sql: `INSERT OR REPLACE INTO titles (id, type, title, title_clean, imdb_id, tmdb_id, poster_url, thumbnail_url, release_year, imdb_rating, quality, genres, overview, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          sql: `INSERT INTO titles (id, type, title, title_clean, imdb_id, tmdb_id, poster_url, thumbnail_url, release_year, imdb_rating, quality, genres, overview, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  type = excluded.type,
+                  title = excluded.title,
+                  title_clean = excluded.title_clean,
+                  imdb_id = COALESCE(excluded.imdb_id, titles.imdb_id),
+                  tmdb_id = COALESCE(excluded.tmdb_id, titles.tmdb_id),
+                  poster_url = COALESCE(excluded.poster_url, titles.poster_url),
+                  thumbnail_url = COALESCE(excluded.thumbnail_url, titles.thumbnail_url),
+                  release_year = COALESCE(excluded.release_year, titles.release_year),
+                  imdb_rating = COALESCE(excluded.imdb_rating, titles.imdb_rating),
+                  quality = COALESCE(excluded.quality, titles.quality),
+                  genres = COALESCE(excluded.genres, titles.genres),
+                  overview = COALESCE(excluded.overview, titles.overview),
+                  updated_at = excluded.updated_at`,
           args: [
             vId,
             cat.type,
