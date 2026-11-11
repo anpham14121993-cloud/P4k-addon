@@ -50,6 +50,7 @@ const DEFAULT_TABLES = buildKeyTables(DEFAULT_KEY);
 
 // Cache lưu CDN URL trực tiếp & metadata theo từng file HF (TTL 15 phút)
 const metaCache = new Map();
+const inFlightMeta = new Map();
 
 /**
  * Giải mã XOR 32-bit trực tiếp trên chunk (In-place, 0 allocation, unrolled 16 từ 32-bit)
@@ -113,161 +114,175 @@ async function getFileMeta(hfUrl, autoKey = false, ctx = null) {
     return cached;
   }
 
-  // L2 Edge Cache: caches.default (chia sẻ giữa mọi isolate trên cùng PoP/colo)
-  const cacheKey = new Request("https://meta-cache.internal/" + encodeURIComponent(hfUrl));
-  if (typeof caches !== "undefined" && caches.default) {
-    try {
-      const edgeHit = await caches.default.match(cacheKey);
-      if (edgeHit) {
-        const edgeMeta = await edgeHit.json();
-        if (edgeMeta && edgeMeta.cdnUrl) {
-          metaCache.set(hfUrl, edgeMeta);
-          return edgeMeta;
-        }
-      }
-    } catch {}
+  // Khử trùng lặp khi nhiều chunk song song (ví dụ 4 kết nối đồng thời từ Nuvio) cùng gọi lúc cold start
+  if (inFlightMeta.has(hfUrl)) {
+    return inFlightMeta.get(hfUrl);
   }
 
-  let cdnUrl = hfUrl;
-  let totalH5Size = 0;
-
-  // Bước 1: Bắt 302 Redirect từ Hugging Face để lấy Location CDN và X-Linked-Size
-  const probeResp = await fetch(hfUrl, {
-    method: "GET",
-    headers: { Range: `bytes=${HEADER_SIZE}-${HEADER_SIZE + 15}` },
-    redirect: "manual"
-  });
-
-  if (probeResp.status >= 300 && probeResp.status < 400) {
-    const loc = probeResp.headers.get("Location");
-    if (loc) cdnUrl = new URL(loc, hfUrl).toString();
-    const linkedSize = probeResp.headers.get("X-Linked-Size");
-    if (linkedSize) totalH5Size = parseInt(linkedSize, 10);
-  } else if (probeResp.status === 206) {
-    const cr = probeResp.headers.get("Content-Range");
-    if (cr && cr.includes("/")) {
-      totalH5Size = parseInt(cr.split("/")[1], 10);
-    }
-  }
-
-  // Bước 2: Lấy mẫu 128 byte đầu từ CDN để phân loại chính xác Raw (không mã hóa) vs Disguised (mã hóa)
-  const sampleResp = await fetch(cdnUrl, { headers: { Range: "bytes=0-127" } });
-  if (!totalH5Size) {
-    const cr = sampleResp.headers.get("Content-Range");
-    if (cr && cr.includes("/")) {
-      totalH5Size = parseInt(cr.split("/")[1], 10);
-    }
-  }
-  const sBuf = new Uint8Array(await sampleResp.arrayBuffer());
-
-  // 1. Kiểm tra video gốc chưa mã hóa (offset 0)
-  const isRawMkv = sBuf.length >= 4 && sBuf[0] === 0x1a && sBuf[1] === 0x45 && sBuf[2] === 0xdf && sBuf[3] === 0xa3;
-  const isRawMp4 = sBuf.length >= 8 && (
-    (sBuf[4] === 0x66 && sBuf[5] === 0x74 && sBuf[6] === 0x79 && sBuf[7] === 0x70) || // ftyp
-    (sBuf[4] === 0x6d && sBuf[5] === 0x6f && sBuf[6] === 0x6f && sBuf[7] === 0x76)    // moov
-  );
-  const isRawAvi = sBuf.length >= 4 && sBuf[0] === 0x52 && sBuf[1] === 0x49 && sBuf[2] === 0x46 && sBuf[3] === 0x46; // RIFF
-  const isRawTs = sBuf.length >= 1 && sBuf[0] === 0x47; // MPEG-TS sync byte
-
-  // 2. Kiểm tra video ngụy trang (offset 64 có XOR key)
-  const isDisguisedMkv = sBuf.length >= 68 &&
-    (sBuf[64] ^ DEFAULT_KEY[0]) === 0x1a &&
-    (sBuf[65] ^ DEFAULT_KEY[1]) === 0x45 &&
-    (sBuf[66] ^ DEFAULT_KEY[2]) === 0xdf &&
-    (sBuf[67] ^ DEFAULT_KEY[3]) === 0xa3;
-
-  const isDisguisedMp4 = sBuf.length >= 72 &&
-    (sBuf[68] ^ DEFAULT_KEY[4]) === 0x66 &&
-    (sBuf[69] ^ DEFAULT_KEY[5]) === 0x74 &&
-    (sBuf[70] ^ DEFAULT_KEY[6]) === 0x79 &&
-    (sBuf[71] ^ DEFAULT_KEY[7]) === 0x70;
-
-  const cleanPath = hfUrl.split("?")[0].toLowerCase();
-  const isVideoExt = /\.(mkv|mp4|avi|ts|webm|mov|m4v|flv)$/i.test(cleanPath);
-
-  // File không mã hóa: offset 0 là video chuẩn HOẶC có đuôi video nhưng KHÔNG bị mã hóa ở offset 64
-  if (isRawMkv || isRawMp4 || isRawAvi || isRawTs || (!isDisguisedMkv && !isDisguisedMp4 && isVideoExt)) {
-    const rawMeta = {
-      isRaw: true,
-      headerSize: 0,
-      cdnUrl,
-      totalSize: totalH5Size,
-      mediaSize: totalH5Size,
-      tables: null,
-      contentType: (isRawMp4 || cleanPath.endsWith(".mp4")) ? "video/mp4" :
-                   (isRawAvi || cleanPath.endsWith(".avi")) ? "video/x-msvideo" :
-                   (isRawTs || cleanPath.endsWith(".ts")) ? "video/mp2t" : "video/x-matroska",
-      time: now
-    };
-    metaCache.set(hfUrl, rawMeta);
+  const resolvePromise = (async () => {
+    // L2 Edge Cache: caches.default (chia sẻ giữa mọi isolate trên cùng PoP/colo)
+    const cacheKey = new Request("https://meta-cache.internal/" + encodeURIComponent(hfUrl));
     if (typeof caches !== "undefined" && caches.default) {
       try {
-        const saveResp = new Response(JSON.stringify(rawMeta), {
+        const edgeHit = await caches.default.match(cacheKey);
+        if (edgeHit) {
+          const edgeMeta = await edgeHit.json();
+          if (edgeMeta && edgeMeta.cdnUrl) {
+            metaCache.set(hfUrl, edgeMeta);
+            return edgeMeta;
+          }
+        }
+      } catch {}
+    }
+
+    let cdnUrl = hfUrl;
+    let totalH5Size = 0;
+
+    // Bước 1: Bắt 302 Redirect từ Hugging Face để lấy Location CDN và X-Linked-Size
+    const probeResp = await fetch(hfUrl, {
+      method: "GET",
+      headers: { Range: `bytes=${HEADER_SIZE}-${HEADER_SIZE + 15}` },
+      redirect: "manual"
+    });
+
+    if (probeResp.status >= 300 && probeResp.status < 400) {
+      const loc = probeResp.headers.get("Location");
+      if (loc) cdnUrl = new URL(loc, hfUrl).toString();
+      const linkedSize = probeResp.headers.get("X-Linked-Size");
+      if (linkedSize) totalH5Size = parseInt(linkedSize, 10);
+    } else if (probeResp.status === 206) {
+      const cr = probeResp.headers.get("Content-Range");
+      if (cr && cr.includes("/")) {
+        totalH5Size = parseInt(cr.split("/")[1], 10);
+      }
+    }
+
+    // Bước 2: Lấy mẫu 128 byte đầu từ CDN để phân loại chính xác Raw (không mã hóa) vs Disguised (mã hóa)
+    const sampleResp = await fetch(cdnUrl, { headers: { Range: "bytes=0-127" } });
+    if (!totalH5Size) {
+      const cr = sampleResp.headers.get("Content-Range");
+      if (cr && cr.includes("/")) {
+        totalH5Size = parseInt(cr.split("/")[1], 10);
+      }
+    }
+    const sBuf = new Uint8Array(await sampleResp.arrayBuffer());
+
+    // 1. Kiểm tra video gốc chưa mã hóa (offset 0)
+    const isRawMkv = sBuf.length >= 4 && sBuf[0] === 0x1a && sBuf[1] === 0x45 && sBuf[2] === 0xdf && sBuf[3] === 0xa3;
+    const isRawMp4 = sBuf.length >= 8 && (
+      (sBuf[4] === 0x66 && sBuf[5] === 0x74 && sBuf[6] === 0x79 && sBuf[7] === 0x70) || // ftyp
+      (sBuf[4] === 0x6d && sBuf[5] === 0x6f && sBuf[6] === 0x6f && sBuf[7] === 0x76)    // moov
+    );
+    const isRawAvi = sBuf.length >= 4 && sBuf[0] === 0x52 && sBuf[1] === 0x49 && sBuf[2] === 0x46 && sBuf[3] === 0x46; // RIFF
+    const isRawTs = sBuf.length >= 1 && sBuf[0] === 0x47; // MPEG-TS sync byte
+
+    // 2. Kiểm tra video ngụy trang (offset 64 có XOR key)
+    const isDisguisedMkv = sBuf.length >= 68 &&
+      (sBuf[64] ^ DEFAULT_KEY[0]) === 0x1a &&
+      (sBuf[65] ^ DEFAULT_KEY[1]) === 0x45 &&
+      (sBuf[66] ^ DEFAULT_KEY[2]) === 0xdf &&
+      (sBuf[67] ^ DEFAULT_KEY[3]) === 0xa3;
+
+    const isDisguisedMp4 = sBuf.length >= 72 &&
+      (sBuf[68] ^ DEFAULT_KEY[4]) === 0x66 &&
+      (sBuf[69] ^ DEFAULT_KEY[5]) === 0x74 &&
+      (sBuf[70] ^ DEFAULT_KEY[6]) === 0x79 &&
+      (sBuf[71] ^ DEFAULT_KEY[7]) === 0x70;
+
+    const cleanPath = hfUrl.split("?")[0].toLowerCase();
+    const isVideoExt = /\.(mkv|mp4|avi|ts|webm|mov|m4v|flv)$/i.test(cleanPath);
+
+    // File không mã hóa: offset 0 là video chuẩn HOẶC có đuôi video nhưng KHÔNG bị mã hóa ở offset 64
+    if (isRawMkv || isRawMp4 || isRawAvi || isRawTs || (!isDisguisedMkv && !isDisguisedMp4 && isVideoExt)) {
+      const rawMeta = {
+        isRaw: true,
+        headerSize: 0,
+        cdnUrl,
+        totalSize: totalH5Size,
+        mediaSize: totalH5Size,
+        tables: null,
+        contentType: (isRawMp4 || cleanPath.endsWith(".mp4")) ? "video/mp4" :
+                     (isRawAvi || cleanPath.endsWith(".avi")) ? "video/x-msvideo" :
+                     (isRawTs || cleanPath.endsWith(".ts")) ? "video/mp2t" : "video/x-matroska",
+        time: now
+      };
+      metaCache.set(hfUrl, rawMeta);
+      if (typeof caches !== "undefined" && caches.default) {
+        try {
+          const saveResp = new Response(JSON.stringify(rawMeta), {
+            headers: { "Cache-Control": "max-age=2400" }
+          });
+          if (ctx && ctx.waitUntil) ctx.waitUntil(caches.default.put(cacheKey, saveResp));
+          else caches.default.put(cacheKey, saveResp).catch(() => {});
+        } catch {}
+      }
+      return rawMeta;
+    }
+
+    // 2. File ngụy trang (có header 64 byte + XOR 256-byte)
+    let tables = DEFAULT_TABLES;
+    if (autoKey) {
+      const keySampleResp = await fetch(cdnUrl, {
+        headers: { Range: `bytes=${HEADER_SIZE}-${HEADER_SIZE + 65535}` }
+      });
+      const kBuf = new Uint8Array(await keySampleResp.arrayBuffer());
+      const isDefaultValid =
+        kBuf.length >= 4 &&
+        (kBuf[0] ^ DEFAULT_KEY[0]) === 0x1a &&
+        (kBuf[1] ^ DEFAULT_KEY[1]) === 0x45 &&
+        (kBuf[2] ^ DEFAULT_KEY[2]) === 0xdf &&
+        (kBuf[3] ^ DEFAULT_KEY[3]) === 0xa3;
+
+      if (!isDefaultValid && kBuf.length >= 256) {
+        const recovered = new Uint8Array(256);
+        const counts = new Int32Array(256);
+        for (let col = 0; col < 256; col++) {
+          counts.fill(0);
+          let maxC = -1;
+          let bestB = 0;
+          for (let i = col; i < kBuf.length; i += 256) {
+            const b = kBuf[i];
+            const c = ++counts[b];
+            if (c > maxC) {
+              maxC = c;
+              bestB = b;
+            }
+          }
+          recovered[col] = bestB;
+        }
+        tables = buildKeyTables(recovered);
+      }
+    }
+
+    const meta = {
+      isRaw: false,
+      headerSize: HEADER_SIZE,
+      cdnUrl,
+      totalSize: totalH5Size,
+      mediaSize: Math.max(0, totalH5Size - HEADER_SIZE),
+      tables,
+      contentType: isDisguisedMp4 ? "video/mp4" : "video/x-matroska",
+      time: now
+    };
+    metaCache.set(hfUrl, meta);
+    if (typeof caches !== "undefined" && caches.default) {
+      try {
+        const saveResp = new Response(JSON.stringify({ ...meta, tables: null }), {
           headers: { "Cache-Control": "max-age=2400" }
         });
         if (ctx && ctx.waitUntil) ctx.waitUntil(caches.default.put(cacheKey, saveResp));
         else caches.default.put(cacheKey, saveResp).catch(() => {});
       } catch {}
     }
-    return rawMeta;
-  }
+    return meta;
+  })();
 
-  // 2. File ngụy trang (có header 64 byte + XOR 256-byte)
-  let tables = DEFAULT_TABLES;
-  if (autoKey) {
-    const keySampleResp = await fetch(cdnUrl, {
-      headers: { Range: `bytes=${HEADER_SIZE}-${HEADER_SIZE + 65535}` }
-    });
-    const kBuf = new Uint8Array(await keySampleResp.arrayBuffer());
-    const isDefaultValid =
-      kBuf.length >= 4 &&
-      (kBuf[0] ^ DEFAULT_KEY[0]) === 0x1a &&
-      (kBuf[1] ^ DEFAULT_KEY[1]) === 0x45 &&
-      (kBuf[2] ^ DEFAULT_KEY[2]) === 0xdf &&
-      (kBuf[3] ^ DEFAULT_KEY[3]) === 0xa3;
-
-    if (!isDefaultValid && kBuf.length >= 256) {
-      const recovered = new Uint8Array(256);
-      const counts = new Int32Array(256);
-      for (let col = 0; col < 256; col++) {
-        counts.fill(0);
-        let maxC = -1;
-        let bestB = 0;
-        for (let i = col; i < kBuf.length; i += 256) {
-          const b = kBuf[i];
-          const c = ++counts[b];
-          if (c > maxC) {
-            maxC = c;
-            bestB = b;
-          }
-        }
-        recovered[col] = bestB;
-      }
-      tables = buildKeyTables(recovered);
-    }
+  inFlightMeta.set(hfUrl, resolvePromise);
+  try {
+    return await resolvePromise;
+  } finally {
+    inFlightMeta.delete(hfUrl);
   }
-
-  const meta = {
-    isRaw: false,
-    headerSize: HEADER_SIZE,
-    cdnUrl,
-    totalSize: totalH5Size,
-    mediaSize: Math.max(0, totalH5Size - HEADER_SIZE),
-    tables,
-    contentType: isDisguisedMp4 ? "video/mp4" : "video/x-matroska",
-    time: now
-  };
-  metaCache.set(hfUrl, meta);
-  if (typeof caches !== "undefined" && caches.default) {
-    try {
-      const saveResp = new Response(JSON.stringify({ ...meta, tables: null }), {
-        headers: { "Cache-Control": "max-age=2400" }
-      });
-      if (ctx && ctx.waitUntil) ctx.waitUntil(caches.default.put(cacheKey, saveResp));
-      else caches.default.put(cacheKey, saveResp).catch(() => {});
-    } catch {}
-  }
-  return meta;
 }
 
 /**
