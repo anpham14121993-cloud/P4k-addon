@@ -50,6 +50,7 @@ const PAGES = Math.max(1, parseInt(getArg("pages", "2"), 10) || 2);
 const DELAY_MS = Math.max(100, parseInt(getArg("delay", "250"), 10) || 250);
 const BATCH_SIZE = Math.max(10, parseInt(getArg("batch-size", "50"), 10) || 50);
 const DRY_RUN = hasFlag("dry-run");
+const FORCE = hasFlag("force");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const startTime = Date.now();
@@ -249,6 +250,7 @@ async function main() {
   const collector = new BatchCollector(client, BATCH_SIZE);
 
   let totalTitlesSynced = 0;
+  let totalTitlesSkipped = 0;
   let totalDuplicatesCleaned = 0;
   let totalStreamsInserted = 0;
 
@@ -289,6 +291,7 @@ async function main() {
         const genres = Array.isArray(d.genre) ? JSON.stringify(d.genre.map((g) => g.name).filter(Boolean)) : null;
 
         // 1. SMART DEDUP: Tìm kiếm bản ghi cũ trùng Tên + Năm trong DB (khác vId)
+        let hadMerge = false;
         if (cleanTitle) {
           const dupRes = await client.exec(
             "SELECT id, title FROM titles WHERE title_clean = ? AND release_year = ? AND id != ? LIMIT 5",
@@ -303,69 +306,123 @@ async function main() {
               await collector.add({ sql: "DELETE FROM titles WHERE id = ?", args: [oldId] });
               totalDuplicatesCleaned++;
             }
+            hadMerge = true;
           }
         }
 
-        // 2. Nạp/Cập nhật bản ghi title với ID mới và timestamp hiện tại (đưa lên đầu catalog)
-        await collector.add({
-          sql: `INSERT INTO titles (id, type, title, title_clean, imdb_id, tmdb_id, poster_url, thumbnail_url, release_year, imdb_rating, quality, genres, overview, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                  type = excluded.type,
-                  title = excluded.title,
-                  title_clean = excluded.title_clean,
-                  imdb_id = COALESCE(excluded.imdb_id, titles.imdb_id),
-                  tmdb_id = COALESCE(excluded.tmdb_id, titles.tmdb_id),
-                  poster_url = COALESCE(excluded.poster_url, titles.poster_url),
-                  thumbnail_url = COALESCE(excluded.thumbnail_url, titles.thumbnail_url),
-                  release_year = COALESCE(excluded.release_year, titles.release_year),
-                  imdb_rating = COALESCE(excluded.imdb_rating, titles.imdb_rating),
-                  quality = COALESCE(excluded.quality, titles.quality),
-                  genres = COALESCE(excluded.genres, titles.genres),
-                  overview = COALESCE(excluded.overview, titles.overview),
-                  updated_at = excluded.updated_at`,
-          args: [
-            vId,
-            cat.type,
-            cleanText(d.title),
-            cleanTitle,
-            imdbId,
-            tmdbId,
-            cleanText(d.poster_url || item.poster_url),
-            cleanText(d.thumbnail_url || item.thumbnail_url),
-            year,
-            rating,
-            cleanText(d.video_quality || item.video_quality),
-            genres,
-            cleanText(d.description || item.description),
-            Date.now(),
-          ],
-        });
-        totalTitlesSynced++;
+        // Kiểm tra xem title này đã tồn tại trong DB chưa
+        const existRes = await client.exec(
+          "SELECT id, quality, poster_url, updated_at FROM titles WHERE id = ?",
+          [vId]
+        );
+        const existingTitle = existRes.rows && existRes.rows.length > 0 ? existRes.rows[0] : null;
 
-        // 3. Nạp danh sách stream cho phim
-        if (cat.type === "movie" && Array.isArray(d.videos)) {
-          // Xoá stream cũ của vId để làm mới
-          await collector.add({ sql: "DELETE FROM episodes_streams WHERE title_id = ?", args: [vId] });
-          for (const v of d.videos) {
+        // Xử lý theo loại: Phim lẻ hoặc Phim bộ
+        if (cat.type === "movie") {
+          const apiVideos = Array.isArray(d.videos) ? d.videos : [];
+
+          // Lấy danh sách stream hiện tại trong DB
+          const streamRes = await client.exec(
+            "SELECT file_id FROM episodes_streams WHERE title_id = ?",
+            [vId]
+          );
+          const existingStreams = streamRes.rows || [];
+          const existingFids = new Set(existingStreams.map((r) => r.file_id));
+
+          const newVideos = apiVideos.filter((v) => {
             const fid = fileNameFrom(v.file_url);
-            if (!fid) continue;
-            await collector.add({
-              sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              args: [
-                vId, 1, 1, fid,
-                cleanText(v.label),
-                cleanText(v.file_type),
-                cleanText(d.video_quality),
-                Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
-                Date.now(),
-              ],
-            });
-            totalStreamsInserted++;
+            return fid && !existingFids.has(fid);
+          });
+
+          // SMART SKIP: Nếu phim đã có trong DB, có stream, không có stream mới, và không có merge trùng lặp
+          if (!FORCE && existingTitle && existingStreams.length > 0 && newVideos.length === 0 && !hadMerge) {
+            console.log(`  [Phim lẻ] [${vId}] ${d.title}: Đã có sẵn (${existingStreams.length} stream, không đổi, bỏ qua).`);
+            totalTitlesSkipped++;
+            continue;
           }
-          console.log(`  [Phim lẻ] [${vId}] ${d.title}: +${d.videos.length} stream mới.`);
-        } else if (cat.type === "series" && Array.isArray(d.season)) {
+
+          // Cập nhật/Thêm mới Title
+          await collector.add({
+            sql: `INSERT INTO titles (id, type, title, title_clean, imdb_id, tmdb_id, poster_url, thumbnail_url, release_year, imdb_rating, quality, genres, overview, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  ON CONFLICT(id) DO UPDATE SET
+                    type = excluded.type,
+                    title = excluded.title,
+                    title_clean = excluded.title_clean,
+                    imdb_id = COALESCE(excluded.imdb_id, titles.imdb_id),
+                    tmdb_id = COALESCE(excluded.tmdb_id, titles.tmdb_id),
+                    poster_url = COALESCE(excluded.poster_url, titles.poster_url),
+                    thumbnail_url = COALESCE(excluded.thumbnail_url, titles.thumbnail_url),
+                    release_year = COALESCE(excluded.release_year, titles.release_year),
+                    imdb_rating = COALESCE(excluded.imdb_rating, titles.imdb_rating),
+                    quality = COALESCE(excluded.quality, titles.quality),
+                    genres = COALESCE(excluded.genres, titles.genres),
+                    overview = COALESCE(excluded.overview, titles.overview),
+                    updated_at = excluded.updated_at`,
+            args: [
+              vId,
+              cat.type,
+              cleanText(d.title),
+              cleanTitle,
+              imdbId,
+              tmdbId,
+              cleanText(d.poster_url || item.poster_url),
+              cleanText(d.thumbnail_url || item.thumbnail_url),
+              year,
+              rating,
+              cleanText(d.video_quality || item.video_quality),
+              genres,
+              cleanText(d.description || item.description),
+              Date.now(),
+            ],
+          });
+          totalTitlesSynced++;
+
+          // Nạp stream
+          if (!existingTitle || hadMerge || FORCE) {
+            // Phim mới hoàn toàn hoặc vừa merge hoặc ép buộc: làm mới toàn bộ
+            await collector.add({ sql: "DELETE FROM episodes_streams WHERE title_id = ?", args: [vId] });
+            for (const v of apiVideos) {
+              const fid = fileNameFrom(v.file_url);
+              if (!fid) continue;
+              await collector.add({
+                sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                args: [
+                  vId, 1, 1, fid,
+                  cleanText(v.label),
+                  cleanText(v.file_type),
+                  cleanText(d.video_quality),
+                  Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
+                  Date.now(),
+                ],
+              });
+              totalStreamsInserted++;
+            }
+            console.log(`  [Phim lẻ] [${vId}] ${d.title}: +${apiVideos.length} stream mới.`);
+          } else if (newVideos.length > 0) {
+            // Phim cũ có thêm stream mới: chỉ chèn stream mới
+            for (const v of newVideos) {
+              const fid = fileNameFrom(v.file_url);
+              if (!fid) continue;
+              await collector.add({
+                sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                args: [
+                  vId, 1, 1, fid,
+                  cleanText(v.label),
+                  cleanText(v.file_type),
+                  cleanText(d.video_quality),
+                  Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
+                  Date.now(),
+                ],
+              });
+              totalStreamsInserted++;
+            }
+            console.log(`  [Phim lẻ] [${vId}] ${d.title}: +${newVideos.length} stream mới (đã có ${existingStreams.length} stream).`);
+          }
+
+        } else if (cat.type === "series") {
           // Lấy danh sách stream đã có của series để không nạp đè trùng lặp
           const epRes = await client.exec(
             "SELECT season, episode, file_id FROM episodes_streams WHERE title_id = ?",
@@ -375,46 +432,103 @@ async function main() {
             (epRes.rows || []).map((r) => `${r.season}:${r.episode}:${r.file_id}`)
           );
 
-          let newEpCount = 0;
-          for (const s of d.season) {
-            if (!s || !Array.isArray(s.episodes)) continue;
-            for (const ep of s.episodes) {
-              const fid = fileNameFrom(ep.file_url || ep.url);
-              if (!fid) continue;
+          const pendingEpisodes = [];
+          if (Array.isArray(d.season)) {
+            for (const s of d.season) {
+              if (!s || !Array.isArray(s.episodes)) continue;
+              for (const ep of s.episodes) {
+                const fid = fileNameFrom(ep.file_url || ep.url);
+                if (!fid) continue;
 
-              const info = episodeInfo(s, ep);
-              if (info.episode === null) continue;
+                const info = episodeInfo(s, ep);
+                if (info.episode === null) continue;
 
-              const from = info.episode;
-              const to = info.episodeEnd ? info.episodeEnd : from;
-              const span = Math.min(to, from + 60);
+                const from = info.episode;
+                const to = info.episodeEnd ? info.episodeEnd : from;
+                const span = Math.min(to, from + 60);
 
-              for (let epNum = from; epNum <= span; epNum++) {
-                const epKey = `${info.season}:${epNum}:${fid}`;
-                if (existingEpKeys.has(epKey)) continue;
+                for (let epNum = from; epNum <= span; epNum++) {
+                  const epKey = `${info.season}:${epNum}:${fid}`;
+                  if (existingEpKeys.has(epKey)) continue;
 
-                await collector.add({
-                  sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                  args: [
-                    vId,
-                    info.season,
-                    epNum,
+                  pendingEpisodes.push({
+                    season: info.season,
+                    episode: epNum,
                     fid,
-                    cleanText(ep.episodes_name || s.seasons_name),
-                    cleanText(ep.file_type),
-                    cleanText(d.video_quality),
-                    Array.isArray(ep.subtitle) && ep.subtitle.length ? JSON.stringify(ep.subtitle) : null,
-                    Date.now(),
-                  ],
-                });
-                existingEpKeys.add(epKey);
-                newEpCount++;
-                totalStreamsInserted++;
+                    label: cleanText(ep.episodes_name || s.seasons_name),
+                    file_type: cleanText(ep.file_type),
+                    subtitles: Array.isArray(ep.subtitle) && ep.subtitle.length ? JSON.stringify(ep.subtitle) : null,
+                  });
+                  existingEpKeys.add(epKey);
+                }
               }
             }
           }
-          console.log(`  [Phim bộ] [${vId}] ${d.title}: +${newEpCount} tập/stream mới.`);
+
+          // SMART SKIP: Nếu phim bộ đã có trong DB, không có tập mới, và không có merge trùng lặp
+          if (!FORCE && existingTitle && pendingEpisodes.length === 0 && !hadMerge) {
+            console.log(`  [Phim bộ] [${vId}] ${d.title}: Đã có sẵn (${epRes.rows ? epRes.rows.length : 0} tập/stream, không có tập mới, bỏ qua).`);
+            totalTitlesSkipped++;
+            continue;
+          }
+
+          // Cập nhật/Thêm mới Title
+          await collector.add({
+            sql: `INSERT INTO titles (id, type, title, title_clean, imdb_id, tmdb_id, poster_url, thumbnail_url, release_year, imdb_rating, quality, genres, overview, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  ON CONFLICT(id) DO UPDATE SET
+                    type = excluded.type,
+                    title = excluded.title,
+                    title_clean = excluded.title_clean,
+                    imdb_id = COALESCE(excluded.imdb_id, titles.imdb_id),
+                    tmdb_id = COALESCE(excluded.tmdb_id, titles.tmdb_id),
+                    poster_url = COALESCE(excluded.poster_url, titles.poster_url),
+                    thumbnail_url = COALESCE(excluded.thumbnail_url, titles.thumbnail_url),
+                    release_year = COALESCE(excluded.release_year, titles.release_year),
+                    imdb_rating = COALESCE(excluded.imdb_rating, titles.imdb_rating),
+                    quality = COALESCE(excluded.quality, titles.quality),
+                    genres = COALESCE(excluded.genres, titles.genres),
+                    overview = COALESCE(excluded.overview, titles.overview),
+                    updated_at = excluded.updated_at`,
+            args: [
+              vId,
+              cat.type,
+              cleanText(d.title),
+              cleanTitle,
+              imdbId,
+              tmdbId,
+              cleanText(d.poster_url || item.poster_url),
+              cleanText(d.thumbnail_url || item.thumbnail_url),
+              year,
+              rating,
+              cleanText(d.video_quality || item.video_quality),
+              genres,
+              cleanText(d.description || item.description),
+              Date.now(),
+            ],
+          });
+          totalTitlesSynced++;
+
+          // Nạp các tập mới
+          for (const pe of pendingEpisodes) {
+            await collector.add({
+              sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              args: [
+                vId,
+                pe.season,
+                pe.episode,
+                pe.fid,
+                pe.label,
+                pe.file_type,
+                cleanText(d.video_quality),
+                pe.subtitles,
+                Date.now(),
+              ],
+            });
+            totalStreamsInserted++;
+          }
+          console.log(`  [Phim bộ] [${vId}] ${d.title}: +${pendingEpisodes.length} tập/stream mới.`);
         }
       }
     }
@@ -433,7 +547,8 @@ async function main() {
   const elapsed = Math.round((Date.now() - startTime) / 1000);
   console.log("\n============================ TỔNG KẾT ĐỒNG BỘ ============================");
   console.log(`Thời gian thực thi: ${elapsed}s`);
-  console.log(`Phim đã đồng bộ: ${totalTitlesSynced}`);
+  console.log(`Phim đã đồng bộ mới/cập nhật: ${totalTitlesSynced}`);
+  console.log(`Phim đã bỏ qua (không đổi): ${totalTitlesSkipped}`);
   console.log(`Bản ghi cũ trùng lặp đã dọn (Smart Merge): ${totalDuplicatesCleaned}`);
   console.log(`Tổng luồng stream/tập đã nạp: ${totalStreamsInserted}`);
   console.log(`Tổng câu lệnh SQL thực thi: ${collector.totalFlushed}`);
