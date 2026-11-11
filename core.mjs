@@ -835,17 +835,17 @@ async function mapLimit(arr, limit, fn) {
 const FALLBACK_CONCURRENCY = 3;
 
 async function resolveMediaSet(items, cfg, opts = {}) {
-  // Ưu tiên CHÍNH lấy từ DB (link HuggingFace qua bộ giải mã XOR của Worker).
-  // File nào DB KHÔNG có (hoặc repo trên HF đã bị xoá 404) thì chuyển về resolver gốc làm luồng Dự Phòng.
+  // Lấy danh sách file từ DB (Hugging Face)
   const dbCandidates = []; // { item, vars }
-  const fbItems = [];      // item không có trong DB hoặc HF trả 404
+  const fbItems = [...items]; // Luôn đưa mọi file vào danh sách resolve CDN (Dự Phòng Railway) để đảm bảo phát và tua mượt 100%
+
   for (const it of items) {
     const id = fileNameFrom(it.fileUrl);
     const vars = id ? await dbVariants(id) : [];
-    if (!vars.length) { fbItems.push(it); continue; }
-    dbCandidates.push({ item: it, vars });
+    if (vars.length) {
+      dbCandidates.push({ item: it, vars });
+    }
   }
-  if (!dbCandidates.length && !fbItems.length) throw new HttpError(502, "empty file set");
 
   const dbUnits = [];   // { item, row, vi, total }
   if (dbCandidates.length) {
@@ -859,14 +859,27 @@ async function resolveMediaSet(items, cfg, opts = {}) {
     for (const res of candidateResults) {
       if (res.liveVars.length > 0) {
         res.liveVars.forEach((row, vi) => dbUnits.push({ item: res.item, row, vi, total: res.liveVars.length }));
-      } else {
-        fbItems.push(res.item);
       }
     }
   }
 
   const out = [];
-  // 1) Nguồn chính: DB → HuggingFace trực tiếp (giữ tên account-repo như cũ).
+
+  // 1) ƯU TIÊN HÀNG ĐẦU: Luồng CDN Dự Phòng (Railway) — chuẩn 100%, tua mượt mọi vị trí, 0 byte băng thông Worker/Oracle
+  if (fbItems.length) {
+    const settled = await mapLimit(fbItems, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
+    settled.forEach((r, idx) => {
+      if (!r || r.status !== "fulfilled" || !r.value) return;
+      const it = fbItems[idx];
+      let title = it.label;
+      try { if (typeof title === "string") title = title + "\n📁 Dự Phòng (Railway - Tua Mượt)"; } catch {}
+      const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
+      attachSubtitles(stream, it);
+      out.push(stream);
+    });
+  }
+
+  // 2) Luồng Hugging Face (từ DB qua Worker): giữ tên account-repo
   for (const u of dbUnits) {
     let title = u.item.label;
     try {
@@ -880,19 +893,7 @@ async function resolveMediaSet(items, cfg, opts = {}) {
     attachSubtitles(stream, u.item);
     out.push(stream);
   }
-  // 2) Dự phòng: DB không có → resolve gốc; ghi rõ "Dự Phòng".
-  if (fbItems.length) {
-    const settled = await mapLimit(fbItems, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
-    settled.forEach((r, idx) => {
-      if (!r || r.status !== "fulfilled" || !r.value) return;
-      const it = fbItems[idx];
-      let title = it.label;
-      try { if (typeof title === "string") title = title + "\n📁 Dự Phòng"; } catch {}
-      const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
-      attachSubtitles(stream, it);
-      out.push(stream);
-    });
-  }
+
   if (out.length) return out;
   throw new HttpError(404, "không có luồng (DB miss & resolve thất bại)");
 }

@@ -222,21 +222,35 @@ async function handleHfStream(request, url, hfUrl) {
   const rangeHeader = request.headers.get("Range");
   let start = 0;
   let end = null;
+  let isSuffix = false;
+  let suffixLength = 0;
 
   if (rangeHeader && rangeHeader.startsWith("bytes=")) {
-    const [s, e] = rangeHeader.replace("bytes=", "").split("-");
-    start = parseInt(s, 10) || 0;
-    if (e !== undefined && e !== "") {
-      const parsedEnd = parseInt(e, 10);
-      if (!Number.isNaN(parsedEnd)) end = parsedEnd;
+    const rawRange = rangeHeader.replace("bytes=", "").trim();
+    if (rawRange.startsWith("-")) {
+      isSuffix = true;
+      suffixLength = parseInt(rawRange.slice(1), 10) || 0;
+    } else {
+      const [s, e] = rawRange.split("-");
+      start = parseInt(s, 10) || 0;
+      if (e !== undefined && e !== "") {
+        const parsedEnd = parseInt(e, 10);
+        if (!Number.isNaN(parsedEnd)) end = parsedEnd;
+      }
     }
   }
 
-  const hfStart = start + headerOffset;
-  const hfEnd = end !== null ? end + headerOffset : "";
+  let hfRangeHeader = "";
+  if (isSuffix) {
+    hfRangeHeader = `bytes=-${suffixLength}`;
+  } else {
+    const hfStart = start + headerOffset;
+    const hfEnd = end !== null ? end + headerOffset : "";
+    hfRangeHeader = `bytes=${hfStart}-${hfEnd}`;
+  }
 
   const hfResp = await fetch(hfUrl, {
-    headers: { Range: `bytes=${hfStart}-${hfEnd}` },
+    headers: { Range: hfRangeHeader },
     redirect: "follow"
   });
 
@@ -249,13 +263,15 @@ async function handleHfStream(request, url, hfUrl) {
 
   const contentRange = hfResp.headers.get("Content-Range");
   let totalSize = mediaTotalSize;
+  let actualStart = start;
   let actualEnd = end !== null ? end : (totalSize > 0 ? totalSize - 1 : 0);
 
   if (contentRange && contentRange.includes("/")) {
     const [rangePart, totalPart] = contentRange.replace("bytes ", "").split("/");
-    const [, rEnd] = rangePart.split("-");
+    const [rStart, rEnd] = rangePart.split("-");
     totalSize = parseInt(totalPart, 10) - headerOffset;
-    actualEnd = parseInt(rEnd, 10) - headerOffset;
+    actualStart = Math.max(0, parseInt(rStart, 10) - headerOffset);
+    actualEnd = Math.max(0, parseInt(rEnd, 10) - headerOffset);
   }
 
   const respHeaders = new Headers({
@@ -266,8 +282,8 @@ async function handleHfStream(request, url, hfUrl) {
   });
 
   if (rangeHeader && contentRange) {
-    respHeaders.set("Content-Range", `bytes ${start}-${actualEnd}/${totalSize}`);
-    respHeaders.set("Content-Length", String(actualEnd - start + 1));
+    respHeaders.set("Content-Range", `bytes ${actualStart}-${actualEnd}/${totalSize}`);
+    respHeaders.set("Content-Length", String(actualEnd - actualStart + 1));
   } else if (totalSize > 0) {
     respHeaders.set("Content-Length", String(totalSize));
   }
@@ -282,7 +298,7 @@ async function handleHfStream(request, url, hfUrl) {
 
   // Trường hợp file mã hóa: Giải mã luồng (Streaming XOR Decryption) trên RAM bằng TransformStream
   const activeKey = fileInfo.key || DEFAULT_KEY;
-  let currentOffset = start;
+  let currentOffset = actualStart;
   const { readable, writable } = new TransformStream({
     transform(chunk, controller) {
       const out = new Uint8Array(chunk.length);
