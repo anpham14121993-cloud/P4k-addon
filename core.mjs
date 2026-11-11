@@ -865,21 +865,7 @@ async function resolveMediaSet(items, cfg, opts = {}) {
 
   const out = [];
 
-  // 1) ƯU TIÊN HÀNG ĐẦU: Luồng CDN Dự Phòng (Railway) — chuẩn 100%, tua mượt mọi vị trí, 0 byte băng thông Worker/Oracle
-  if (fbItems.length) {
-    const settled = await mapLimit(fbItems, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
-    settled.forEach((r, idx) => {
-      if (!r || r.status !== "fulfilled" || !r.value) return;
-      const it = fbItems[idx];
-      let title = it.label;
-      try { if (typeof title === "string") title = title + "\n📁 Dự Phòng (Railway - Tua Mượt)"; } catch {}
-      const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
-      attachSubtitles(stream, it);
-      out.push(stream);
-    });
-  }
-
-  // 2) Luồng Hugging Face (từ DB qua Worker): giữ tên account-repo
+  // 1) Luồng Hugging Face (từ DB qua Worker): Siêu tốc, giải mã XOR 32-bit & tua mượt trực tiếp từ CDN
   for (const u of dbUnits) {
     let title = u.item.label;
     try {
@@ -892,6 +878,20 @@ async function resolveMediaSet(items, cfg, opts = {}) {
     const stream = { name: "⚡ " + ADDON_NAME, url: hfDirectUrl(u.row), title: title || undefined };
     attachSubtitles(stream, u.item);
     out.push(stream);
+  }
+
+  // 2) Luồng CDN Dự Phòng (Railway) — chuẩn 100%, tua mượt mọi vị trí
+  if (fbItems.length) {
+    const settled = await mapLimit(fbItems, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
+    settled.forEach((r, idx) => {
+      if (!r || r.status !== "fulfilled" || !r.value) return;
+      const it = fbItems[idx];
+      let title = it.label;
+      try { if (typeof title === "string") title = title + "\n📁 Dự Phòng (Railway - Tua Mượt)"; } catch {}
+      const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
+      attachSubtitles(stream, it);
+      out.push(stream);
+    });
   }
 
   if (out.length) return out;

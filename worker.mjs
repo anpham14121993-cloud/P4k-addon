@@ -4,7 +4,7 @@ import { tursoDb } from "./turso-db.mjs";
 
 let ready = false;
 
-/* ═══════════════ BỘ GIẢI MÃ LUỒNG HUGGING FACE (STREAMING XOR 256-BYTE) ═══════════════ */
+/* ═══════════════ BỘ GIẢI MÃ LUỒNG HUGGING FACE (STREAMING XOR 256-BYTE SIÊU TỐC) ═══════════════ */
 
 const HEADER_SIZE = 64; // 64 bytes (0x40) header giả ở đầu mọi file mã hóa
 
@@ -28,117 +28,191 @@ const DEFAULT_KEY = new Uint8Array([
   0xad, 0x86, 0xe1, 0x40, 0x46, 0xdd, 0x25, 0xe9, 0x47, 0xe9, 0xca, 0x3c, 0x00, 0xe3, 0x16, 0xdb
 ]);
 
-// Cache lưu trạng thái mã hóa & khóa theo từng URL Hugging Face
-const hfFileCache = new Map();
-
-function cacheHfInfo(hfUrl, info) {
-  if (hfFileCache.size > 2000) {
-    const firstKey = hfFileCache.keys().next().value;
-    if (firstKey) hfFileCache.delete(firstKey);
-  }
-  hfFileCache.set(hfUrl, info);
-  return info;
-}
-
 /**
- * Tự động dò khóa XOR 256-byte từ 64 KB đầu của file (nếu file dùng khóa mới khác DEFAULT_KEY)
+ * Tạo sẵn bảng 256 góc xoay của khóa (dạng Uint8Array và Uint32Array) để XOR 32-bit siêu tốc
  */
-async function autoDetectKey(hfUrl) {
-  const resp = await fetch(hfUrl, {
-    headers: { Range: `bytes=${HEADER_SIZE}-${HEADER_SIZE + 65535}` },
-    redirect: "follow"
-  });
-  const buf = new Uint8Array(await resp.arrayBuffer());
-
-  if (
-    buf.length >= 4 &&
-    (buf[0] ^ DEFAULT_KEY[0]) === 0x1a &&
-    (buf[1] ^ DEFAULT_KEY[1]) === 0x45 &&
-    (buf[2] ^ DEFAULT_KEY[2]) === 0xdf &&
-    (buf[3] ^ DEFAULT_KEY[3]) === 0xa3
-  ) {
-    return DEFAULT_KEY;
-  }
-
-  const recovered = new Uint8Array(256);
-  const counts = new Int32Array(256);
-  for (let col = 0; col < 256; col++) {
-    counts.fill(0);
-    let maxCount = -1;
-    let bestByte = 0;
-    for (let i = col; i < buf.length; i += 256) {
-      const b = buf[i];
-      const c = ++counts[b];
-      if (c > maxCount) {
-        maxCount = c;
-        bestByte = b;
-      }
+function buildKeyTables(baseKey) {
+  const u8 = new Array(256);
+  const u32 = new Array(256);
+  for (let rot = 0; rot < 256; rot++) {
+    const buf = new ArrayBuffer(256);
+    const k8 = new Uint8Array(buf);
+    for (let i = 0; i < 256; i++) {
+      k8[i] = baseKey[(rot + i) & 255];
     }
-    recovered[col] = bestByte;
+    u8[rot] = k8;
+    u32[rot] = new Uint32Array(buf);
   }
-  return recovered;
+  return { u8, u32 };
+}
+
+const DEFAULT_TABLES = buildKeyTables(DEFAULT_KEY);
+
+// Cache lưu CDN URL trực tiếp & metadata theo từng file HF (TTL 15 phút)
+const metaCache = new Map();
+
+/**
+ * Giải mã XOR 32-bit trực tiếp trên chunk (In-place, 0 allocation, unrolled 16 từ 32-bit)
+ */
+function xorChunkFast(chunk, rotOffset, tables) {
+  const len = chunk.byteLength;
+  if (len === 0) return chunk;
+
+  const k8 = tables.u8[rotOffset];
+  const k32 = tables.u32[rotOffset];
+
+  let target = chunk;
+  if ((chunk.byteOffset & 3) !== 0) {
+    target = new Uint8Array(len);
+    target.set(chunk);
+  }
+
+  const n32 = len >>> 2;
+  if (n32 > 0) {
+    const u32 = new Uint32Array(target.buffer, target.byteOffset, n32);
+    let i = 0;
+    for (; i + 16 <= n32; i += 16) {
+      const o = i & 63;
+      u32[i] ^= k32[o];
+      u32[i + 1] ^= k32[o + 1];
+      u32[i + 2] ^= k32[o + 2];
+      u32[i + 3] ^= k32[o + 3];
+      u32[i + 4] ^= k32[o + 4];
+      u32[i + 5] ^= k32[o + 5];
+      u32[i + 6] ^= k32[o + 6];
+      u32[i + 7] ^= k32[o + 7];
+      u32[i + 8] ^= k32[o + 8];
+      u32[i + 9] ^= k32[o + 9];
+      u32[i + 10] ^= k32[o + 10];
+      u32[i + 11] ^= k32[o + 11];
+      u32[i + 12] ^= k32[o + 12];
+      u32[i + 13] ^= k32[o + 13];
+      u32[i + 14] ^= k32[o + 14];
+      u32[i + 15] ^= k32[o + 15];
+    }
+    for (; i < n32; i++) {
+      u32[i] ^= k32[i & 63];
+    }
+  }
+
+  for (let b = n32 << 2; b < len; b++) {
+    target[b] ^= k8[b & 255];
+  }
+
+  return target;
 }
 
 /**
- * Kiểm tra nhanh 128 byte đầu để phân biệt:
- *  - File đời cũ nguyên bản (Raw MKV / MP4 / AVI từ byte 0) -> phát trực tiếp không dịch +64, không XOR
- *  - File đời mới ngụy trang 64-byte header + XOR 256-byte -> cắt 64 byte và giải mã XOR
+ * Lấy link CDN trực tiếp (us.aws.cdn.hf.co) và tổng dung lượng file (X-Linked-Size)
+ * Phân biệt file Raw vs Disguised và lưu Cache 15 phút để tua không bị 302 Redirect delay
  */
-async function detectHfFile(hfUrl, forceAutoKey = false) {
-  if (!forceAutoKey && hfFileCache.has(hfUrl)) {
-    return hfFileCache.get(hfUrl);
+async function getFileMeta(hfUrl, autoKey = false) {
+  const now = Date.now();
+  const cached = metaCache.get(hfUrl);
+  if (cached && now - cached.time < 15 * 60 * 1000) {
+    return cached;
   }
+
+  let cdnUrl = hfUrl;
+  let totalH5Size = 0;
 
   const probeResp = await fetch(hfUrl, {
+    method: "GET",
     headers: { Range: "bytes=0-127" },
-    redirect: "follow"
+    redirect: "manual"
   });
 
-  if (!probeResp.ok && probeResp.status !== 206) {
-    return { errorStatus: probeResp.status };
-  }
-
-  let rawTotalSize = 0;
-  const cr = probeResp.headers.get("Content-Range");
-  if (cr && cr.includes("/")) {
-    rawTotalSize = parseInt(cr.split("/")[1], 10) || 0;
-  }
-
-  const buf = new Uint8Array(await probeResp.arrayBuffer());
-
-  // 1. Kiểm tra file video gốc chưa mã hóa (offset 0)
-  const isRawMkv = buf.length >= 4 && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3;
-  const isRawMp4 = buf.length >= 8 && buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70;
-  const isRawAvi = buf.length >= 4 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46;
-
-  if (isRawMkv || isRawMp4 || isRawAvi) {
-    const contentType = isRawMp4 ? "video/mp4" : isRawAvi ? "video/x-msvideo" : "video/x-matroska";
-    return cacheHfInfo(hfUrl, { isRaw: true, key: null, contentType, rawTotalSize });
-  }
-
-  // 2. Kiểm tra file mã hóa bằng DEFAULT_KEY tại offset 64 (0x40)
-  if (!forceAutoKey && buf.length >= HEADER_SIZE + 8) {
-    const d0 = buf[HEADER_SIZE] ^ DEFAULT_KEY[0];
-    const d1 = buf[HEADER_SIZE + 1] ^ DEFAULT_KEY[1];
-    const d2 = buf[HEADER_SIZE + 2] ^ DEFAULT_KEY[2];
-    const d3 = buf[HEADER_SIZE + 3] ^ DEFAULT_KEY[3];
-    const d4 = buf[HEADER_SIZE + 4] ^ DEFAULT_KEY[4];
-    const d5 = buf[HEADER_SIZE + 5] ^ DEFAULT_KEY[5];
-    const d6 = buf[HEADER_SIZE + 6] ^ DEFAULT_KEY[6];
-    const d7 = buf[HEADER_SIZE + 7] ^ DEFAULT_KEY[7];
-
-    const isEncMkv = d0 === 0x1a && d1 === 0x45 && d2 === 0xdf && d3 === 0xa3;
-    const isEncMp4 = d4 === 0x66 && d5 === 0x74 && d6 === 0x79 && d7 === 0x70;
-
-    if (isEncMkv || isEncMp4) {
-      const contentType = isEncMp4 ? "video/mp4" : "video/x-matroska";
-      return cacheHfInfo(hfUrl, { isRaw: false, key: DEFAULT_KEY, contentType, rawTotalSize });
+  if (probeResp.status >= 300 && probeResp.status < 400) {
+    const loc = probeResp.headers.get("Location");
+    if (loc) cdnUrl = new URL(loc, hfUrl).toString();
+    const linkedSize = probeResp.headers.get("X-Linked-Size");
+    if (linkedSize) totalH5Size = parseInt(linkedSize, 10);
+  } else if (probeResp.status === 206) {
+    const cr = probeResp.headers.get("Content-Range");
+    if (cr && cr.includes("/")) {
+      totalH5Size = parseInt(cr.split("/")[1], 10);
     }
   }
 
-  // 3. Nếu dùng khóa 256-byte mới hoặc truyền ?autokey=1 -> tự động khôi phục khóa
-  const recoveredKey = await autoDetectKey(hfUrl);
-  return cacheHfInfo(hfUrl, { isRaw: false, key: recoveredKey, contentType: "video/x-matroska", rawTotalSize });
+  // Probe 128 byte đầu từ CDN để kiểm tra Raw vs Disguised và kích thước (nếu thiếu)
+  const sampleResp = await fetch(cdnUrl, {
+    headers: { Range: "bytes=0-127" }
+  });
+  const sampleBuf = new Uint8Array(await sampleResp.arrayBuffer());
+  if (!totalH5Size) {
+    const cr = sampleResp.headers.get("Content-Range");
+    if (cr && cr.includes("/")) {
+      totalH5Size = parseInt(cr.split("/")[1], 10);
+    }
+  }
+
+  // 1. Kiểm tra video gốc chưa mã hóa (offset 0)
+  const isRawMkv = sampleBuf.length >= 4 && sampleBuf[0] === 0x1a && sampleBuf[1] === 0x45 && sampleBuf[2] === 0xdf && sampleBuf[3] === 0xa3;
+  const isRawMp4 = sampleBuf.length >= 8 && sampleBuf[4] === 0x66 && sampleBuf[5] === 0x74 && sampleBuf[6] === 0x79 && sampleBuf[7] === 0x70;
+  const isRawAvi = sampleBuf.length >= 4 && sampleBuf[0] === 0x52 && sampleBuf[1] === 0x49 && sampleBuf[2] === 0x46 && sampleBuf[3] === 0x46;
+
+  if (isRawMkv || isRawMp4 || isRawAvi) {
+    const meta = {
+      isRaw: true,
+      headerSize: 0,
+      cdnUrl,
+      totalSize: totalH5Size,
+      mediaSize: totalH5Size,
+      tables: null,
+      contentType: isRawMp4 ? "video/mp4" : isRawAvi ? "video/x-msvideo" : "video/x-matroska",
+      time: now
+    };
+    metaCache.set(hfUrl, meta);
+    return meta;
+  }
+
+  // 2. File ngụy trang (có header 64 byte + XOR 256-byte)
+  let tables = DEFAULT_TABLES;
+  if (autoKey) {
+    const keySampleResp = await fetch(cdnUrl, {
+      headers: { Range: `bytes=${HEADER_SIZE}-${HEADER_SIZE + 65535}` }
+    });
+    const kBuf = new Uint8Array(await keySampleResp.arrayBuffer());
+    const isDefaultValid =
+      kBuf.length >= 4 &&
+      (kBuf[0] ^ DEFAULT_KEY[0]) === 0x1a &&
+      (kBuf[1] ^ DEFAULT_KEY[1]) === 0x45 &&
+      (kBuf[2] ^ DEFAULT_KEY[2]) === 0xdf &&
+      (kBuf[3] ^ DEFAULT_KEY[3]) === 0xa3;
+
+    if (!isDefaultValid && kBuf.length >= 256) {
+      const recovered = new Uint8Array(256);
+      const counts = new Int32Array(256);
+      for (let col = 0; col < 256; col++) {
+        counts.fill(0);
+        let maxC = -1;
+        let bestB = 0;
+        for (let i = col; i < kBuf.length; i += 256) {
+          const b = kBuf[i];
+          const c = ++counts[b];
+          if (c > maxC) {
+            maxC = c;
+            bestB = b;
+          }
+        }
+        recovered[col] = bestB;
+      }
+      tables = buildKeyTables(recovered);
+    }
+  }
+
+  const meta = {
+    isRaw: false,
+    headerSize: HEADER_SIZE,
+    cdnUrl,
+    totalSize: totalH5Size,
+    mediaSize: Math.max(0, totalH5Size - HEADER_SIZE),
+    tables,
+    contentType: "video/x-matroska",
+    time: now
+  };
+  metaCache.set(hfUrl, meta);
+  return meta;
 }
 
 /**
@@ -187,133 +261,138 @@ async function handleHfStream(request, url, hfUrl) {
       headers: {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers": "Range, Content-Type"
+        "Access-Control-Allow-Headers": "Range, Content-Type",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges"
       }
     });
   }
 
-  const forceAutoKey = url.searchParams.get("autokey") === "1";
-  const fileInfo = await detectHfFile(hfUrl, forceAutoKey);
+  const autoKey = url.searchParams.get("autokey") === "1";
+  const meta = await getFileMeta(hfUrl, autoKey);
+  const mediaSize = meta.mediaSize;
 
-  if (fileInfo.errorStatus) {
-    return new Response(`Hugging Face upstream error: ${fileInfo.errorStatus}`, {
-      status: fileInfo.errorStatus,
-      headers: { "Access-Control-Allow-Origin": "*" }
-    });
-  }
-
-  const headerOffset = fileInfo.isRaw ? 0 : HEADER_SIZE;
-  const mediaTotalSize = fileInfo.rawTotalSize > headerOffset ? fileInfo.rawTotalSize - headerOffset : 0;
-
-  // Xử lý HEAD request
+  // 1. HEAD request
   if (request.method === "HEAD") {
-    const headers = new Headers({
-      "Content-Type": fileInfo.contentType,
-      "Accept-Ranges": "bytes",
-      "Access-Control-Allow-Origin": "*"
+    return new Response(null, {
+      status: 200,
+      headers: {
+        "Content-Type": meta.contentType,
+        "Content-Length": String(mediaSize),
+        "Accept-Ranges": "bytes",
+        "Access-Control-Allow-Origin": "*"
+      }
     });
-    if (mediaTotalSize > 0) {
-      headers.set("Content-Length", String(mediaTotalSize));
-    }
-    return new Response(null, { status: 200, headers });
   }
 
-  // Đọc Range header từ trình phát video
+  // 2. Hỗ trợ đầy đủ các dạng Range (START-END, START-, suffix -SUFFIX)
   const rangeHeader = request.headers.get("Range");
   let start = 0;
-  let end = null;
-  let isSuffix = false;
-  let suffixLength = 0;
+  let end = mediaSize - 1;
+  let isPartial = false;
 
   if (rangeHeader && rangeHeader.startsWith("bytes=")) {
-    const rawRange = rangeHeader.replace("bytes=", "").trim();
-    if (rawRange.startsWith("-")) {
-      isSuffix = true;
-      suffixLength = parseInt(rawRange.slice(1), 10) || 0;
-    } else {
-      const [s, e] = rawRange.split("-");
-      start = parseInt(s, 10) || 0;
-      if (e !== undefined && e !== "") {
-        const parsedEnd = parseInt(e, 10);
-        if (!Number.isNaN(parsedEnd)) end = parsedEnd;
+    isPartial = true;
+    const rangeSpec = rangeHeader.replace("bytes=", "").split(",")[0].trim();
+    const dashIdx = rangeSpec.indexOf("-");
+
+    if (dashIdx === 0) {
+      const suffixLen = parseInt(rangeSpec.slice(1), 10);
+      if (suffixLen > 0) {
+        start = Math.max(0, mediaSize - suffixLen);
+        end = mediaSize - 1;
+      }
+    } else if (dashIdx > 0) {
+      const sStr = rangeSpec.slice(0, dashIdx);
+      const eStr = rangeSpec.slice(dashIdx + 1);
+      start = parseInt(sStr, 10) || 0;
+      if (eStr.length > 0) {
+        end = Math.min(mediaSize - 1, parseInt(eStr, 10));
       }
     }
   }
 
-  let hfRangeHeader = "";
-  if (isSuffix) {
-    hfRangeHeader = `bytes=-${suffixLength}`;
-  } else {
-    const hfStart = start + headerOffset;
-    const hfEnd = end !== null ? end + headerOffset : "";
-    hfRangeHeader = `bytes=${hfStart}-${hfEnd}`;
-  }
-
-  const hfResp = await fetch(hfUrl, {
-    headers: { Range: hfRangeHeader },
-    redirect: "follow"
-  });
-
-  if (!hfResp.ok && hfResp.status !== 206) {
-    return new Response(`Hugging Face upstream error: ${hfResp.status}`, {
-      status: hfResp.status,
-      headers: { "Access-Control-Allow-Origin": "*" }
+  if (start >= mediaSize || start > end) {
+    return new Response(null, {
+      status: 416,
+      headers: {
+        "Content-Range": `bytes */${mediaSize}`,
+        "Access-Control-Allow-Origin": "*"
+      }
     });
   }
 
-  const contentRange = hfResp.headers.get("Content-Range");
-  let totalSize = mediaTotalSize;
-  let actualStart = start;
-  let actualEnd = end !== null ? end : (totalSize > 0 ? totalSize - 1 : 0);
+  // 3. Gọi trực tiếp CDN qua link và vị trí thực tế
+  const hfStart = start + meta.headerSize;
+  const hfEnd = end + meta.headerSize;
 
-  if (contentRange && contentRange.includes("/")) {
-    const [rangePart, totalPart] = contentRange.replace("bytes ", "").split("/");
-    const [rStart, rEnd] = rangePart.split("-");
-    totalSize = parseInt(totalPart, 10) - headerOffset;
-    actualStart = Math.max(0, parseInt(rStart, 10) - headerOffset);
-    actualEnd = Math.max(0, parseInt(rEnd, 10) - headerOffset);
+  let upstreamResp = await fetch(meta.cdnUrl, {
+    headers: { Range: `bytes=${hfStart}-${hfEnd}` }
+  });
+
+  if (upstreamResp.status === 401 || upstreamResp.status === 403) {
+    metaCache.delete(hfUrl);
+    const freshMeta = await getFileMeta(hfUrl, autoKey);
+    upstreamResp = await fetch(freshMeta.cdnUrl, {
+      headers: { Range: `bytes=${hfStart}-${hfEnd}` }
+    });
   }
 
+  if (!upstreamResp.ok && upstreamResp.status !== 206) {
+    return new Response(`Upstream CDN error: ${upstreamResp.status}`, {
+      status: upstreamResp.status
+    });
+  }
+
+  const contentLength = end - start + 1;
   const respHeaders = new Headers({
-    "Content-Type": fileInfo.contentType,
+    "Content-Type": meta.contentType,
     "Accept-Ranges": "bytes",
+    "Content-Length": String(contentLength),
     "Access-Control-Allow-Origin": "*",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
     "Content-Disposition": 'inline; filename="video.mkv"'
   });
 
-  if (rangeHeader && contentRange) {
-    respHeaders.set("Content-Range", `bytes ${actualStart}-${actualEnd}/${totalSize}`);
-    respHeaders.set("Content-Length", String(actualEnd - actualStart + 1));
-  } else if (totalSize > 0) {
-    respHeaders.set("Content-Length", String(totalSize));
+  if (isPartial) {
+    respHeaders.set("Content-Range", `bytes ${start}-${end}/${mediaSize}`);
   }
 
-  // Trường hợp file đời cũ nguyên bản (không mã hóa): truyền thẳng body không tốn CPU XOR
-  if (fileInfo.isRaw) {
-    return new Response(hfResp.body, {
-      status: rangeHeader ? 206 : 200,
+  // File raw nguyên bản -> truyền trực tiếp body
+  if (meta.isRaw) {
+    return new Response(upstreamResp.body, {
+      status: isPartial ? 206 : 200,
       headers: respHeaders
     });
   }
 
-  // Trường hợp file mã hóa: Giải mã luồng (Streaming XOR Decryption) trên RAM bằng TransformStream
-  const activeKey = fileInfo.key || DEFAULT_KEY;
-  let currentOffset = actualStart;
-  const { readable, writable } = new TransformStream({
-    transform(chunk, controller) {
-      const out = new Uint8Array(chunk.length);
-      for (let i = 0; i < chunk.length; i++) {
-        out[i] = chunk[i] ^ activeKey[(currentOffset + i) & 255];
+  // 4. File mã hóa: Dùng ReadableStream pull() + cancel() để giải mã theo tốc độ đọc thực tế
+  //    và hủy ngay lập tức kết nối cũ tới Hugging Face khi người dùng kéo thanh tua (Seek)
+  const reader = upstreamResp.body.getReader();
+  let rotOffset = ((start % 256) + 256) % 256;
+  const tables = meta.tables || DEFAULT_TABLES;
+
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        const dec = xorChunkFast(value, rotOffset, tables);
+        rotOffset = (rotOffset + value.byteLength) & 255;
+        controller.enqueue(dec);
+      } catch (err) {
+        controller.error(err);
       }
-      currentOffset += chunk.length;
-      controller.enqueue(out);
+    },
+    cancel(reason) {
+      return reader.cancel(reason).catch(() => {});
     }
   });
 
-  hfResp.body.pipeTo(writable).catch(() => {});
-
-  return new Response(readable, {
-    status: rangeHeader ? 206 : 200,
+  return new Response(stream, {
+    status: isPartial ? 206 : 200,
     headers: respHeaders
   });
 }
