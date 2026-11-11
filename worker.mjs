@@ -135,39 +135,57 @@ async function getFileMeta(hfUrl, autoKey = false) {
     }
   }
 
-  // Nếu chưa lấy được totalH5Size từ header 302, hỏi trực tiếp CDN 1 byte
+  // Bước 2: Lấy mẫu 128 byte đầu từ CDN để phân loại chính xác Raw (không mã hóa) vs Disguised (mã hóa)
+  const sampleResp = await fetch(cdnUrl, { headers: { Range: "bytes=0-127" } });
   if (!totalH5Size) {
-    const cdnProbe = await fetch(cdnUrl, {
-      headers: { Range: `bytes=${HEADER_SIZE}-${HEADER_SIZE}` }
-    });
-    const cr = cdnProbe.headers.get("Content-Range");
+    const cr = sampleResp.headers.get("Content-Range");
     if (cr && cr.includes("/")) {
       totalH5Size = parseInt(cr.split("/")[1], 10);
     }
-    if (cdnProbe.body) cdnProbe.body.cancel().catch(() => {});
   }
+  const sBuf = new Uint8Array(await sampleResp.arrayBuffer());
 
-  // Kiểm tra nếu là file video raw thông thường (.mp4/.mkv gốc không phải ngụy trang)
-  const isPureVideoExt = /\.(mkv|mp4|avi)$/i.test(hfUrl.split("?")[0].replace(/\.mkv$/i, ""));
-  if (isPureVideoExt) {
-    const sampleResp = await fetch(cdnUrl, { headers: { Range: "bytes=0-15" } });
-    const sBuf = new Uint8Array(await sampleResp.arrayBuffer());
-    const isRawMkv = sBuf.length >= 4 && sBuf[0] === 0x1a && sBuf[1] === 0x45 && sBuf[2] === 0xdf && sBuf[3] === 0xa3;
-    const isRawMp4 = sBuf.length >= 8 && sBuf[4] === 0x66 && sBuf[5] === 0x74 && sBuf[6] === 0x79 && sBuf[7] === 0x70;
-    if (isRawMkv || isRawMp4) {
-      const rawMeta = {
-        isRaw: true,
-        headerSize: 0,
-        cdnUrl,
-        totalSize: totalH5Size,
-        mediaSize: totalH5Size,
-        tables: null,
-        contentType: isRawMp4 ? "video/mp4" : "video/x-matroska",
-        time: now
-      };
-      metaCache.set(hfUrl, rawMeta);
-      return rawMeta;
-    }
+  // 1. Kiểm tra video gốc chưa mã hóa (offset 0)
+  const isRawMkv = sBuf.length >= 4 && sBuf[0] === 0x1a && sBuf[1] === 0x45 && sBuf[2] === 0xdf && sBuf[3] === 0xa3;
+  const isRawMp4 = sBuf.length >= 8 && (
+    (sBuf[4] === 0x66 && sBuf[5] === 0x74 && sBuf[6] === 0x79 && sBuf[7] === 0x70) || // ftyp
+    (sBuf[4] === 0x6d && sBuf[5] === 0x6f && sBuf[6] === 0x6f && sBuf[7] === 0x76)    // moov
+  );
+  const isRawAvi = sBuf.length >= 4 && sBuf[0] === 0x52 && sBuf[1] === 0x49 && sBuf[2] === 0x46 && sBuf[3] === 0x46; // RIFF
+  const isRawTs = sBuf.length >= 1 && sBuf[0] === 0x47; // MPEG-TS sync byte
+
+  // 2. Kiểm tra video ngụy trang (offset 64 có XOR key)
+  const isDisguisedMkv = sBuf.length >= 68 &&
+    (sBuf[64] ^ DEFAULT_KEY[0]) === 0x1a &&
+    (sBuf[65] ^ DEFAULT_KEY[1]) === 0x45 &&
+    (sBuf[66] ^ DEFAULT_KEY[2]) === 0xdf &&
+    (sBuf[67] ^ DEFAULT_KEY[3]) === 0xa3;
+
+  const isDisguisedMp4 = sBuf.length >= 72 &&
+    (sBuf[68] ^ DEFAULT_KEY[4]) === 0x66 &&
+    (sBuf[69] ^ DEFAULT_KEY[5]) === 0x74 &&
+    (sBuf[70] ^ DEFAULT_KEY[6]) === 0x79 &&
+    (sBuf[71] ^ DEFAULT_KEY[7]) === 0x70;
+
+  const cleanPath = hfUrl.split("?")[0].toLowerCase();
+  const isVideoExt = /\.(mkv|mp4|avi|ts|webm|mov|m4v|flv)$/i.test(cleanPath);
+
+  // File không mã hóa: offset 0 là video chuẩn HOẶC có đuôi video nhưng KHÔNG bị mã hóa ở offset 64
+  if (isRawMkv || isRawMp4 || isRawAvi || isRawTs || (!isDisguisedMkv && !isDisguisedMp4 && isVideoExt)) {
+    const rawMeta = {
+      isRaw: true,
+      headerSize: 0,
+      cdnUrl,
+      totalSize: totalH5Size,
+      mediaSize: totalH5Size,
+      tables: null,
+      contentType: (isRawMp4 || cleanPath.endsWith(".mp4")) ? "video/mp4" :
+                   (isRawAvi || cleanPath.endsWith(".avi")) ? "video/x-msvideo" :
+                   (isRawTs || cleanPath.endsWith(".ts")) ? "video/mp2t" : "video/x-matroska",
+      time: now
+    };
+    metaCache.set(hfUrl, rawMeta);
+    return rawMeta;
   }
 
   // 2. File ngụy trang (có header 64 byte + XOR 256-byte)
@@ -212,7 +230,7 @@ async function getFileMeta(hfUrl, autoKey = false) {
     totalSize: totalH5Size,
     mediaSize: Math.max(0, totalH5Size - HEADER_SIZE),
     tables,
-    contentType: "video/x-matroska",
+    contentType: isDisguisedMp4 ? "video/mp4" : "video/x-matroska",
     time: now
   };
   metaCache.set(hfUrl, meta);
