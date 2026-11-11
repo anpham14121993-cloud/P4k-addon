@@ -570,15 +570,20 @@ async function healthProbe(url) {
 }
 
 // Kiểm tra nhanh luồng video dự phòng có thực sự phát được (HTTP 200 hoặc 206) không.
-// Nếu node trả về 404 (source unavailable) hoặc lỗi mạng thì loại bỏ ngay để không trả luồng chết cho client.
-async function isStreamPlayable(url, timeoutMs = 2500) {
+// Chỉ loại bỏ khi node dứt khoát trả về 404/410 (file không có trên node).
+// Nếu mạng trễ hoặc timeout probe, vẫn giữ lại để client tự kết nối và buffer.
+async function isStreamPlayable(url, timeoutMs = 4500) {
   try {
     const res = await fetchWithTimeout(url, { headers: { Range: "bytes=0-0" } }, timeoutMs);
-    const ok = res.status === 200 || res.status === 206;
+    if (res.status === 404 || res.status === 410) {
+      discardResponse(res);
+      return false;
+    }
+    const ok = res.status === 200 || res.status === 206 || res.status < 400;
     discardResponse(res);
     return ok;
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -1830,10 +1835,11 @@ async function handleStream(type, id, cfg, ms, opts) {
   const parsed = parseId(id);
   if (!parsed || !parsed.cleanId) throw new HttpError(400, "bad stream id");
 
+  let vId = null;
+
   // 1. Ưu tiên đọc Streams từ Turso DB độc lập
   if (DB && typeof DB.getStreams === "function") {
     try {
-      let vId = null;
       if (parsed.internal) {
         vId = parsed.cleanId;
       } else if (parsed.baseId && parsed.baseId.startsWith("tt") && DB.getTitleByImdb) {
@@ -1896,7 +1902,7 @@ async function handleStream(type, id, cfg, ms, opts) {
 
   // Fallback: gọi upstream
   const realId = parsed.internal ? parsed.cleanId
-    : await resolveExternalToVideosId(parsed.baseId, metaType, cfg, ms);
+    : (vId || await resolveExternalToVideosId(parsed.baseId, metaType, cfg, ms));
   if (!realId) throw new HttpError(404, "cannot resolve external id to internal");
 
   if (metaType === "movie") {
@@ -1990,10 +1996,11 @@ async function diagMint(fileName, mirror, host, secret) {
     const txt = await res.text().catch(() => "");
     const minted = extractMint(txt, host);
     const node = minted ? safeHostname(minted.url) : null;
-    return { status: res.status, ms: Date.now() - t0, mint: !!minted, node };
+    return { status: res.status, ms: Date.now() - t0, mint: !!minted, node, raw: txt.slice(0, 150) };
   } catch (e) { return { status: "ERR", ms: Date.now() - t0, mint: false, err: String(e.message || e.name || e).slice(0, 80) }; }
 }
 async function diagAll(request) {
+  const reqUrl = new URL(request.url);
   const out = { colo: null, ip: null, config: null, direct: null, mirrors: [], mint: [] };
   const ray = request.headers.get("cf-ray") || "";
   out.colo = ray.slice(0, ray.indexOf("-")) || null;
@@ -2010,7 +2017,8 @@ async function diagAll(request) {
   } catch (e) { out.configError = String(e.message || e).slice(0, 60); }
   const probeTarget = "https://svpc.cryboiz.workers.dev/";
   out.mirrors = await Promise.all(EGRESS_MIRRORS.map(async (m) => ({ name: m.name, ...await diagProbe(m, probeTarget) })));
-  const fileName = "JE2TRZGY7TCW99A";
+  const fileName = reqUrl.searchParams.get("file") || "JE2TRZGY7TCW99A";
+  out.file = fileName;
   const host = "https://svpc.cryboiz.workers.dev";
   const secret = HMAC_SECRETS[host.replace(/^https?:\/\//, "")];
   try {
