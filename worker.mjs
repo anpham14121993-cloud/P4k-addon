@@ -106,11 +106,26 @@ function xorChunkFast(chunk, rotOffset, tables) {
  * Lấy link CDN trực tiếp (us.aws.cdn.hf.co) và tổng dung lượng file (X-Linked-Size)
  * Phân biệt file Raw vs Disguised và lưu Cache 15 phút để tua không bị 302 Redirect delay
  */
-async function getFileMeta(hfUrl, autoKey = false) {
+async function getFileMeta(hfUrl, autoKey = false, ctx = null) {
   const now = Date.now();
   const cached = metaCache.get(hfUrl);
   if (cached && now - cached.time < 15 * 60 * 1000) {
     return cached;
+  }
+
+  // L2 Edge Cache: caches.default (chia sẻ giữa mọi isolate trên cùng PoP/colo)
+  const cacheKey = new Request("https://meta-cache.internal/" + encodeURIComponent(hfUrl));
+  if (typeof caches !== "undefined" && caches.default) {
+    try {
+      const edgeHit = await caches.default.match(cacheKey);
+      if (edgeHit) {
+        const edgeMeta = await edgeHit.json();
+        if (edgeMeta && edgeMeta.cdnUrl) {
+          metaCache.set(hfUrl, edgeMeta);
+          return edgeMeta;
+        }
+      }
+    } catch {}
   }
 
   let cdnUrl = hfUrl;
@@ -185,6 +200,15 @@ async function getFileMeta(hfUrl, autoKey = false) {
       time: now
     };
     metaCache.set(hfUrl, rawMeta);
+    if (typeof caches !== "undefined" && caches.default) {
+      try {
+        const saveResp = new Response(JSON.stringify(rawMeta), {
+          headers: { "Cache-Control": "max-age=2400" }
+        });
+        if (ctx && ctx.waitUntil) ctx.waitUntil(caches.default.put(cacheKey, saveResp));
+        else caches.default.put(cacheKey, saveResp).catch(() => {});
+      } catch {}
+    }
     return rawMeta;
   }
 
@@ -234,6 +258,15 @@ async function getFileMeta(hfUrl, autoKey = false) {
     time: now
   };
   metaCache.set(hfUrl, meta);
+  if (typeof caches !== "undefined" && caches.default) {
+    try {
+      const saveResp = new Response(JSON.stringify({ ...meta, tables: null }), {
+        headers: { "Cache-Control": "max-age=2400" }
+      });
+      if (ctx && ctx.waitUntil) ctx.waitUntil(caches.default.put(cacheKey, saveResp));
+      else caches.default.put(cacheKey, saveResp).catch(() => {});
+    } catch {}
+  }
   return meta;
 }
 
@@ -276,7 +309,7 @@ function resolveHfUrl(urlObj) {
   return null;
 }
 
-async function handleHfStream(request, url, hfUrl) {
+async function handleHfStream(request, url, hfUrl, ctx) {
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -290,7 +323,7 @@ async function handleHfStream(request, url, hfUrl) {
   }
 
   const autoKey = url.searchParams.get("autokey") === "1";
-  const meta = await getFileMeta(hfUrl, autoKey);
+  const meta = await getFileMeta(hfUrl, autoKey, ctx);
   const mediaSize = meta.mediaSize;
 
   // 1. HEAD request
@@ -316,6 +349,8 @@ async function handleHfStream(request, url, hfUrl) {
   let end = mediaSize - 1;
   let isPartial = false;
 
+  const MAX_CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB chunk cap để tua mượt, giữ kết nối ổn định và giải phóng RAM/CPU
+
   if (rangeHeader && rangeHeader.startsWith("bytes=")) {
     isPartial = true;
     const rangeSpec = rangeHeader.replace("bytes=", "").split(",")[0].trim();
@@ -333,8 +368,19 @@ async function handleHfStream(request, url, hfUrl) {
       start = parseInt(sStr, 10) || 0;
       if (eStr.length > 0) {
         end = Math.min(mediaSize - 1, parseInt(eStr, 10));
+      } else {
+        end = Math.min(mediaSize - 1, start + MAX_CHUNK_SIZE - 1);
       }
     }
+  } else {
+    isPartial = true;
+    start = 0;
+    end = Math.min(mediaSize - 1, MAX_CHUNK_SIZE - 1);
+  }
+
+  // Cắt giới hạn chunk tối đa 16MB nếu client yêu cầu khoảng quá dài (tránh timeout worker khi player pause)
+  if (isPartial && (end - start + 1 > MAX_CHUNK_SIZE)) {
+    end = start + MAX_CHUNK_SIZE - 1;
   }
 
   if (start >= mediaSize || start > end) {
@@ -357,7 +403,11 @@ async function handleHfStream(request, url, hfUrl) {
 
   if (upstreamResp.status === 401 || upstreamResp.status === 403) {
     metaCache.delete(hfUrl);
-    const freshMeta = await getFileMeta(hfUrl, autoKey);
+    if (typeof caches !== "undefined" && caches.default) {
+      const cacheKey = new Request("https://meta-cache.internal/" + encodeURIComponent(hfUrl));
+      try { await caches.default.delete(cacheKey); } catch {}
+    }
+    const freshMeta = await getFileMeta(hfUrl, autoKey, ctx);
     upstreamResp = await fetch(freshMeta.cdnUrl, {
       headers: { Range: `bytes=${hfStart}-${hfEnd}` }
     });
@@ -387,41 +437,48 @@ async function handleHfStream(request, url, hfUrl) {
     respHeaders.set("Content-Range", `bytes ${start}-${end}/${mediaSize}`);
   }
 
-  // File raw nguyên bản -> truyền trực tiếp body
+  let bodyStream = upstreamResp.body;
+
+  // File raw nguyên bản -> truyền trực tiếp body (kèm FixedLengthStream nếu có để đảm bảo Content-Length)
   if (meta.isRaw) {
-    return new Response(upstreamResp.body, {
+    if (typeof FixedLengthStream !== "undefined") {
+      try {
+        const fls = new FixedLengthStream(contentLength);
+        bodyStream = bodyStream.pipeThrough(fls);
+      } catch {}
+    }
+    return new Response(bodyStream, {
       status: isPartial ? 206 : 200,
       headers: respHeaders
     });
   }
 
-  // 4. File mã hóa: Dùng ReadableStream pull() + cancel() chuẩn từ worker.txt
-  //    Giải mã theo tốc độ đọc của trình phát và ngắt ngay luồng tải cũ khi người xem kéo thanh tua (Seek)
-  const reader = upstreamResp.body.getReader();
+  // 4. File mã hóa: Dùng TransformStream + FixedLengthStream
   let rotOffset = ((start % 256) + 256) % 256;
   const tables = meta.tables || DEFAULT_TABLES;
 
-  const stream = new ReadableStream({
-    async pull(controller) {
+  const ts = new TransformStream({
+    transform(chunk, controller) {
       try {
-        const { done, value } = await reader.read();
-        if (done) {
-          controller.close();
-          return;
-        }
-        const dec = xorChunkFast(value, rotOffset, tables);
-        rotOffset = (rotOffset + value.byteLength) & 255;
+        const dec = xorChunkFast(chunk, rotOffset, tables);
+        rotOffset = (rotOffset + chunk.byteLength) & 255;
         controller.enqueue(dec);
       } catch (err) {
         controller.error(err);
       }
-    },
-    cancel(reason) {
-      return reader.cancel(reason).catch(() => {});
     }
   });
 
-  return new Response(stream, {
+  bodyStream = bodyStream.pipeThrough(ts);
+
+  if (typeof FixedLengthStream !== "undefined") {
+    try {
+      const fls = new FixedLengthStream(contentLength);
+      bodyStream = bodyStream.pipeThrough(fls);
+    } catch {}
+  }
+
+  return new Response(bodyStream, {
     status: isPartial ? 206 : 200,
     headers: respHeaders
   });
@@ -475,7 +532,7 @@ export default {
     // 2. Giải mã & Stream trực tiếp file video từ Hugging Face (/hf/... hoặc /<user>/<repo>/<file> hoặc /?url=...)
     const hfUrl = resolveHfUrl(url);
     if (hfUrl) {
-      return handleHfStream(request, url, hfUrl);
+      return handleHfStream(request, url, hfUrl, ctx);
     }
 
     // 3. Stremio Addon Router
