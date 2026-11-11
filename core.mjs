@@ -59,15 +59,24 @@ function fmtBytes(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
   return Math.max(1, Math.round(n / 1e3)) + " KB";
 }
+let CURRENT_ORIGIN = "https://phim4k-addon.notthingp.workers.dev";
 function hfRepo(row) { return String(row.repo_id || "").replace(/^BUCKET:/, ""); }   // bucket.mjs lưu kèm tiền tố
-function hfDirectUrl(row) {
+function hfRawUrl(row) {
   const p = row.path, repo = hfRepo(row);
   if (row.kind === "bucket") return HF_ENDPOINT + "/buckets/" + repo + "/resolve/" + p;
   if (row.kind === "dataset") return HF_ENDPOINT + "/datasets/" + repo + "/resolve/main/" + p;
   return HF_ENDPOINT + "/" + repo + "/resolve/main/" + p;
 }
+function hfDirectUrl(row) {
+  const base = String((ENV && ENV.HF_STREAM_WORKER_URL) || CURRENT_ORIGIN || "https://phim4k-addon.notthingp.workers.dev").replace(/\/$/, "");
+  const p = row.path, repo = hfRepo(row);
+  const suffix = /\.(mkv|mp4)$/i.test(p) ? "" : ".mkv";
+  if (row.kind === "bucket") return base + "/hf/buckets/" + repo + "/resolve/" + p + suffix;
+  if (row.kind === "dataset") return base + "/hf/datasets/" + repo + "/resolve/main/" + p + suffix;
+  return base + "/hf/datasets/" + repo + "/resolve/main/" + p + suffix;
+}
 
-const VERSION = "2.1.5-oracle";
+const VERSION = "2.2.0-oracle-xor";
 
 /* ═══════════════════════ 1. CẤU HÌNH ═══════════════════════ */
 
@@ -826,17 +835,35 @@ async function mapLimit(arr, limit, fn) {
 const FALLBACK_CONCURRENCY = 3;
 
 async function resolveMediaSet(items, cfg, opts = {}) {
-  // Ưu tiên CHÍNH lấy từ DB (link HuggingFace trực tiếp). File nào DB KHÔNG có
-  // thì chuyển về resolver gốc (svpc/svatv theo config động) làm luồng Dự Phòng.
-  const dbUnits = [];   // { item, row, vi, total }
-  const fbItems = [];   // item không có trong DB
+  // Ưu tiên CHÍNH lấy từ DB (link HuggingFace qua bộ giải mã XOR của Worker).
+  // File nào DB KHÔNG có (hoặc repo trên HF đã bị xoá 404) thì chuyển về resolver gốc làm luồng Dự Phòng.
+  const dbCandidates = []; // { item, vars }
+  const fbItems = [];      // item không có trong DB hoặc HF trả 404
   for (const it of items) {
     const id = fileNameFrom(it.fileUrl);
     const vars = id ? await dbVariants(id) : [];
     if (!vars.length) { fbItems.push(it); continue; }
-    vars.forEach((row, vi) => dbUnits.push({ item: it, row, vi, total: vars.length }));
+    dbCandidates.push({ item: it, vars });
   }
-  if (!dbUnits.length && !fbItems.length) throw new HttpError(502, "empty file set");
+  if (!dbCandidates.length && !fbItems.length) throw new HttpError(502, "empty file set");
+
+  const dbUnits = [];   // { item, row, vi, total }
+  if (dbCandidates.length) {
+    const candidateResults = await Promise.all(dbCandidates.map(async (cand) => {
+      const checks = await Promise.all(cand.vars.map(async (row) => {
+        const alive = await isStreamPlayable(hfRawUrl(row), 3500);
+        return alive ? row : null;
+      }));
+      return { item: cand.item, liveVars: checks.filter(Boolean) };
+    }));
+    for (const res of candidateResults) {
+      if (res.liveVars.length > 0) {
+        res.liveVars.forEach((row, vi) => dbUnits.push({ item: res.item, row, vi, total: res.liveVars.length }));
+      } else {
+        fbItems.push(res.item);
+      }
+    }
+  }
 
   const out = [];
   // 1) Nguồn chính: DB → HuggingFace trực tiếp (giữ tên account-repo như cũ).
@@ -2036,6 +2063,7 @@ export const addon = {
   async fetch(request) {
     if (request.method === "OPTIONS") return json({ ok: true }, 200);
     const url = new URL(request.url);
+    if (url.origin && url.origin !== "null") CURRENT_ORIGIN = url.origin;
     const segments = url.pathname.split("/").filter(Boolean);
 
     if (segments.length === 0 || segments[0] === "manifest.json") {
