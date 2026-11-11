@@ -357,41 +357,48 @@ async function handleHfStream(request, url, hfUrl) {
     respHeaders.set("Content-Range", `bytes ${start}-${end}/${mediaSize}`);
   }
 
-  // File raw nguyên bản -> truyền trực tiếp body
+  // File raw nguyên bản -> truyền trực tiếp body (kèm FixedLengthStream nếu có)
   if (meta.isRaw) {
-    return new Response(upstreamResp.body, {
+    let rawBody = upstreamResp.body;
+    if (typeof FixedLengthStream !== "undefined") {
+      try {
+        const fls = new FixedLengthStream(contentLength);
+        rawBody = rawBody.pipeThrough(fls);
+      } catch {}
+    }
+    return new Response(rawBody, {
       status: isPartial ? 206 : 200,
       headers: respHeaders
     });
   }
 
-  // 4. File mã hóa: Dùng ReadableStream pull() + cancel() để giải mã theo tốc độ đọc thực tế
-  //    và hủy ngay lập tức kết nối cũ tới Hugging Face khi người dùng kéo thanh tua (Seek)
-  const reader = upstreamResp.body.getReader();
+  // 4. File mã hóa: Dùng TransformStream + FixedLengthStream để giải mã trực tiếp
+  //    và ĐẢM BẢO giữ nguyên Content-Length (tránh bị Cloudflare chuyển sang Transfer-Encoding: chunked làm player lỗi tua)
   let rotOffset = ((start % 256) + 256) % 256;
   const tables = meta.tables || DEFAULT_TABLES;
 
-  const stream = new ReadableStream({
-    async pull(controller) {
+  const ts = new TransformStream({
+    transform(chunk, controller) {
       try {
-        const { done, value } = await reader.read();
-        if (done) {
-          controller.close();
-          return;
-        }
-        const dec = xorChunkFast(value, rotOffset, tables);
-        rotOffset = (rotOffset + value.byteLength) & 255;
+        const dec = xorChunkFast(chunk, rotOffset, tables);
+        rotOffset = (rotOffset + chunk.byteLength) & 255;
         controller.enqueue(dec);
       } catch (err) {
         controller.error(err);
       }
-    },
-    cancel(reason) {
-      return reader.cancel(reason).catch(() => {});
     }
   });
 
-  return new Response(stream, {
+  let bodyStream = upstreamResp.body.pipeThrough(ts);
+
+  if (typeof FixedLengthStream !== "undefined") {
+    try {
+      const fls = new FixedLengthStream(contentLength);
+      bodyStream = bodyStream.pipeThrough(fls);
+    } catch {}
+  }
+
+  return new Response(bodyStream, {
     status: isPartial ? 206 : 200,
     headers: respHeaders
   });
