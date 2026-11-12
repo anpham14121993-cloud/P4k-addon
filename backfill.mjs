@@ -231,9 +231,9 @@ async function main() {
 
   // 1. Tải danh sách ID đã có trong DB để tránh query lại nếu không --force
   console.log("1. Đang kiểm tra các ID đã có sẵn trong Turso DB...");
-  const existingRes = await client.exec("SELECT id FROM titles");
-  const existingIds = new Set((existingRes.rows || []).map((r) => Number(r.id)));
-  console.log(`=> Đã có sẵn ${existingIds.size} bộ phim trong database.\n`);
+  const existingRes = await client.exec("SELECT id, type FROM titles");
+  const existingTypes = new Map((existingRes.rows || []).map((r) => [Number(r.id), r.type]));
+  console.log(`=> Đã có sẵn ${existingTypes.size} bộ phim trong database.\n`);
 
   const collector = new BatchCollector(client, BATCH_SIZE);
 
@@ -302,25 +302,30 @@ async function main() {
         const vId = Number(item.videos_id);
         if (!vId) continue;
 
-        // 1. Phim lẻ: Nếu không phải --force và đã có trong DB -> Bỏ qua luôn 100%
-        if (!FORCE && titleType === "movie" && existingIds.has(vId)) {
+        // 1. Phim lẻ: Nếu không phải --force, không đổi loại và đã có trong DB -> Bỏ qua luôn 100%
+        const prevType = existingTypes.get(vId);
+        const typeChanged = prevType && prevType !== titleType;
+
+        if (!FORCE && !typeChanged && titleType === "movie" && existingTypes.has(vId)) {
           pageSkipped++;
           totalSkipped++;
           continue;
         }
 
-        // 2. Phim bộ: Nếu đã có trong DB, lấy danh sách các tập đã lưu để không ghi đè lại
+        // 2. Phim bộ: Nếu đã có trong DB và không đổi loại, lấy danh sách các tập đã lưu để không ghi đè lại
         let isExistingSeries = false;
+        let existingRows = [];
         let existingEpKeys = new Set();
-        if (!FORCE && titleType === "series" && existingIds.has(vId)) {
+        if (!FORCE && !typeChanged && titleType === "series" && existingTypes.has(vId)) {
           isExistingSeries = true;
           try {
             const epRes = await client.exec(
-              "SELECT season, episode, file_id FROM episodes_streams WHERE title_id = ?",
+              "SELECT id, season, episode, file_id FROM episodes_streams WHERE title_id = ?",
               [vId]
             );
+            existingRows = epRes.rows || [];
             existingEpKeys = new Set(
-              (epRes.rows || []).map((r) => `${r.season}:${r.episode}:${r.file_id}`)
+              existingRows.map((r) => `${r.season}:${r.episode}:${r.file_id}`)
             );
           } catch (e) {
             console.error(`Lỗi kiểm tra tập cũ của phim ${vId}:`, e.message);
@@ -349,7 +354,17 @@ async function main() {
         const genres = Array.isArray(d.genre) ? JSON.stringify(d.genre.map((g) => g.name).filter(Boolean)) : null;
 
         let itemStreams = 0;
+        let staleStreamsCleaned = 0;
         const streamStatements = [];
+
+        // Nếu title đổi loại (ví dụ: từ movie sang series hoặc ngược lại): xoá sạch stream cũ
+        if (typeChanged) {
+          console.log(`  [CHUYỂN LOẠI] [${vId}] ${d.title}: Chuyển từ "${prevType}" sang "${titleType}" -> Xoá sạch stream cũ.`);
+          streamStatements.push({
+            sql: "DELETE FROM episodes_streams WHERE title_id = ?",
+            args: [vId],
+          });
+        }
 
         // Xử lý stream nguồn phát
         if (titleType === "movie") {
@@ -377,12 +392,16 @@ async function main() {
             }
           }
         } else if (titleType === "series") {
+          const validFids = new Set();
+          const validEpKeys = new Set();
           if (Array.isArray(d.season)) {
             for (const s of d.season) {
               if (!Array.isArray(s.episodes)) continue;
               for (const ep of s.episodes) {
                 const fileId = fileNameFrom(ep.file_url);
                 if (!fileId) continue;
+                validFids.add(fileId);
+
                 const info = episodeInfo(s, ep);
                 if (info.episode === null) continue;
 
@@ -392,6 +411,7 @@ async function main() {
 
                 for (let epNum = from; epNum <= span; epNum++) {
                   const epKey = `${info.season}:${epNum}:${fileId}`;
+                  validEpKeys.add(epKey);
                   if (existingEpKeys.has(epKey)) {
                     // Tập này ĐÃ CÓ trong DB rồi -> Bỏ qua, không ghi đè lại vào Turso!
                     continue;
@@ -417,10 +437,26 @@ async function main() {
               }
             }
           }
+
+          // Dọn dẹp stream rác/cũ không còn trong API
+          if (isExistingSeries && !typeChanged) {
+            for (const r of existingRows) {
+              if (!validFids.has(r.file_id) || !validEpKeys.has(`${r.season}:${r.episode}:${r.file_id}`)) {
+                streamStatements.push({
+                  sql: "DELETE FROM episodes_streams WHERE id = ?",
+                  args: [r.id],
+                });
+                staleStreamsCleaned++;
+              }
+            }
+            if (staleStreamsCleaned > 0) {
+              console.log(`  [Phim bộ] [${vId}] ${d.title}: Dọn dẹp ${staleStreamsCleaned} stream rác không hợp lệ.`);
+            }
+          }
         }
 
-        // Nếu là phim bộ cũ và KHÔNG có tập mới nào -> Bỏ qua hoàn toàn, không tốn ghi Turso!
-        if (isExistingSeries && itemStreams === 0) {
+        // Nếu là phim bộ cũ và KHÔNG có tập mới nào và KHÔNG có stream rác bị dọn -> Bỏ qua hoàn toàn, không tốn ghi Turso!
+        if (isExistingSeries && itemStreams === 0 && staleStreamsCleaned === 0 && !typeChanged) {
           pageSkipped++;
           totalSkipped++;
           console.log(`  [${listPath}: p${page}] [${i + 1}/${list.length}] [${vId}] ${d.title} -> Đã đủ tập (bỏ qua)`);
@@ -454,7 +490,7 @@ async function main() {
           collector.add(st);
         }
 
-        existingIds.add(vId);
+        existingTypes.set(vId, titleType);
         pageInserted++;
         totalTitlesInserted++;
         pageStreams += itemStreams;

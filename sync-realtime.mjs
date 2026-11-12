@@ -312,18 +312,19 @@ async function main() {
 
         // Kiểm tra xem title này đã tồn tại trong DB chưa
         const existRes = await client.exec(
-          "SELECT id, quality, poster_url, updated_at FROM titles WHERE id = ?",
+          "SELECT id, type, quality, poster_url, updated_at FROM titles WHERE id = ?",
           [vId]
         );
         const existingTitle = existRes.rows && existRes.rows.length > 0 ? existRes.rows[0] : null;
+        const typeChanged = existingTitle && existingTitle.type && existingTitle.type !== cat.type;
 
         // Xử lý theo loại: Phim lẻ hoặc Phim bộ
         if (cat.type === "movie") {
           const apiVideos = Array.isArray(d.videos) ? d.videos : [];
 
           // Lấy danh sách stream hiện tại trong DB
-          const streamRes = await client.exec(
-            "SELECT file_id FROM episodes_streams WHERE title_id = ?",
+          const streamRes = typeChanged ? { rows: [] } : await client.exec(
+            "SELECT id, file_id FROM episodes_streams WHERE title_id = ?",
             [vId]
           );
           const existingStreams = streamRes.rows || [];
@@ -334,8 +335,8 @@ async function main() {
             return fid && !existingFids.has(fid);
           });
 
-          // SMART SKIP: Nếu phim đã có trong DB, có stream, không có stream mới, và không có merge trùng lặp
-          if (!FORCE && existingTitle && existingStreams.length > 0 && newVideos.length === 0 && !hadMerge) {
+          // SMART SKIP: Nếu phim đã có trong DB, có stream, không có stream mới, không đổi loại, và không có merge trùng lặp
+          if (!FORCE && existingTitle && !typeChanged && existingStreams.length > 0 && newVideos.length === 0 && !hadMerge) {
             console.log(`  [Phim lẻ] [${vId}] ${d.title}: Đã có sẵn (${existingStreams.length} stream, không đổi, bỏ qua).`);
             totalTitlesSkipped++;
             continue;
@@ -379,8 +380,8 @@ async function main() {
           totalTitlesSynced++;
 
           // Nạp stream
-          if (!existingTitle || hadMerge || FORCE) {
-            // Phim mới hoàn toàn hoặc vừa merge hoặc ép buộc: làm mới toàn bộ
+          if (!existingTitle || hadMerge || typeChanged || FORCE) {
+            // Phim mới hoàn toàn hoặc vừa merge hoặc đổi loại hoặc ép buộc: làm mới toàn bộ
             await collector.add({ sql: "DELETE FROM episodes_streams WHERE title_id = ?", args: [vId] });
             for (const v of apiVideos) {
               const fid = fileNameFrom(v.file_url);
@@ -423,15 +424,23 @@ async function main() {
           }
 
         } else if (cat.type === "series") {
-          // Lấy danh sách stream đã có của series để không nạp đè trùng lặp
-          const epRes = await client.exec(
-            "SELECT season, episode, file_id FROM episodes_streams WHERE title_id = ?",
+          if (typeChanged) {
+            console.log(`  [CHUYỂN LOẠI] [${vId}] ${d.title}: Chuyển từ "${existingTitle.type}" sang "series" -> Xoá sạch stream cũ.`);
+            await collector.add({ sql: "DELETE FROM episodes_streams WHERE title_id = ?", args: [vId] });
+          }
+
+          // Lấy danh sách stream đã có của series để không nạp đè trùng lặp và phát hiện stream rác
+          const epRes = typeChanged ? { rows: [] } : await client.exec(
+            "SELECT id, season, episode, file_id FROM episodes_streams WHERE title_id = ?",
             [vId]
           );
+          const existingRows = epRes.rows || [];
           const existingEpKeys = new Set(
-            (epRes.rows || []).map((r) => `${r.season}:${r.episode}:${r.file_id}`)
+            existingRows.map((r) => `${r.season}:${r.episode}:${r.file_id}`)
           );
 
+          const validFids = new Set();
+          const validEpKeys = new Set();
           const pendingEpisodes = [];
           if (Array.isArray(d.season)) {
             for (const s of d.season) {
@@ -439,6 +448,7 @@ async function main() {
               for (const ep of s.episodes) {
                 const fid = fileNameFrom(ep.file_url || ep.url);
                 if (!fid) continue;
+                validFids.add(fid);
 
                 const info = episodeInfo(s, ep);
                 if (info.episode === null) continue;
@@ -449,6 +459,7 @@ async function main() {
 
                 for (let epNum = from; epNum <= span; epNum++) {
                   const epKey = `${info.season}:${epNum}:${fid}`;
+                  validEpKeys.add(epKey);
                   if (existingEpKeys.has(epKey)) continue;
 
                   pendingEpisodes.push({
@@ -465,9 +476,25 @@ async function main() {
             }
           }
 
-          // SMART SKIP: Nếu phim bộ đã có trong DB, không có tập mới, và không có merge trùng lặp
-          if (!FORCE && existingTitle && pendingEpisodes.length === 0 && !hadMerge) {
-            console.log(`  [Phim bộ] [${vId}] ${d.title}: Đã có sẵn (${epRes.rows ? epRes.rows.length : 0} tập/stream, không có tập mới, bỏ qua).`);
+          // Dọn dẹp stream rác/cũ (stream có trong DB nhưng không còn trong API hoặc phim lẻ cũ còn sót lại)
+          const staleIds = [];
+          if (!typeChanged) {
+            for (const r of existingRows) {
+              if (!validFids.has(r.file_id) || !validEpKeys.has(`${r.season}:${r.episode}:${r.file_id}`)) {
+                staleIds.push(r.id);
+              }
+            }
+            if (staleIds.length > 0) {
+              for (const sId of staleIds) {
+                await collector.add({ sql: "DELETE FROM episodes_streams WHERE id = ?", args: [sId] });
+              }
+              console.log(`  [Phim bộ] [${vId}] ${d.title}: Đã dọn dẹp ${staleIds.length} stream/tập rác không hợp lệ.`);
+            }
+          }
+
+          // SMART SKIP: Nếu phim bộ đã có trong DB, không đổi loại, không có tập mới, không có stream rác, và không có merge trùng lặp
+          if (!FORCE && existingTitle && !typeChanged && pendingEpisodes.length === 0 && staleIds.length === 0 && !hadMerge) {
+            console.log(`  [Phim bộ] [${vId}] ${d.title}: Đã có sẵn (${existingRows.length} tập/stream, không có tập mới, bỏ qua).`);
             totalTitlesSkipped++;
             continue;
           }
