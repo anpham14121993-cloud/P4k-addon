@@ -38,12 +38,15 @@ const client = tursoClient({ url: dbUrl, token: dbToken });
 
 const args = process.argv.slice(2);
 function getArg(name, def = null) {
-  const idx = args.indexOf("--" + name);
-  if (idx !== -1 && idx + 1 < args.length) return args[idx + 1];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--" + name && i + 1 < args.length) return args[i + 1];
+    if (a.startsWith("--" + name + "=")) return a.slice(name.length + 3);
+  }
   return def;
 }
 function hasFlag(name) {
-  return args.includes("--" + name);
+  return args.some((a) => a === "--" + name || a.startsWith("--" + name + "="));
 }
 
 const PAGES = Math.max(1, parseInt(getArg("pages", "2"), 10) || 2);
@@ -424,13 +427,13 @@ async function main() {
           }
 
         } else if (cat.type === "series") {
-          if (typeChanged) {
-            console.log(`  [CHUYỂN LOẠI] [${vId}] ${d.title}: Chuyển từ "${existingTitle.type}" sang "series" -> Xoá sạch stream cũ.`);
+          if (typeChanged || FORCE) {
+            console.log(`  [CHUYỂN LOẠI / FORCE] [${vId}] ${d.title}: ${typeChanged ? `Chuyển từ "${existingTitle.type}" sang "series" -> Xoá sạch stream cũ.` : "Làm mới toàn bộ stream (--force)."}`);
             await collector.add({ sql: "DELETE FROM episodes_streams WHERE title_id = ?", args: [vId] });
           }
 
           // Lấy danh sách stream đã có của series để không nạp đè trùng lặp và phát hiện stream rác
-          const epRes = typeChanged ? { rows: [] } : await client.exec(
+          const epRes = (typeChanged || FORCE) ? { rows: [] } : await client.exec(
             "SELECT id, season, episode, file_id FROM episodes_streams WHERE title_id = ?",
             [vId]
           );
