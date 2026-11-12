@@ -283,7 +283,8 @@ async function main() {
         break;
       }
 
-      const listUrl = `https://api.phim4k.space/rest-api/v130/${listPath}?page=${page}`;
+      const sep = listPath.includes("?") ? "&" : "?";
+      const listUrl = `https://api.phim4k.space/rest-api/v130/${listPath}${sep}page=${page}`;
       const list = await fetchWithRetry(listUrl);
 
       if (!list || !Array.isArray(list) || list.length === 0) {
@@ -515,10 +516,10 @@ async function main() {
 
   // 3. Thực thi theo cấu hình
   if (TYPE === "all" || TYPE === "movies" || TYPE === "movie") {
-    await crawlCategory("movies", "movie");
+    await crawlCategory("latest_movies?limit=24", "movie");
   }
   if (!isOverBudget() && (TYPE === "all" || TYPE === "tvseries" || TYPE === "series")) {
-    await crawlCategory("tvseries", "series");
+    await crawlCategory("latest_tvseries?limit=24", "series");
   }
 
   await collector.flush();

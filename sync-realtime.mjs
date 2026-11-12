@@ -255,12 +255,12 @@ async function main() {
   let totalStreamsInserted = 0;
 
   for (const cat of [
-    { name: "Phim lẻ (movies)", path: "movies", type: "movie" },
-    { name: "Phim bộ (tvseries)", path: "tvseries", type: "series" },
+    { name: "Phim lẻ (movies)", path: "latest_movies?limit=24", type: "movie" },
+    { name: "Phim bộ (tvseries)", path: "latest_tvseries?limit=24", type: "series" },
   ]) {
     console.log(`\n--- BẮT ĐẦU ĐỒNG BỘ: ${cat.name.toUpperCase()} ---`);
     for (let page = 1; page <= PAGES; page++) {
-      const listUrl = `https://api.phim4k.space/rest-api/v130/${cat.path}?page=${page}`;
+      const listUrl = `https://api.phim4k.space/rest-api/v130/${cat.path}&page=${page}`;
       const list = await fetchWithRetry(listUrl);
       if (!Array.isArray(list) || list.length === 0) {
         console.log(`Trang ${page} không có phim nào, kết thúc danh mục ${cat.path}.`);
