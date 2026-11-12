@@ -1373,6 +1373,8 @@ function detailToMeta(d, type) {
     description: cleanText(d.description),
     poster: cleanText(d.thumbnail_url || d.poster_url),
     background: cleanText(d.poster_url || d.thumbnail_url),
+    year: parseInt(String(d.release || d.release_year || "").slice(0, 4), 10) || undefined,
+    imdb_id: d.imdb_id ? (String(d.imdb_id).startsWith("tt") ? String(d.imdb_id) : "tt" + d.imdb_id) : undefined,
     releaseInfo: [d.video_quality, d.runtime].filter(Boolean).join(" · ") || undefined,
     imdbRating: d.imdb_rating != null && String(d.imdb_rating).trim() !== ""
       ? String(d.imdb_rating) : undefined,
@@ -1734,6 +1736,7 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
               releaseInfo: m.quality || undefined,
               imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
               description: m.overview || undefined,
+              imdb_id: m.imdb_id || undefined,
             };
           }),
         };
@@ -1831,8 +1834,10 @@ async function handleMeta(type, id, cfg, ms) {
           description: cleanText(titleRow.overview),
           poster: cleanText(titleRow.thumbnail_url || titleRow.poster_url),
           background: cleanText(titleRow.poster_url || titleRow.thumbnail_url),
+          year: parseInt(titleRow.release_year, 10) || undefined,
           releaseInfo: cleanText(titleRow.quality) || undefined,
           imdbRating: titleRow.imdb_rating != null ? String(titleRow.imdb_rating) : undefined,
+          imdb_id: titleRow.imdb_id || undefined,
           genres: Array.isArray(genres) ? genres : [],
         };
         if (titleRow.type === "series" && DB.getSeriesEpisodes) {
@@ -2053,7 +2058,7 @@ async function diagAll(request) {
     const signed = await genVideoUrl(fileName, host, secret);
     const t0 = Date.now();
     const res = await fetchWithTimeout(signed, { headers: { Accept: "application/json" } }, 6000);
-    out.direct = { status: res.status, ms: Date.now() - t0, body: (await res.text().catch(() => "")).slice(0, 70) };
+    out.direct = { status: res.status, ms: Date.now() - t0, body: (await res.text().catch(() => "")).slice(0, 300) };
   } catch (e) { out.direct = { status: "ERR", err: String(e.message || e.name || e).slice(0, 60) }; }
   out.mint = await Promise.all(EGRESS_MIRRORS.map(async (m) => ({ name: m.name, ...await diagMint(fileName, m, host, secret) })));
   return out;

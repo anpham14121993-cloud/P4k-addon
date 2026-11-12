@@ -4,7 +4,7 @@ import { tursoClient } from "./turso-http.mjs";
 const TTL_MS = 30 * 60 * 1000;
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 const MAX_MEM = 5000;
-const CACHE_VER = "v6";
+const CACHE_VER = "v7";
 const baseOf = (id) => (id.includes(".") ? id.slice(0, id.lastIndexOf(".")) : id);
 
 function normalizeText(v) {
@@ -112,15 +112,15 @@ export function tursoDb(env) {
     const args = [];
     if (catalogId === "phim4k-otv-movies" || catalogId === "phim4k-otv-movies-latest") {
       sql =
-        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'movie' ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?";
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview, imdb_id FROM titles WHERE type = 'movie' ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?";
       args.push(limit, offset);
     } else if (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") {
       sql =
-        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'series' ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?";
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview, imdb_id FROM titles WHERE type = 'series' ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?";
       args.push(limit, offset);
     } else if (catalogId === "phim4k-otv-top") {
       sql =
-        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles ORDER BY imdb_rating DESC, updated_at DESC, id DESC LIMIT ? OFFSET ?";
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview, imdb_id FROM titles ORDER BY imdb_rating DESC, updated_at DESC, id DESC LIMIT ? OFFSET ?";
       args.push(limit, offset);
     } else {
       return [];
@@ -141,15 +141,15 @@ export function tursoDb(env) {
     const pattern = "%" + cleanQ + "%";
     if (mediaType === "series" || mediaType === "tvseries") {
       sql =
-        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'series' AND title_clean LIKE ? ORDER BY release_year DESC LIMIT ?";
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview, imdb_id FROM titles WHERE type = 'series' AND title_clean LIKE ? ORDER BY release_year DESC LIMIT ?";
       args.push(pattern, limit);
     } else if (mediaType === "movie") {
       sql =
-        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE type = 'movie' AND title_clean LIKE ? ORDER BY release_year DESC LIMIT ?";
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview, imdb_id FROM titles WHERE type = 'movie' AND title_clean LIKE ? ORDER BY release_year DESC LIMIT ?";
       args.push(pattern, limit);
     } else {
       sql =
-        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview FROM titles WHERE title_clean LIKE ? ORDER BY release_year DESC LIMIT ?";
+        "SELECT id, type, title, poster_url, thumbnail_url, release_year, imdb_rating, quality, overview, imdb_id FROM titles WHERE title_clean LIKE ? ORDER BY release_year DESC LIMIT ?";
       args.push(pattern, limit);
     }
     const r = await c.exec(sql, args);
