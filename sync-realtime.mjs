@@ -277,6 +277,9 @@ async function main() {
         const vId = Number(item.videos_id);
         if (!vId) continue;
 
+        // Giữ đúng thứ tự hiển thị của API gốc khi sort theo updated_at DESC trong DB
+        const itemUpdatedAt = startTime - ((page - 1) * 50 + i) * 1000;
+
         await sleep(DELAY_MS);
         const detailType = cat.type === "movie" ? "movie" : "tvseries";
         const detailUrl = `https://api.phim4k.space/rest-api/v130/single_details?type=${detailType}&id=${vId}`;
@@ -377,7 +380,7 @@ async function main() {
               cleanText(d.video_quality || item.video_quality),
               genres,
               cleanText(d.description || item.description),
-              Date.now(),
+              itemUpdatedAt,
             ],
           });
           totalTitlesSynced++;
@@ -534,7 +537,7 @@ async function main() {
               cleanText(d.video_quality || item.video_quality),
               genres,
               cleanText(d.description || item.description),
-              Date.now(),
+              itemUpdatedAt,
             ],
           });
           totalTitlesSynced++;

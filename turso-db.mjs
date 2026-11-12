@@ -4,7 +4,7 @@ import { tursoClient } from "./turso-http.mjs";
 const TTL_MS = 30 * 60 * 1000;
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 const MAX_MEM = 5000;
-const CACHE_VER = "v5";
+const CACHE_VER = "v6";
 const baseOf = (id) => (id.includes(".") ? id.slice(0, id.lastIndexOf(".")) : id);
 
 function normalizeText(v) {
