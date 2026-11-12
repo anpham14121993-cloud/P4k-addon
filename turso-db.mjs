@@ -4,7 +4,7 @@ import { tursoClient } from "./turso-http.mjs";
 const TTL_MS = 30 * 60 * 1000;
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 const MAX_MEM = 5000;
-const CACHE_VER = "v7";
+const CACHE_VER = "v8";
 const baseOf = (id) => (id.includes(".") ? id.slice(0, id.lastIndexOf(".")) : id);
 
 function normalizeText(v) {
@@ -215,7 +215,7 @@ export function tursoDb(env) {
     const r = await c.exec(
       "SELECT s.id, s.title_id, s.season, s.episode, s.file_id, s.label, s.container, s.quality, s.subtitles, t.title, t.quality as release_quality " +
         "FROM episodes_streams s JOIN titles t ON s.title_id = t.id " +
-        "WHERE s.title_id = ? AND s.season = ? AND s.episode = ? ORDER BY s.id ASC",
+        "WHERE s.title_id = ? AND (t.type = 'movie' OR (s.season = ? AND s.episode = ?)) ORDER BY s.id ASC",
       [numId, s, e]
     );
     const rows = r.rows || [];

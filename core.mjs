@@ -834,9 +834,8 @@ async function mapLimit(arr, limit, fn) {
 const FALLBACK_CONCURRENCY = 3;
 
 async function resolveMediaSet(items, cfg, opts = {}) {
-  // Lấy danh sách file từ DB (Hugging Face)
+  // 1. Kiểm tra luồng từ DB (Hugging Face trực tiếp qua Worker XOR decoder)
   const dbCandidates = []; // { item, vars }
-  const fbItems = [...items]; // Luôn đưa mọi file vào danh sách resolve CDN (Dự Phòng Railway) để đảm bảo phát và tua mượt 100%
 
   for (const it of items) {
     const id = fileNameFrom(it.fileUrl);
@@ -846,7 +845,7 @@ async function resolveMediaSet(items, cfg, opts = {}) {
     }
   }
 
-  const dbUnits = [];   // { item, row, vi, total }
+  const dbUnits = []; // { item, row, vi, total }
   if (dbCandidates.length) {
     const candidateResults = await Promise.all(dbCandidates.map(async (cand) => {
       const checks = await Promise.all(cand.vars.map(async (row) => {
@@ -864,7 +863,7 @@ async function resolveMediaSet(items, cfg, opts = {}) {
 
   const out = [];
 
-  // 1) Luồng Hugging Face (từ DB qua Worker): Siêu tốc, giải mã XOR 32-bit & tua mượt trực tiếp từ CDN
+  // Luồng Hugging Face (từ DB qua Worker): Siêu tốc, giải mã XOR 32-bit & tua mượt trực tiếp từ CDN
   for (const u of dbUnits) {
     let title = u.item.label;
     try {
@@ -879,12 +878,17 @@ async function resolveMediaSet(items, cfg, opts = {}) {
     out.push(stream);
   }
 
-  // 2) Luồng CDN Dự Phòng (Railway) — chuẩn 100%, tua mượt mọi vị trí
-  if (fbItems.length) {
-    const settled = await mapLimit(fbItems, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
+  // YÊU CẦU: Luồng stream sẽ lấy từ DB, nếu DB KHÔNG CÓ mới lấy link dự phòng (Railway CDN)
+  if (out.length > 0) {
+    return out;
+  }
+
+  // 2. Dự phòng: Khi DB KHÔNG có bất kỳ luồng HF nào -> Gọi resolver CDN Dự Phòng (Railway)
+  if (items.length) {
+    const settled = await mapLimit(items, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
     settled.forEach((r, idx) => {
       if (!r || r.status !== "fulfilled" || !r.value) return;
-      const it = fbItems[idx];
+      const it = items[idx];
       let title = it.label;
       try { if (typeof title === "string") title = title + "\n📁 Dự Phòng (Railway - Tua Mượt)"; } catch {}
       const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
