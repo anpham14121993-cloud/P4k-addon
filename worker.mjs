@@ -584,25 +584,14 @@ export default {
       }
     }
 
-    // 0. Tuyến 0 (sync-realtime): chạy mỗi 30 phút một lần (smart dedup + cập nhật phim mới)
-    await dispatch("sync-realtime.yml", { pages: "2" });
+    // 0. Tuyến 0 (sync-realtime): chạy mỗi 30 phút một lần (quét 5 trang cập nhật + trang 1 ID mới)
+    await dispatch("sync-realtime.yml", { pages: "5" });
 
     const min = new Date().getUTCMinutes();
-    const hour = new Date().getUTCHours();
 
     // 1. Tuyến 1 (crawl): chạy mỗi giờ một lần (vào đầu giờ :00)
     if (min < 15) {
       await dispatch("crawl.yml", { budget: "3600" });
-
-      // 2. Tuyến 2 (upgrade-quality): 05:00 UTC (12:00 VN) & 17:00 UTC (00:00 VN)
-      if (hour === 5 || hour === 17) {
-        await dispatch("upgrade-quality.yml", { type: "all", limit: "0", dry_run: "false" });
-      }
-
-      // 3. Tuyến 3 (health-check): 20:00 UTC (03:00 VN)
-      if (hour === 20) {
-        await dispatch("health-check.yml", { limit: "0", dry_run: "false" });
-      }
     }
   },
 };

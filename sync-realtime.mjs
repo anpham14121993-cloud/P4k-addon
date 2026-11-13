@@ -1,6 +1,6 @@
 // sync-realtime.mjs — Đồng bộ thời gian thực từ Phim4K API vào Turso DB.
-// Cơ chế: Quét trang 1-2 mới nhất của movies & tvseries, tích hợp Smart Dedup (so khớp Tên + Năm)
-// để tự động chuyển đổi ID cũ sang ID mới, dọn sạch trùng lặp, cập nhật poster và link stream mới nhất.
+// Cơ chế: Quét các trang mới cập nhật (movies/tvseries + trang 1 latest_* để đón ID mới tức thì),
+// tích hợp Smart Dedup (so khớp Tên + Năm) và dọn stream cũ khi Phim4K thay thế/thêm tập.
 
 import fs from "fs";
 import { tursoClient } from "./turso-http.mjs";
@@ -49,7 +49,7 @@ function hasFlag(name) {
   return args.some((a) => a === "--" + name || a.startsWith("--" + name + "="));
 }
 
-const PAGES = Math.max(1, parseInt(getArg("pages", "2"), 10) || 2);
+const PAGES = Math.max(1, parseInt(getArg("pages", "5"), 10) || 5);
 const DELAY_MS = Math.max(100, parseInt(getArg("delay", "250"), 10) || 250);
 const BATCH_SIZE = Math.max(10, parseInt(getArg("batch-size", "50"), 10) || 50);
 const DRY_RUN = hasFlag("dry-run");
@@ -258,10 +258,13 @@ async function main() {
   let totalStreamsInserted = 0;
 
   for (const cat of [
-    { name: "Phim lẻ (movies)", path: "latest_movies?limit=24", type: "movie" },
-    { name: "Phim bộ (tvseries)", path: "latest_tvseries?limit=24", type: "series" },
+    { name: "Phim lẻ (movies)", path: "movies?limit=24", latestPath: "latest_movies?limit=24", type: "movie" },
+    { name: "Phim bộ (tvseries)", path: "tvseries?limit=24", latestPath: "latest_tvseries?limit=24", type: "series" },
   ]) {
     console.log(`\n--- BẮT ĐẦU ĐỒNG BỘ: ${cat.name.toUpperCase()} ---`);
+    const seenIds = new Set();
+    const batches = [];
+
     for (let page = 1; page <= PAGES; page++) {
       const listUrl = `https://api.phim4k.space/rest-api/v130/${cat.path}&page=${page}`;
       const list = await fetchWithRetry(listUrl);
@@ -269,16 +272,27 @@ async function main() {
         console.log(`Trang ${page} không có phim nào, kết thúc danh mục ${cat.path}.`);
         break;
       }
-
       console.log(`[${cat.path}] Trang ${page}: Tìm thấy ${list.length} phim từ Phim4K.`);
+      batches.push({ tag: cat.path, page, list, isLatestFallback: false });
+    }
 
-      for (let i = 0; i < list.length; i++) {
-        const item = list[i];
+    // Quét thêm trang 1 của latest_* để đón ngay các ID mới tạo nếu endpoint chính bị trễ cache
+    const latestList = await fetchWithRetry(`https://api.phim4k.space/rest-api/v130/${cat.latestPath}&page=1`);
+    if (Array.isArray(latestList) && latestList.length > 0) {
+      batches.push({ tag: cat.latestPath, page: 1, list: latestList, isLatestFallback: true });
+    }
+
+    for (const batch of batches) {
+      for (let i = 0; i < batch.list.length; i++) {
+        const item = batch.list[i];
         const vId = Number(item.videos_id);
-        if (!vId) continue;
+        if (!vId || seenIds.has(vId)) continue;
+        seenIds.add(vId);
 
         // Giữ đúng thứ tự hiển thị của API gốc khi sort theo updated_at DESC trong DB
-        const itemUpdatedAt = startTime - ((page - 1) * 50 + i) * 1000;
+        const itemUpdatedAt = batch.isLatestFallback
+          ? startTime + 1000 - i * 10
+          : startTime - ((batch.page - 1) * 50 + i) * 1000;
 
         await sleep(DELAY_MS);
         const detailType = cat.type === "movie" ? "movie" : "tvseries";
@@ -296,15 +310,21 @@ async function main() {
         const rating = (d.imdb_rating || item.imdb_rating) ? parseFloat(d.imdb_rating || item.imdb_rating) || null : null;
         const genres = Array.isArray(d.genre) ? JSON.stringify(d.genre.map((g) => g.name).filter(Boolean)) : null;
 
-        // 1. SMART DEDUP: Tìm kiếm bản ghi cũ trùng Tên + Năm trong DB (khác vId)
+        // 1. SMART DEDUP: Tìm kiếm bản ghi cũ trùng Tên + Năm + Loại trong DB (khác vId)
+        // Chỉ gộp khi vId > oldId (lên đời ID mới hơn); nếu DB đã có ID mới hơn thì bỏ qua ID cũ để tránh ghi đè ngược.
         let hadMerge = false;
+        let skipOlderDup = false;
         if (cleanTitle) {
           const dupRes = await client.exec(
-            "SELECT id, title FROM titles WHERE title_clean = ? AND release_year = ? AND id != ? LIMIT 5",
-            [cleanTitle, year, vId]
+            "SELECT id, title FROM titles WHERE title_clean = ? AND release_year = ? AND type = ? AND id != ? LIMIT 5",
+            [cleanTitle, year, cat.type, vId]
           );
           const oldDups = dupRes.rows || [];
-          if (oldDups.length > 0) {
+          const newerDup = oldDups.find((r) => Number(r.id) > vId);
+          if (newerDup) {
+            console.log(`  [SMART DEDUP] [${vId}] ${d.title}: Đã có bản mới hơn (ID ${newerDup.id}), bỏ qua ID cũ.`);
+            skipOlderDup = true;
+          } else if (oldDups.length > 0) {
             for (const oldRow of oldDups) {
               const oldId = oldRow.id;
               console.log(`  [SMART MERGE] Gộp phim: "${d.title}" -> Xoá ID cũ ${oldId}, cập nhật sang ID mới ${vId}`);
@@ -314,6 +334,10 @@ async function main() {
             }
             hadMerge = true;
           }
+        }
+        if (skipOlderDup) {
+          totalTitlesSkipped++;
+          continue;
         }
 
         // Kiểm tra xem title này đã tồn tại trong DB chưa
@@ -336,13 +360,24 @@ async function main() {
           const existingStreams = streamRes.rows || [];
           const existingFids = new Set(existingStreams.map((r) => r.file_id));
 
-          const newVideos = apiVideos.filter((v) => {
+          const validFids = new Set();
+          const newVideos = [];
+          for (const v of apiVideos) {
             const fid = fileNameFrom(v.file_url);
-            return fid && !existingFids.has(fid);
-          });
+            if (!fid) continue;
+            validFids.add(fid);
+            if (!existingFids.has(fid)) {
+              newVideos.push(v);
+              existingFids.add(fid);
+            }
+          }
 
-          // SMART SKIP: Nếu phim đã có trong DB, có stream, không có stream mới, không đổi loại, và không có merge trùng lặp
-          if (!FORCE && existingTitle && !typeChanged && existingStreams.length > 0 && newVideos.length === 0 && !hadMerge) {
+          const staleIds = (!typeChanged && !FORCE && validFids.size > 0)
+            ? existingStreams.filter((r) => !r.file_id || !validFids.has(r.file_id)).map((r) => r.id)
+            : [];
+
+          // SMART SKIP: Nếu phim đã có trong DB, có stream, không có stream mới, không có stream rác, không đổi loại, và không có merge trùng lặp
+          if (!FORCE && existingTitle && !typeChanged && existingStreams.length > 0 && newVideos.length === 0 && staleIds.length === 0 && !hadMerge) {
             console.log(`  [Phim lẻ] [${vId}] ${d.title}: Đã có sẵn (${existingStreams.length} stream, không đổi, bỏ qua).`);
             totalTitlesSkipped++;
             continue;
@@ -407,26 +442,34 @@ async function main() {
               totalStreamsInserted++;
             }
             console.log(`  [Phim lẻ] [${vId}] ${d.title}: +${apiVideos.length} stream mới.`);
-          } else if (newVideos.length > 0) {
-            // Phim cũ có thêm stream mới: chỉ chèn stream mới
-            for (const v of newVideos) {
-              const fid = fileNameFrom(v.file_url);
-              if (!fid) continue;
-              await collector.add({
-                sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                args: [
-                  vId, 1, 1, fid,
-                  cleanText(v.label),
-                  cleanText(v.file_type),
-                  cleanText(d.video_quality),
-                  Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
-                  Date.now(),
-                ],
-              });
-              totalStreamsInserted++;
+          } else {
+            if (staleIds.length > 0) {
+              for (const sId of staleIds) {
+                await collector.add({ sql: "DELETE FROM episodes_streams WHERE id = ?", args: [sId] });
+              }
+              console.log(`  [Phim lẻ] [${vId}] ${d.title}: Đã dọn ${staleIds.length} stream cũ không còn trên API.`);
             }
-            console.log(`  [Phim lẻ] [${vId}] ${d.title}: +${newVideos.length} stream mới (đã có ${existingStreams.length} stream).`);
+            if (newVideos.length > 0) {
+              // Phim cũ có thêm stream mới: chỉ chèn stream mới
+              for (const v of newVideos) {
+                const fid = fileNameFrom(v.file_url);
+                if (!fid) continue;
+                await collector.add({
+                  sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  args: [
+                    vId, 1, 1, fid,
+                    cleanText(v.label),
+                    cleanText(v.file_type),
+                    cleanText(d.video_quality),
+                    Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
+                    Date.now(),
+                  ],
+                });
+                totalStreamsInserted++;
+              }
+              console.log(`  [Phim lẻ] [${vId}] ${d.title}: +${newVideos.length} stream mới (hiện giữ ${existingStreams.length - staleIds.length + newVideos.length} stream).`);
+            }
           }
 
         } else if (cat.type === "series") {
@@ -563,6 +606,7 @@ async function main() {
           }
           console.log(`  [Phim bộ] [${vId}] ${d.title}: +${pendingEpisodes.length} tập/stream mới.`);
         }
+        if (hadMerge) await collector.flush();
       }
     }
   }

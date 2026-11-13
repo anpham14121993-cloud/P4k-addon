@@ -1,9 +1,7 @@
 name: sync-realtime
 
 on:
-  schedule:
-    # Chạy mỗi 30 phút một lần
-    - cron: '*/30 * * * *'
+  # Lịch chạy 30 phút/lần do Cloudflare Worker Cron Trigger dispatch (tránh chạy trùng GitHub schedule).
   workflow_dispatch:
     inputs:
       pages:
