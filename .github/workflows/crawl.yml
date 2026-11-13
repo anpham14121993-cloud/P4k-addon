@@ -7,6 +7,9 @@ on:
       budget:
         description: "Giây chạy tối đa"
         default: "3600"
+      feed_pages:
+        description: "Số trang feed HF quét đầu run"
+        default: "10"
 
 concurrency:
   group: p4k-db-job
@@ -48,7 +51,7 @@ jobs:
           P4K_TURSO: "1"
           P4K_GAP: "200"
           P4K_FEED_TOP: "1"
-          P4K_FEED_PAGES: "10"
+          P4K_FEED_PAGES: ${{ github.event.inputs.feed_pages || '10' }}
           P4K_POLL_MS: "180000"
           P4K_POLL_PAGES: "1"
           P4K_POLL_UNTIL: "1800"
