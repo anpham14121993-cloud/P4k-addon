@@ -226,8 +226,16 @@ let feedCursor = FEED_TOP ? null : (await metaGet(db, "feed_cursor")) || null;
 let feedPages = 0, feedSeen = 0, feedEnq = 0, feedShape = 0, feedStyle = 0, feedAtEnd = false;
 let feedPageCap = FEED_MAX_PAGES, feedPolling = false, feedPollN = 0, feedPagesAll = 0;
 // Chẩn đoán feed: đếm item trùng trong cùng run + mốc lastModified mỗi trang và của cursor.
-let feedDup = 0, feedCurLt = "-", feedNoLink = 0, feedNoLinkStreak = 0;
+let feedDup = 0, feedCurLt = "-", feedNoLink = 0, feedNoLinkStreak = 0, feedProbed = 0;
 const feedIds = new Set();
+const AI_TAG_RE = /^(?:task_categories|language|license|library|size_categories|format|modality|arxiv):/;
+const AI_SLUG_RE = /(?:^|-)(?:ai|ml|dl|llm|gpt|rag|nlp|bench|benchmark|eval|dataset|datasets|model|models|corpus|results|runs|notes|status|logs|backup|train|pretrain|sft|dpo|rlhf|test|data|code|docs)(?:-|$)/;
+async function probeDatasetForId(id) {
+  feedProbed++;
+  const r = await req(`${base}/datasets/${id}/tree/main`, { timeout: 15000 });
+  if (!r.ok || !Array.isArray(r.data)) return false;
+  return r.data.some((f) => f.type === "file" && isId(f.path));
+}
 const accCache = P.accCache || new Map();
 async function accOf(u) {
   if (!accCache.has(u)) accCache.set(u, (await getAccount(db, u)) || null);
@@ -265,9 +273,20 @@ async function feedOne() {
     if (feedIds.has(id)) { feedDup++; continue; } // trùng trong run: đã xử lý rồi, khỏi đọc DB lại
     feedIds.add(id);
     if (isInvalidFarmName(author)) { feedStyle++; continue; }
+    const rbase = id.split("/").slice(1).join("/");
     const isSelf = id === author + "/" + author;
     const pureLower = isPureLowerFarm(author);
-    if (!isFarmStrict(author) && !(pureLower && isSelf)) continue;
+    const hasAiTags = Array.isArray(x.tags) && x.tags.some((t) => AI_TAG_RE.test(t));
+    const oneWord = /^[a-z]{3,20}$/.test(rbase);
+    const hyphenLower = /^[a-z]+(-[a-z]+){1,6}$/.test(rbase);
+    const probePure = pureLower && !isSelf && !hasAiTags && (oneWord || hyphenLower) && !AI_SLUG_RE.test(rbase);
+    const probeTwoDig = /^[a-z]{4,20}\d{2}$/.test(author) && isSelf && !hasAiTags;
+    let probedOk = false;
+    if (!isFarmStrict(author) && !(pureLower && isSelf)) {
+      if (!(probePure || probeTwoDig)) continue;
+      probedOk = await probeDatasetForId(id);
+      if (!probedOk) { feedShape++; continue; }
+    }
     let acc = await accOf(author);
     if (acc?.junk) {
       await clearJunk(db, author);
@@ -277,14 +296,12 @@ async function feedOne() {
     const hasId = !!(acc && acc.has_id);
     if (/^[A-Z]/.test(author) && !hasId) { feedStyle++; continue; }
     if (acc && acc.nrepo >= 20 && !hasId) { feedStyle++; continue; }
-    const rbase = id.split("/").slice(1).join("/");
     const lowerNum = /^[a-z]{2,}[0-9]{1,7}$/.test(author);
-    const oneWord = /^[a-z]{3,20}$/.test(rbase);
     const capWord = /^[A-Za-z]{3,20}$/.test(rbase);
     // Account đã có phim (hasId): chấp nhận mọi repo của account đó
     // (kể cả tên chứa số/dấu '-'/'_'/generic) để không sót phim.
     const hyphenWord = rbase.includes("-") && /^[A-Za-z0-9-]{3,30}$/.test(rbase);
-    const take = isSelf || hasId || (oneWord && lowerNum) || (capWord && lowerNum) || (hasId && hyphenWord);
+    const take = isSelf || hasId || probedOk || (oneWord && lowerNum) || (capWord && lowerNum) || (hasId && hyphenWord);
     if (!take) { feedShape++; continue; }
     if (!acc) { // account đã có trong DB thì INSERT OR IGNORE là thừa (1 lượt đọc PK)
       if (await insertAccount(db, author)) pending.inv++; // account mới = đến hạn quét ngay
@@ -643,7 +660,7 @@ try { await Promise.allSettled(workers); } catch (e) { log("AUTO FATAL " + (e &&
 clearInterval(timer);
 try { await flushTouches(db); } catch { }
 log(`AUTO done feed pages=${feedPagesAll} enq=${feedEnq} poll=${feedPollN} | inv done=${invDone} ok=${invOk} skip=${invSkip} fail=${invFail} enq=${invEnq} | index n=${idxN} inc=${idxInc} wfiles=${wFiles} stale_left=${staleBacklog} | bkt done=${bktDone} sweeps=${bktSweeps} enq=${bktEnq} err=${bktErr} 404=${bkt404} | ${stat()}`);
-log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPagesAll, feed_poll: feedPollN, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, bkt_done: bktDone, bkt_sweeps: bktSweeps, bkt_enq: bktEnq, bkt_err: bktErr, bkt_404: bkt404, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
+log(`AUTO SUMMARY ${JSON.stringify({ elapsed: Math.round((Date.now() - START) / 1000), feed_pages: feedPagesAll, feed_poll: feedPollN, feed_seen: feedSeen, feed_dup: feedDup, feed_nolink: feedNoLink, feed_cursor_lt: feedCurLt, feed_probed: feedProbed, feed_enq: feedEnq, inv_done: invDone, inv_ok: invOk, inv_skip: invSkip, inv_fail: invFail, inv_enq: invEnq, bkt_done: bktDone, bkt_sweeps: bktSweeps, bkt_enq: bktEnq, bkt_err: bktErr, bkt_404: bkt404, index_n: idxN, index_inc: idxInc, wfiles: wFiles, write_cap: WRITE_CAP, req: lanes.reduce((a, t) => a + t.req, 0), n429: lanes.reduce((a, t) => a + t.n429, 0), errors: lanes.reduce((a, t) => a + t.err, 0) })}`);
 // STATUS chỉ để theo dõi; GROUP BY state quét covering index toàn bộ repos
 // (~242k dòng read mỗi lần — chiếm ~94% reads/run). Cache 6h trong meta: các
 // run sau chỉ đọc 1 dòng thay vì quét cả bảng, số liệu lệch tối đa 6h.
