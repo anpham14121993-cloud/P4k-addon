@@ -10,7 +10,7 @@
 const P = await import(process.env.P4K_TURSO === "1" ? "./pdb-turso.mjs" : "./pdb.mjs");
 const {
   openDB, ensureSchema, metaGet, metaSet, storeTree, finishRepo, touchRepo, unclaimRepo, reevalAccount,
-  upsertRepoMeta, claimRepo, recoverStale, isFarm, isFarmStrict, isId, log, repoCounts,
+  upsertRepoMeta, claimRepo, recoverStale, isFarm, isFarmStrict, isInvalidFarmName, isPureLowerFarm, isId, log, repoCounts,
   applyGitDiff, accountScore, getAccount, insertAccount, setScanned, pendingAccounts, countPending,
   countNew, stateCounts, getRepoPrev, pendingAccountsAdaptive, countPendingAdaptive,
   claimRepoStale, clearJunk, markJunk, countStale, countStaleHasId, countStaleNoId, flushTouches, releaseStale, resetStaleQueue,
@@ -264,7 +264,10 @@ async function feedOne() {
     const id = String(x.id), author = id.split("/")[0];
     if (feedIds.has(id)) { feedDup++; continue; } // trùng trong run: đã xử lý rồi, khỏi đọc DB lại
     feedIds.add(id);
-    if (!isFarmStrict(author)) continue;
+    if (isInvalidFarmName(author)) { feedStyle++; continue; }
+    const isSelf = id === author + "/" + author;
+    const pureLower = isPureLowerFarm(author);
+    if (!isFarmStrict(author) && !(pureLower && isSelf)) continue;
     let acc = await accOf(author);
     if (acc?.junk) {
       await clearJunk(db, author);
@@ -275,12 +278,9 @@ async function feedOne() {
     if (/^[A-Z]/.test(author) && !hasId) { feedStyle++; continue; }
     if (acc && acc.nrepo >= 20 && !hasId) { feedStyle++; continue; }
     const rbase = id.split("/").slice(1).join("/");
-    const isSelf = id === author + "/" + author;
     const lowerNum = /^[a-z]{2,}[0-9]{1,7}$/.test(author);
     const oneWord = /^[a-z]{3,20}$/.test(rbase);
     const capWord = /^[A-Za-z]{3,20}$/.test(rbase);
-    // Account đã có phim (hasId): chấp nhận mọi repo của account đó
-    // (kể cả tên chứa số/dấu '-'/'_'/generic) để không sót phim.
     // Account đã có phim (hasId): chấp nhận mọi repo của account đó
     // (kể cả tên chứa số/dấu '-'/'_'/generic) để không sót phim.
     const hyphenWord = rbase.includes("-") && /^[A-Za-z0-9-]{3,30}$/.test(rbase);
@@ -354,6 +354,11 @@ async function refreshInv() {
 }
 async function invOne(a) {
   const u = a.username;
+  if (isInvalidFarmName(u) || (!a.has_id && a.nrepo >= 20)) {
+    await markJunk(db, u); accCache.delete(u);
+    if (pending.inv > 0) pending.inv--;
+    invSkip++; return;
+  }
   // Account junk (hiếm khi tới vì TTL ~1 năm): mở lại để quét, reevalAccount sẽ dán junk lại nếu vẫn rác.
   if (a.junk) { await clearJunk(db, u); accCache.delete(u); }
   // Lấy overview + 2 listing song song; overview dùng để đối chiếu số bucket/dataset thực tế.
@@ -416,6 +421,7 @@ async function ensureBkt() {
   return bktLoaded;
 }
 async function bktOne(u) {
+  if (isInvalidFarmName(u)) return;
   const r = await req(`${base}/buckets/${encodeURIComponent(u)}`);
   bktDone++;
   if (!Array.isArray(r.data)) {
@@ -424,7 +430,7 @@ async function bktOne(u) {
   }
   for (const b of r.data) {
     const id = String(b.id || ""), au = id.split("/")[0];
-    if (!id || (au !== u && !isFarm(au))) continue;
+    if (!id || isInvalidFarmName(au) || (au !== u && !isFarm(au))) continue;
     if (await upsertRepoMeta(db, id, u, "bucket", b.updatedAt)) bktEnq++;
   }
 }

@@ -24,10 +24,26 @@ const dueAt = (hasId, updated, key) => {
   const ttl = hasId ? REPO_TTL_HAS_MS : REPO_TTL_NOID_MS;
   return now + ttl - (h32(key) % JITTER_MS);
 };
-// isFarm (RỘNG): chữ+số (abc123), chữ+số+chữ (hoanglong2k5), chữ-only dài >=12 (nguyenthimaihuong).
-export const isFarm = (u) => { const s = String(u); return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s) || /^[a-z]{12,}$/i.test(s); };
+const AI_WORD_RE = /^(?:ai|ml|dl|rl|nlp|llm|gpt|rag|sota|lab|labs|bench|eval|model|models|dataset|datasets|agent|agents|neural|vision|audio|robot|robotics|research|studio|official)\d|\d(?:ai|ml|llm|gpt|labs?|bench|eval|model|models|dataset|datasets|agent|agents|neural|research|studio|official)$/;
+export const isInvalidFarmName = (u) => {
+  const s = String(u || "");
+  if (!/^[A-Za-z0-9]+$/.test(s)) return true;
+  if (/[A-Z]{2,}/.test(s)) return true;
+  return AI_WORD_RE.test(s.toLowerCase());
+};
+export const isPureLowerFarm = (u) => /^[a-z]{10,25}$/.test(String(u || ""));
+// isFarm (RỘNG): chữ+số (abc123), chữ+số+chữ (hoanglong2k5), chữ thường thuần >=10 (phanthimyhanh).
+export const isFarm = (u) => {
+  const s = String(u || "");
+  if (isInvalidFarmName(s)) return false;
+  return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s) || isPureLowerFarm(s);
+};
 // isFarmStrict (cho feed quét toàn HF): BẮT BUỘC có số -> tránh kéo org/tên ML hợp lệ.
-export const isFarmStrict = (u) => { const s = String(u); return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s); };
+export const isFarmStrict = (u) => {
+  const s = String(u || "");
+  if (isInvalidFarmName(s)) return false;
+  return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s);
+};
 
 // ---------- chấm điểm ưu tiên (dựa mẫu đo trên DB: bucket/self-repo của account lowercase+digits) ----------
 const LOW_NUM = /^[a-z]{2,}[0-9]{1,7}$/;

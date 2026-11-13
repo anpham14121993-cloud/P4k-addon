@@ -23,8 +23,24 @@ const dueAt = (hasId, updated, key) => {
   const ttl = hasId ? REPO_TTL_HAS_MS : REPO_TTL_NOID_MS;
   return now + ttl - (h32(key) % JITTER_MS);
 };
-export const isFarm = (u) => { const s = String(u); return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s) || /^[a-z]{12,}$/i.test(s); };
-export const isFarmStrict = (u) => { const s = String(u); return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s); };
+const AI_WORD_RE = /^(?:ai|ml|dl|rl|nlp|llm|gpt|rag|sota|lab|labs|bench|eval|model|models|dataset|datasets|agent|agents|neural|vision|audio|robot|robotics|research|studio|official)\d|\d(?:ai|ml|llm|gpt|labs?|bench|eval|model|models|dataset|datasets|agent|agents|neural|research|studio|official)$/;
+export const isInvalidFarmName = (u) => {
+  const s = String(u || "");
+  if (!/^[A-Za-z0-9]+$/.test(s)) return true; // loai dau "-", "_", "."
+  if (/[A-Z]{2,}/.test(s)) return true; // loai ten viet tat / IN HOA AI/org
+  return AI_WORD_RE.test(s.toLowerCase());
+};
+export const isPureLowerFarm = (u) => /^[a-z]{10,25}$/.test(String(u || ""));
+export const isFarm = (u) => {
+  const s = String(u || "");
+  if (isInvalidFarmName(s)) return false;
+  return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s) || isPureLowerFarm(s);
+};
+export const isFarmStrict = (u) => {
+  const s = String(u || "");
+  if (isInvalidFarmName(s)) return false;
+  return /^[a-z]+\d{3,10}$/i.test(s) || /^[a-z]+\d{1,4}[a-z]+\d{0,4}$/i.test(s);
+};
 const LOW_NUM = /^[a-z]{2,}[0-9]{1,7}$/;
 export function accountScore(u, a = {}) {
   let s = 0;
