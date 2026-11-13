@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       pages:
-        description: "Số trang quét (mặc định 2)"
-        default: "2"
+        description: "Số trang quét (mặc định 5)"
+        default: "5"
         required: false
 
 concurrency:
@@ -31,7 +31,7 @@ jobs:
           TURSO_TIMEOUT: "90000"
           TURSO_MAX_CONCURRENT: "2"
         run: |
-          PAGES="${{ github.event.inputs.pages || '2' }}"
+          PAGES="${{ github.event.inputs.pages || '5' }}"
           node sync-realtime.mjs --pages "$PAGES" --delay 250 2>&1 | tee sync.log
       - name: Báo cáo kết quả
         if: always()
