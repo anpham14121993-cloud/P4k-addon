@@ -236,7 +236,8 @@ export function isId(name) {
   const b = String(name || "").split("/").pop();
   const m = b.match(/\.[^.]+$/);
   if (!m || !PHIM_EXT.has(m[0].toLowerCase())) return false;
-  return IDF.test(b.slice(0, b.length - m[0].length)) && !IS_TIMESTAMP.test(b.slice(0, b.length - m[0].length));
+  const base = b.slice(0, b.length - m[0].length);
+  return IDF.test(base) && !/^\d+$/.test(base) && !IS_TIMESTAMP.test(base);
 }
 // Tách đuôi + id của basename (ok = id khớp IDF, BẤT KỂ đuôi) — để ghi nhận đuôi lạ.
 export function idParts(name) {
@@ -244,7 +245,7 @@ export function idParts(name) {
   const m = bn.match(/\.[^.]+$/);
   const ext = m ? m[0].toLowerCase() : "(no-ext)";
   const base = m ? bn.slice(0, bn.length - m[0].length) : bn;
-  return { ext, base, ok: IDF.test(base) && !IS_TIMESTAMP.test(base) };
+  return { ext, base, ok: IDF.test(base) && !/^\d+$/.test(base) && !IS_TIMESTAMP.test(base) };
 }
 // Ghi nhận thống kê đuôi (MỌI đuôi, kể cả chưa whitelist) — để phát hiện đuôi phim MỚI.
 // farm_n = số file đuôi này nằm trong repo CÓ đuôi phim hợp lệ (dấu hiệu farm thật).

@@ -81,14 +81,14 @@ export function isId(name) {
   const m = b.match(/\.[^.]+$/);
   if (!m || !PHIM_EXT.has(m[0].toLowerCase())) return false;
   const base = b.slice(0, b.length - m[0].length);
-  return IDF.test(base) && !IS_TIMESTAMP.test(base);
+  return IDF.test(base) && !/^\d+$/.test(base) && !IS_TIMESTAMP.test(base);
 }
 export function idParts(name) {
   const bn = String(name || "").split("/").pop();
   const m = bn.match(/\.[^.]+$/);
   const ext = m ? m[0].toLowerCase() : "(no-ext)";
   const base = m ? bn.slice(0, bn.length - m[0].length) : bn;
-  return { ext, base, ok: IDF.test(base) && !IS_TIMESTAMP.test(base) };
+  return { ext, base, ok: IDF.test(base) && !/^\d+$/.test(base) && !IS_TIMESTAMP.test(base) };
 }
 
 // ---------- backend: Turso HTTP hoặc SQLite local (test) ----------
