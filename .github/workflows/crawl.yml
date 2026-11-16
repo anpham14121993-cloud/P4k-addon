@@ -6,10 +6,10 @@ on:
     inputs:
       budget:
         description: "Giây chạy tối đa"
-        default: "3600"
+        default: "3200"
       feed_pages:
         description: "Số trang feed HF quét đầu run"
-        default: "10"
+        default: "25"
 
 concurrency:
   group: p4k-db-job
@@ -51,10 +51,10 @@ jobs:
           P4K_TURSO: "1"
           P4K_GAP: "200"
           P4K_FEED_TOP: "1"
-          P4K_FEED_PAGES: ${{ github.event.inputs.feed_pages || '10' }}
+          P4K_FEED_PAGES: ${{ github.event.inputs.feed_pages || '25' }}
           P4K_POLL_MS: "180000"
           P4K_POLL_PAGES: "1"
-          P4K_POLL_UNTIL: "1800"
+          P4K_POLL_UNTIL: "3200"
           P4K_FEED_LIMIT: "1000"
           P4K_BKT: "1"
           P4K_BKT_WORKERS: "4"
@@ -68,7 +68,7 @@ jobs:
           TURSO_MAX_CONCURRENT: "2"
         run: |
           set -o pipefail
-          node auto.mjs "${{ github.event.inputs.budget || '3600' }}" 2>&1 | tee crawl.log
+          node auto.mjs "${{ github.event.inputs.budget || '3200' }}" 2>&1 | tee crawl.log
       - name: Summary
         if: always()
         run: |

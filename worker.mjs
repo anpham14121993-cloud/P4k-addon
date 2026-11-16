@@ -591,7 +591,7 @@ export default {
 
     // 1. Tuyến 1 (crawl): chạy mỗi giờ một lần (vào đầu giờ :00)
     if (min < 15) {
-      await dispatch("crawl.yml", { budget: "3600" });
+      await dispatch("crawl.yml", { budget: "3200", feed_pages: "25" });
     }
   },
 };
