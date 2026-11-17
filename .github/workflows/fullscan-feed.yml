@@ -1,0 +1,70 @@
+name: fullscan-feed
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: "Giây chạy tối đa (mặc định 18000 = 5 giờ)"
+        default: "18000"
+        required: false
+      resume:
+        description: "Chạy tiếp từ checkpoint lần trước thay vì từ trang 1"
+        type: boolean
+        default: false
+        required: false
+      recheck_dead:
+        description: "Kiểm tra lại repo state='dead' chưa index của account qua lọc"
+        type: boolean
+        default: true
+        required: false
+      bkt_extra:
+        description: "Quét bổ sung /api/buckets cho account junk=0 chưa gặp trong feed"
+        type: boolean
+        default: true
+        required: false
+      dry_run:
+        description: "Chỉ quét thử không ghi DB"
+        type: boolean
+        default: false
+        required: false
+
+concurrency:
+  group: p4k-db-job
+  cancel-in-progress: false
+
+jobs:
+  fullscan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Fullscan Feed + Account/Dataset/Bucket (5 HF Tokens)
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          P4K_TURSO: "1"
+          P4K_GAP: "160"
+          P4K_ACC_WORKERS: "6"
+          P4K_PROBE_CONCURRENCY: "8"
+          P4K_FEED_LIMIT: "1000"
+          P4K_RESUME: ${{ github.event.inputs.resume || 'false' }}
+          P4K_RECHECK_DEAD: ${{ github.event.inputs.recheck_dead || 'true' }}
+          P4K_BKT_EXTRA: ${{ github.event.inputs.bkt_extra || 'true' }}
+          P4K_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          TURSO_TIMEOUT: "90000"
+          TURSO_MAX_CONCURRENT: "2"
+        run: |
+          set -o pipefail
+          node fullscan-feed.mjs "${{ github.event.inputs.budget || '18000' }}" 2>&1 | tee fullscan.log
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Kết quả Fullscan Feed -> DB" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          grep "FULLSCAN SUMMARY" fullscan.log | tail -1 >> "$GITHUB_STEP_SUMMARY" || tail -25 fullscan.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
