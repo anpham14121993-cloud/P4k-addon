@@ -94,7 +94,7 @@ const FALLBACK_CFG = {
   apiBase: "https://api.phim4k.space/rest-api/v130/",
   jsonBase: "https://api.phim4k.space/rest-api/v130/",
   cdnBase: "https://svpc.cryboiz.workers.dev",
-  cdnFallback: "",
+  cdnFallback: "https://svatv.cryboiz.workers.dev",
   apiKey: "bbbb411dea44849",
   tmdbKey: "",
   prefer: [],
@@ -252,24 +252,6 @@ function safeDecode(s) {
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 function safeHostname(u) { try { return new URL(u).hostname; } catch { return "?"; } }
-
-// Trả về giá trị đầu tiên "thật" (non-null) trong tập promise đang chạy song song.
-// budgetMs = null thì đợi hết; có ngân sách thì hết hạn trả null (không hủy promise).
-function firstNonNull(promises, budgetMs) {
-  return new Promise((resolve) => {
-    if (!promises.length) { resolve(null); return; }
-    let pending = promises.length;
-    const timer = budgetMs != null ? setTimeout(() => resolve(null), budgetMs) : null;
-    for (const p of promises) {
-      Promise.resolve(p).then((v) => {
-        if (v) { if (timer) clearTimeout(timer); resolve(v); }
-        else if (--pending === 0) { if (timer) clearTimeout(timer); resolve(null); }
-      }, () => {
-        if (--pending === 0) { if (timer) clearTimeout(timer); resolve(null); }
-      });
-    }
-  });
-}
 
 async function fetchWithTimeout(url, init = {}, ms = UPSTREAM_TIMEOUT_MS) {
   const ctrl = new AbortController();
@@ -476,8 +458,13 @@ function secretForResolver(host) {
 function resolverList(cfg, egress = false) {
   const list = [];
   const push = (u) => { const v = String(u || "").replace(/\/$/, ""); if (v && list.indexOf(v) < 0) list.push(v); };
-  push((cfg && cfg.cdnBase) || FALLBACK_CFG.cdnBase);
-  push(cfg && cfg.cdnFallback);
+  const base = (cfg && cfg.cdnBase) || FALLBACK_CFG.cdnBase;
+  const fb = (cfg && cfg.cdnFallback) || FALLBACK_CFG.cdnFallback;
+  if (/\/\/svatv\./i.test(base)) {
+    push(FALLBACK_CFG.cdnBase);
+  }
+  push(base);
+  push(fb);
   if (!egress) {
     for (const host of Object.keys(HMAC_SECRETS)) push("https://" + host);
   }
@@ -616,12 +603,13 @@ async function resolveOnce(fileName, cfg, opts = {}) {
   const attemptDirect = async (host) => {
     try {
       const secret = secretForResolver(host);
+      if (!secret) return null;
       const signed = await genVideoUrl(fileName, host, secret);
       const res = await fetchWithTimeout(signed,
-        { headers: { Accept: "application/json" } }, RESOLVE_TIMEOUT_MS);
+        { headers: { Accept: "application/json" } }, DIRECT_RESOLVE_BUDGET_MS);
       if (res.status === 503) {
         // 503 = chữ ký HỢP LỆ nhưng upstream stream-domain đang chết
-        // (STREAM_DOMAIN_UNAVAILABLE) → không đứng chờ, để giai đoạn egress lo.
+        // (STREAM_DOMAIN_UNAVAILABLE) → không đứng chờ, chuyển sang resolver dự phòng / egress.
         discardResponse(res);
         return null;
       }
@@ -638,23 +626,22 @@ async function resolveOnce(fileName, cfg, opts = {}) {
     } catch { return null; }
   };
 
-  // Trực tiếp: chạy TOÀN BỘ resolver của config CÙNG LÚC, lấy vé hợp lệ đầu tiên.
-  // Trước đây tuần tự nên độ trễ = TỔNG timeout các resolver; giờ ≈ 1 request.
-  // Ngân sách 2.5s: pool SỐNG thì trả ngay, pool chết thì 503 rơi nhanh,
-  // resolver câm/treo thì không kéo dài mà chuyển sang egress luôn.
-  const recentlyDead = Date.now() - poolDeadMs < POOL_DEAD_WINDOW_MS;
   // "Đổi IP luôn từ đầu": bật ?emint=1 (hoặc EGRESS_ALWAYS, hoặc vừa dính 503
   // trong cửa sổ gần đây) → bỏ hẳn giai đoạn trực tiếp, mint egress ngay.
+  const recentlyDead = Date.now() - poolDeadMs < POOL_DEAD_WINDOW_MS;
   if (opts.emint || EGRESS_ALWAYS || recentlyDead) {
     return resolveViaEgress(fileName, cfg);
   }
-  const direct = (resolvers.length ? resolvers : [EGRESS_HOST]).map(attemptDirect);
-  const found = await firstNonNull(direct, DIRECT_RESOLVE_BUDGET_MS);
-  if (found) { poolDeadMs = 0; return found; }
+
+  // Tuần tự theo thứ tự ưu tiên: mặc định gọi svpc (chính) trước; chỉ khi lỗi mới sang svatv (dự phòng).
+  const directHosts = resolvers.length ? resolvers : ["https://" + EGRESS_HOST];
+  for (const host of directHosts) {
+    const found = await attemptDirect(host);
+    if (found) { poolDeadMs = 0; return found; }
+  }
   poolDeadMs = poolDeadMs || Date.now();
 
-  // Resolver 503 theo egress (VD: IP VN-FPT bị chối, egress quốc tế mint vé OK):
-  // sang giai đoạn egress mint qua proxy đổi IP.
+  // Cả resolver chính và dự phòng gọi trực tiếp đều thất bại → chuyển qua cf-relay.
   return resolveViaEgress(fileName, cfg);
 }
 
