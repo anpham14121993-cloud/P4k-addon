@@ -124,15 +124,16 @@ let HMAC_SECRET = "";
 // allorigins/codetabs/allorigins2/webcors chết, whateverorigin 500, corsproxy 401,
 // cors.lol 429 — CHỈ r.jina còn mint được. Các mirror chết vừa tốn request vừa
 // giữ subrequest slot (gây "stalled response" / giảm tốc), nên bỏ khỏi danh sách.
-const DEFAULT_RELAY_URL = "https://p4k-relay.vercel.app/api/relay";
+const DEFAULT_RELAY_URL = "https://p4k-relay.notthingp.workers.dev/api/relay";
 const DEFAULT_RELAY_KEY = "p4k_sec_7a9f82d1e0b5c439";
 
 let EGRESS_MIRRORS = [
   {
-    name: "relay",
+    name: "cf-relay",
     wrap: (u) => DEFAULT_RELAY_URL + "?url=" + encodeURIComponent(u),
     ms: 6000,
     headers: { Accept: "application/json", "x-relay-key": DEFAULT_RELAY_KEY },
+    service: null,
   },
 ];
 // Ghi chú (tạm giữ cấu hình cũ nếu cần bật lại một mirror khác):
@@ -164,16 +165,31 @@ function applySecrets(env) {
   HMAC_SECRET = HMAC_SECRETS["svatv.cryboiz.workers.dev"] || HMAC_SECRETS["svpc.cryboiz.workers.dev"] || "";
   TMDB_API_KEY = env.TMDB_API_KEY || "";
 
-  const relayUrl = (env && env.VERCEL_RELAY_URL) || DEFAULT_RELAY_URL;
-  const relayKey = (env && env.VERCEL_RELAY_KEY) || DEFAULT_RELAY_KEY;
+  const relayUrl = (env && env.CF_RELAY_URL) || DEFAULT_RELAY_URL;
+  const relayKey = (env && (env.CF_RELAY_KEY || env.VERCEL_RELAY_KEY)) || DEFAULT_RELAY_KEY;
+  const relayBinding = env && env.RELAY_WORKER && typeof env.RELAY_WORKER.fetch === "function"
+    ? env.RELAY_WORKER
+    : null;
   EGRESS_MIRRORS = [
     {
-      name: "relay",
+      name: "cf-relay",
       wrap: (u) => (relayUrl.includes("?") ? relayUrl + "&url=" : relayUrl + "?url=") + encodeURIComponent(u),
       ms: 6000,
       headers: { Accept: "application/json", "x-relay-key": relayKey },
+      service: relayBinding,
     },
   ];
+  if (env && env.ENABLE_VERCEL_RELAY === "1" && env.VERCEL_RELAY_URL) {
+    const vUrl = env.VERCEL_RELAY_URL;
+    const vKey = env.VERCEL_RELAY_KEY || DEFAULT_RELAY_KEY;
+    EGRESS_MIRRORS.push({
+      name: "vercel-relay",
+      wrap: (u) => (vUrl.includes("?") ? vUrl + "&url=" : vUrl + "?url=") + encodeURIComponent(u),
+      ms: 6000,
+      headers: { Accept: "application/json", "x-relay-key": vKey },
+      service: null,
+    });
+  }
 }
 applySecrets(PROCESS_ENV);
 
@@ -669,6 +685,19 @@ async function resolveViaEgress(fileName, cfg) {
     return await resolveViaEgressInner(fileName, cfg);
   } finally { egressRelease(); }
 }
+async function fetchMirror(mirror, targetUrl, timeoutMs) {
+  const reqUrl = mirror.wrap(targetUrl);
+  const init = { headers: { Accept: "application/json", ...(mirror.headers || {}) } };
+  const ms = timeoutMs || mirror.ms || 6000;
+  if (mirror.service && typeof mirror.service.fetch === "function") {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try { return await mirror.service.fetch(reqUrl, { ...init, signal: ctrl.signal }); }
+    finally { clearTimeout(timer); }
+  }
+  return fetchWithTimeout(reqUrl, init, ms);
+}
+
 async function resolveViaEgressInner(fileName, cfg) {
   let hosts = resolverList(cfg, true);
   if (!hosts.length) hosts = [EGRESS_HOST];
@@ -679,8 +708,7 @@ async function resolveViaEgressInner(fileName, cfg) {
     const tasks = EGRESS_MIRRORS.map((m) => (async () => {
       const signed = await genVideoUrl(fileName, host, secret);
       try {
-        const res = await fetchWithTimeout(m.wrap(signed),
-          { headers: { Accept: "application/json", ...(m.headers || {}) } }, m.ms);
+        const res = await fetchMirror(m, signed, m.ms);
         if (!res.ok) { discardResponse(res); return { name: m.name, status: "HTTP" + res.status }; }
         const minted = extractMint(await res.text(), host);
         if (minted) return { url: minted.url, expiresIn: minted.expires_in, host: "egress/" + hostName(host) };
@@ -2017,8 +2045,7 @@ function buildManifest() {
 async function diagProbe(mirror, target) {
   const t0 = Date.now();
   try {
-    const res = await fetchWithTimeout(mirror.wrap(target),
-      { headers: { Accept: "application/json", ...(mirror.headers || {}) } }, 6000);
+    const res = await fetchMirror(mirror, target, 6000);
     discardResponse(res); // chỉ cần status, không đọc body
     return { status: res.status, ms: Date.now() - t0 };
   } catch (e) { return { status: "ERR", ms: Date.now() - t0, err: String(e.message || e.name || e).slice(0, 80) }; }
@@ -2027,10 +2054,9 @@ async function diagMint(fileName, mirror, host, secret) {
   const t0 = Date.now();
   try {
     const signed = await genVideoUrl(fileName, host, secret);
-    const res = await fetchWithTimeout(mirror.wrap(signed),
-      { headers: { Accept: "application/json", ...(mirror.headers || {}) } }, 8000);
-    if (!res.ok) { discardResponse(res); return { status: res.status, ms: Date.now() - t0, mint: false }; }
+    const res = await fetchMirror(mirror, signed, 8000);
     const txt = await res.text().catch(() => "");
+    if (!res.ok) { return { status: res.status, ms: Date.now() - t0, mint: false, raw: txt.slice(0, 150) }; }
     const minted = extractMint(txt, host);
     const node = minted ? safeHostname(minted.url) : null;
     return { status: res.status, ms: Date.now() - t0, mint: !!minted, node, raw: txt.slice(0, 150) };
@@ -2040,7 +2066,7 @@ async function diagAll(request) {
   const reqUrl = new URL(request.url);
   const out = { colo: null, ip: null, config: null, direct: null, mirrors: [], mint: [] };
   const ray = request.headers.get("cf-ray") || "";
-  out.colo = ray.slice(0, ray.indexOf("-")) || null;
+  out.colo = (request.cf && request.cf.colo) || (ray.includes("-") ? ray.slice(ray.indexOf("-") + 1) : null) || null;
   const ip = (request.headers.get("cf-connecting-ip") || "").split(".");
   out.ip = ip.length === 4 ? ip[0] + "." + ip[1] + ".*.*" : (ip[0] || "") + ":*";
   try {
