@@ -862,9 +862,28 @@ async function mapLimit(arr, limit, fn) {
 const FALLBACK_CONCURRENCY = 3;
 
 async function resolveMediaSet(items, cfg, opts = {}) {
-  // 1. Kiểm tra luồng từ DB (Hugging Face trực tiếp qua Worker XOR decoder)
-  const dbCandidates = []; // { item, vars }
+  const out = [];
 
+  // 1. Mặc định ưu tiên luồng CDN Dự Phòng (Railway) trước
+  if (items.length) {
+    const settled = await mapLimit(items, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
+    settled.forEach((r, idx) => {
+      if (!r || r.status !== "fulfilled" || !r.value) return;
+      const it = items[idx];
+      let title = it.label;
+      try { if (typeof title === "string") title = title + "\n📁 Dự Phòng (Railway - Tua Mượt)"; } catch {}
+      const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
+      attachSubtitles(stream, it);
+      out.push(stream);
+    });
+  }
+
+  if (out.length > 0) {
+    return out;
+  }
+
+  // 2. Dự phòng khi không có luồng Railway: tra DB Turso -> luồng Hugging Face qua Worker XOR decoder
+  const dbCandidates = []; // { item, vars }
   for (const it of items) {
     const id = fileNameFrom(it.fileUrl);
     const vars = id ? await dbVariants(id) : [];
@@ -889,9 +908,6 @@ async function resolveMediaSet(items, cfg, opts = {}) {
     }
   }
 
-  const out = [];
-
-  // Luồng Hugging Face (từ DB qua Worker): Siêu tốc, giải mã XOR 32-bit & tua mượt trực tiếp từ CDN
   for (const u of dbUnits) {
     let title = u.item.label;
     try {
@@ -906,27 +922,8 @@ async function resolveMediaSet(items, cfg, opts = {}) {
     out.push(stream);
   }
 
-  // YÊU CẦU: Luồng stream sẽ lấy từ DB, nếu DB KHÔNG CÓ mới lấy link dự phòng (Railway CDN)
-  if (out.length > 0) {
-    return out;
-  }
-
-  // 2. Dự phòng: Khi DB KHÔNG có bất kỳ luồng HF nào -> Gọi resolver CDN Dự Phòng (Railway)
-  if (items.length) {
-    const settled = await mapLimit(items, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
-    settled.forEach((r, idx) => {
-      if (!r || r.status !== "fulfilled" || !r.value) return;
-      const it = items[idx];
-      let title = it.label;
-      try { if (typeof title === "string") title = title + "\n📁 Dự Phòng (Railway - Tua Mượt)"; } catch {}
-      const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
-      attachSubtitles(stream, it);
-      out.push(stream);
-    });
-  }
-
   if (out.length) return out;
-  throw new HttpError(404, "không có luồng (DB miss & resolve thất bại)");
+  throw new HttpError(404, "không có luồng (resolve & DB miss)");
 }
 
 /* ═══════════════════════ 6. TMDB / ID MAPPING ═══════════════════════ */
@@ -1001,6 +998,7 @@ function catalogQuery(catalogId, page) {
     case "phim4k-otv-movies":
     case "phim4k-otv-movies-latest":
       return "latest_movies?limit=20&page=" + page;
+    case "phim4k-otv-series":
     case "phim4k-otv-series-latest":
       return "latest_tvseries?limit=20&page=" + page;
     case "phim4k-otv-top":
@@ -1678,6 +1676,24 @@ function buildStreamTitle(src) {
   return [l1, l2, l3, l4, l5].join("\n");
 }
 
+function mapCatalogItem(m, forceType, fromDb = false) {
+  const t = forceType || (fromDb
+    ? (m.type || (String(m.is_tvseries) === "1" ? "series" : "movie"))
+    : (String(m.is_tvseries) === "1" ? "series" : (m.type || "movie")));
+  return {
+    id: "otv:" + (fromDb ? m.id : (m.videos_id || m.id)),
+    type: t,
+    name: m.title || "",
+    poster: m.thumbnail_url || m.poster_url || "",
+    background: m.poster_url || m.thumbnail_url || "",
+    year: parseInt(fromDb ? m.release_year : (m.release || m.release_year), 10) || undefined,
+    releaseInfo: (fromDb ? m.quality : (m.video_quality || m.quality)) || undefined,
+    imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
+    description: (fromDb ? m.overview : (m.description || m.overview)) || undefined,
+    imdb_id: fromDb ? (m.imdb_id || undefined) : undefined,
+  };
+}
+
 async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
   let skip = null, query = null;
   if (params) {
@@ -1708,120 +1724,55 @@ async function handleCatalog(type, catalogId, extras, params, cfg, ms) {
   const page = Math.floor((skip || 0) / 20) + 1;
   const forceType = (catalogId === "phim4k-otv-series" || catalogId === "phim4k-otv-series-latest") ? "series" : null;
 
-  // 1. Riêng danh mục "phim4k-otv-top" (Bảng xếp hạng Top Lượt Xem):
-  // Lấy trực tiếp từ API gốc Phim4K theo số lượt xem thực tế (có Edge Cache 1 giờ).
-  // Nếu API gốc lỗi -> Tự động fallback sang Database.
-  if (catalogId === "phim4k-otv-top" && !query) {
-    const topCacheKey = "cat/top_views_v10/" + page;
-    const cachedTop = await cacheGetJSON(topCacheKey);
-    if (cachedTop && Array.isArray(cachedTop.metas) && cachedTop.metas.length > 0) {
-      return cachedTop;
-    }
-    try {
-      const data = await getJson("top_views?period=all&limit=20&page=" + page, cfg, ms);
-      const topList = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
-      if (topList.length > 0) {
-        const topResult = {
-          metas: topList.filter((m) => m && (m.videos_id || m.id)).map((m) => {
-            const t = forceType || (String(m.is_tvseries) === "1" ? "series" : (m.type || "movie"));
-            return {
-              id: "otv:" + (m.videos_id || m.id),
-              type: t,
-              name: m.title || "",
-              poster: m.thumbnail_url || m.poster_url || "",
-              background: m.poster_url || m.thumbnail_url || "",
-              year: parseInt(m.release || m.release_year, 10) || undefined,
-              releaseInfo: m.video_quality || m.quality || undefined,
-              imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
-              description: m.description || m.overview || undefined,
-            };
-          }),
-        };
-        await cachePutJSON(topCacheKey, topResult, 3600);
-        return topResult;
-      }
-    } catch (topErr) {
-      console.warn("Lỗi tải top_views từ API gốc, fallback sang DB:", topErr && topErr.message);
-    }
-  }
-
-  // 2. Phim lẻ & Phim bộ: Đọc 100% từ Database Turso / Oracle độc lập (ORDER BY updated_at DESC)
-  if (DB && typeof DB.getCatalog === "function") {
-    try {
-      let dbList = [];
-      if (query) {
-        dbList = await DB.search(query, type, 20);
-      } else {
-        dbList = await DB.getCatalog(catalogId, page, 20);
-      }
-      if (Array.isArray(dbList) && dbList.length > 0) {
-        return {
-          metas: dbList.map((m) => {
-            const t = forceType || m.type || (String(m.is_tvseries) === "1" ? "series" : "movie");
-            return {
-              id: "otv:" + m.id,
-              type: t,
-              name: m.title || "",
-              poster: m.thumbnail_url || m.poster_url || "",
-              background: m.poster_url || m.thumbnail_url || "",
-              year: parseInt(m.release_year, 10) || undefined,
-              releaseInfo: m.quality || undefined,
-              imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
-              description: m.overview || undefined,
-              imdb_id: m.imdb_id || undefined,
-            };
-          }),
-        };
-      } else if (!query) {
-        // Duyệt catalog theo trang: nếu DB đã hết trang -> trả về rỗng ngay (HTTP 200), không gọi upstream
-        return { metas: [] };
-      }
-    } catch (err) {
-      console.warn("DB catalog error:", err && err.message);
-    }
-  }
-
-  // 3. Fallback: Khi tìm kiếm (query) mà DB chưa có kết quả -> thử tìm thêm trên Phim4K
-  let list = [];
+  // 1. Mặc định lấy Catalog / Search trực tiếp từ API gốc Phim4K (có Edge Cache)
   if (query) {
     try {
-      list = await searchP4K(query, type, cfg, ms);
-    } catch {}
+      const list = await searchP4K(query, type, cfg, ms);
+      if (Array.isArray(list) && list.length > 0) {
+        return { metas: list.filter((m) => m && (m.videos_id || m.id)).map((m) => mapCatalogItem(m, forceType, false)) };
+      }
+    } catch (searchErr) {
+      console.warn("Lỗi tìm kiếm từ API gốc, fallback sang DB:", searchErr && searchErr.message);
+    }
   } else {
     const path = catalogQuery(catalogId, page);
     if (path) {
+      const catCacheKey = "cat/rt_v11/" + catalogId + "/" + page;
+      const ttl = catalogId === "phim4k-otv-top" ? 3600 : 600;
+      const cachedCat = await cacheGetJSON(catCacheKey);
+      if (cachedCat && Array.isArray(cachedCat.metas) && cachedCat.metas.length > 0) {
+        return cachedCat;
+      }
       try {
         const data = await getJson(path, cfg, ms);
-        list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
-      } catch {}
+        const list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
+        const metas = list.filter((m) => m && (m.videos_id || m.id)).map((m) => mapCatalogItem(m, forceType, false));
+        if (metas.length > 0) {
+          const result = { metas };
+          await cachePutJSON(catCacheKey, result, ttl);
+          return result;
+        }
+      } catch (catErr) {
+        console.warn("Lỗi tải catalog từ API gốc, fallback sang DB:", catErr && catErr.message);
+      }
     }
   }
 
-  if (!Array.isArray(list)) list = [];
-
-  const result = {
-    metas: list.filter((m) => m && (m.videos_id || m.id)).map((m) => {
-      const t = forceType || (String(m.is_tvseries) === "1" ? "series" : (m.type || "movie"));
-      return {
-        id: "otv:" + (m.videos_id || m.id),
-        type: t,
-        name: m.title || "",
-        poster: m.thumbnail_url || m.poster_url || "",
-        background: m.poster_url || m.thumbnail_url || "",
-        year: parseInt(m.release || m.release_year, 10) || undefined,
-        releaseInfo: m.video_quality || m.quality || undefined,
-        imdbRating: m.imdb_rating != null ? String(m.imdb_rating) : undefined,
-        description: m.description || m.overview || undefined,
-      };
-    }),
-  };
-
-  // Lưu cache cho topview nếu có kết quả từ upstream
-  if (catalogId === "phim4k-otv-top" && !query && result.metas.length > 0) {
-    await cachePutJSON("cat/top_views/" + page, result, 3600);
+  // 2. Dự phòng: Nếu API gốc lỗi hoặc trả rỗng -> Đọc từ Database Turso
+  if (DB && typeof DB.getCatalog === "function") {
+    try {
+      const dbList = query
+        ? await DB.search(query, type, 20)
+        : await DB.getCatalog(catalogId, page, 20);
+      if (Array.isArray(dbList) && dbList.length > 0) {
+        return { metas: dbList.map((m) => mapCatalogItem(m, forceType, true)) };
+      }
+    } catch (err) {
+      console.warn("DB catalog fallback error:", err && err.message);
+    }
   }
 
-  return result;
+  return { metas: [] };
 }
 
 async function handleMeta(type, id, cfg, ms) {
