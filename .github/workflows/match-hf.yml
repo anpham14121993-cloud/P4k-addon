@@ -20,6 +20,10 @@ on:
         description: "Loại phim: all | movie | series"
         default: "all"
         required: false
+      cooldown_hours:
+        description: "Số giờ chờ trước khi kiểm tra lại mã từng miss (mặc định 168 = 7 ngày)"
+        default: "168"
+        required: false
       dry_run:
         description: "Chỉ kiểm thử, không ghi DB (true/false)"
         default: "false"
@@ -56,6 +60,7 @@ jobs:
             --limit="${{ github.event.inputs.limit || '300' }}" \
             --budget="${{ github.event.inputs.budget || '1200' }}" \
             --concurrency="${{ github.event.inputs.concurrency || '3' }}" \
+            --cooldown-hours="${{ github.event.inputs.cooldown_hours || '168' }}" \
             $EXTRA_ARGS 2>&1 | tee match-hf.log
       - name: Báo cáo kết quả
         if: always()

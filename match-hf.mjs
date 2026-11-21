@@ -37,7 +37,7 @@ const rawLimit = parseInt(getArg("limit", "200"), 10);
 const LIMIT = Number.isFinite(rawLimit) ? Math.max(0, rawLimit) : 200;
 const BUDGET_MS = Math.max(30, parseInt(getArg("budget", "1200"), 10) || 1200) * 1000;
 const CONCURRENCY = Math.max(1, Math.min(6, parseInt(getArg("concurrency", "3"), 10) || 3));
-const COOLDOWN_MS = Math.max(1, parseInt(getArg("cooldown-hours", "24"), 10) || 24) * 3600 * 1000;
+const COOLDOWN_MS = Math.max(1, parseInt(getArg("cooldown-hours", "168"), 10) || 168) * 3600 * 1000;
 const DRY_RUN = hasFlag("dry-run");
 const TARGET_TYPE = (() => {
   const t = String(getArg("type", "all") || "all").toLowerCase();
@@ -236,6 +236,8 @@ async function main() {
          ${whereExtra.join("\n         ")}
        GROUP BY e.file_id
        ORDER BY
+         CASE WHEN MAX(e.hf_checked_at) IS NULL THEN 0 ELSE 1 END,
+         CASE WHEN MAX(e.hf_checked_at) IS NULL THEN 0 ELSE COALESCE(MIN(e.hf_checked_at), 0) END ASC,
          CASE WHEN length(e.file_id) = 12 THEN 0 ELSE 1 END,
          MIN(CASE WHEN t.type = 'movie' THEN 0 ELSE 1 END),
          MAX(e.created_at) DESC,
