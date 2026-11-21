@@ -11,8 +11,8 @@ service = "p4k-relay"
 [vars]
 HF_ENDPOINT = "https://huggingface.co"
 
-# Cloudflare Cron Triggers: chạy mỗi 30 phút.
-# - Vào :00: dispatch crawl (1h/lần) + sync-realtime (30m/lần)
-# - Vào :30: dispatch sync-realtime (30m/lần)
+# Cloudflare Cron Triggers:
+# - :00 và :30: dispatch sync-realtime (30m/lần) + crawl (:00 mỗi 1h)
+# - :10 và :40: dispatch match-hf (30m/lần, lùi sau sync-realtime 10 phút)
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["0,30 * * * *", "10,40 * * * *"]

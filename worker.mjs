@@ -584,21 +584,26 @@ export default {
       }
     }
 
-    // 0. Tuyến 0 (sync-realtime): chạy mỗi 30 phút một lần (quét 5 trang cập nhật + trang 1 ID mới)
-    await dispatch("sync-realtime.yml", { pages: "5" });
-
     const now = new Date(event && event.scheduledTime ? event.scheduledTime : Date.now());
     const min = now.getUTCMinutes();
     const hour = now.getUTCHours();
+    const cron = String((event && event.cron) || "");
+    const isMatchSlot = cron === "10,40 * * * *" || (!cron && ((min >= 5 && min < 25) || min >= 35));
+
+    // 2. Tuyến 2 (match-hf): chạy lúc :10 và :40 (sau sync-realtime 10 phút) để đối chiếu ngay phim/tập vừa nạp.
+    // Mặc định chỉ quét mã mới (hf_checked_at IS NULL); mỗi 6 giờ (:10 giờ % 6 === 0 UTC) quét lại thêm tối đa 300 mã miss quá 7 ngày.
+    if (isMatchSlot) {
+      const newOnly = (min < 25 && hour % 6 === 0) ? "false" : "true";
+      await dispatch("match-hf.yml", { limit: "300", budget: "1200", new_only: newOnly, dry_run: "false" });
+      return;
+    }
+
+    // 0. Tuyến 0 (sync-realtime): chạy mỗi 30 phút một lần vào :00 và :30 (quét 5 trang cập nhật + trang 1 ID mới)
+    await dispatch("sync-realtime.yml", { pages: "5" });
 
     // 1. Tuyến 1 (crawl): chạy mỗi giờ một lần (vào đầu giờ :00)
     if (min < 15) {
       await dispatch("crawl.yml", { budget: "3200", feed_pages: "25" });
-    }
-
-    // 2. Tuyến 2 (match-hf): chạy mỗi 2 giờ một lần vào phút :30 (tránh trùng giờ :00 với crawl)
-    if (min >= 15 && hour % 2 === 0) {
-      await dispatch("match-hf.yml", { limit: "300", budget: "1200", dry_run: "false" });
     }
   },
 };

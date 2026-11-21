@@ -39,6 +39,7 @@ const BUDGET_MS = Math.max(30, parseInt(getArg("budget", "1200"), 10) || 1200) *
 const CONCURRENCY = Math.max(1, Math.min(6, parseInt(getArg("concurrency", "3"), 10) || 3));
 const COOLDOWN_MS = Math.max(1, parseInt(getArg("cooldown-hours", "168"), 10) || 168) * 3600 * 1000;
 const DRY_RUN = hasFlag("dry-run");
+const NEW_ONLY = hasFlag("new-only");
 const TARGET_TYPE = (() => {
   const t = String(getArg("type", "all") || "all").toLowerCase();
   return t === "movie" || t === "series" ? t : "all";
@@ -201,7 +202,7 @@ async function verifyCandidate(railUrl, totalSize, cand) {
 async function main() {
   const t0 = Date.now();
   const deadline = t0 + BUDGET_MS;
-  console.log(`=== MATCH-HF START | type=${TARGET_TYPE} shard=${SHARD.index}/${SHARD.total} dryRun=${DRY_RUN} limit=${LIMIT} conc=${CONCURRENCY} budget=${Math.round(BUDGET_MS / 1000)}s cooldown=${COOLDOWN_MS / 3600000}h ===`);
+  console.log(`=== MATCH-HF START | type=${TARGET_TYPE} shard=${SHARD.index}/${SHARD.total} dryRun=${DRY_RUN} newOnly=${NEW_ONLY} limit=${LIMIT} conc=${CONCURRENCY} budget=${Math.round(BUDGET_MS / 1000)}s cooldown=${COOLDOWN_MS / 3600000}h ===`);
 
   if (!DRY_RUN) await ensureSchema();
 
@@ -212,7 +213,11 @@ async function main() {
     const cutoff = Date.now() - COOLDOWN_MS;
     const sqlLimit = LIMIT > 0 ? LIMIT : 50000;
     const whereExtra = [];
-    const params = [cutoff];
+    const params = [];
+    const checkedCond = NEW_ONLY
+      ? "e.hf_checked_at IS NULL"
+      : "(e.hf_checked_at IS NULL OR e.hf_checked_at < ?)";
+    if (!NEW_ONLY) params.push(cutoff);
     if (TARGET_TYPE !== "all") {
       whereExtra.push("AND t.type = ?");
       params.push(TARGET_TYPE);
@@ -229,7 +234,7 @@ async function main() {
        JOIN titles t ON t.id = e.title_id
        WHERE e.file_id != ''
          AND e.hf_id IS NULL
-         AND (e.hf_checked_at IS NULL OR e.hf_checked_at < ?)
+         AND ${checkedCond}
          AND NOT EXISTS (
            SELECT 1 FROM files f WHERE f.name >= e.file_id || '.' AND f.name < e.file_id || '/'
          )

@@ -1,7 +1,7 @@
 name: match-hf
 
 on:
-  # Lịch định kỳ 2 giờ/lần vào phút :30 do Cloudflare Worker Cron Trigger dispatch (tránh kẹt & bỏ nhịp GitHub schedule).
+  # Lịch chạy mỗi 30 phút vào :10 và :40 (sau sync-realtime 10 phút) do Cloudflare Worker Cron Trigger dispatch.
   workflow_dispatch:
     inputs:
       limit:
@@ -23,6 +23,10 @@ on:
       cooldown_hours:
         description: "Số giờ chờ trước khi kiểm tra lại mã từng miss (mặc định 168 = 7 ngày)"
         default: "168"
+        required: false
+      new_only:
+        description: "Chỉ đối chiếu mã mới chưa từng check (hf_checked_at IS NULL)"
+        default: "false"
         required: false
       dry_run:
         description: "Chỉ kiểm thử, không ghi DB (true/false)"
@@ -52,8 +56,11 @@ jobs:
         run: |
           set -o pipefail
           EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.new_only }}" == "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --new-only"
+          fi
           if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
-            EXTRA_ARGS="--dry-run"
+            EXTRA_ARGS="$EXTRA_ARGS --dry-run"
           fi
           node match-hf.mjs \
             --type="${{ github.event.inputs.type || 'all' }}" \
