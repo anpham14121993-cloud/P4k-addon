@@ -2064,7 +2064,7 @@ export const addon = {
     const segments = url.pathname.split("/").filter(Boolean);
 
     if (segments.length === 0 || segments[0] === "manifest.json") {
-      return json(buildManifest());
+      return json(buildManifest(), 200, { "Cache-Control": "no-store, no-cache, must-revalidate" });
     }
     if (segments[0] === "_diag") {
       return json(await diagAll(request));
