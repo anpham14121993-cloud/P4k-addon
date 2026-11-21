@@ -591,10 +591,11 @@ export default {
     const isMatchSlot = cron === "10,40 * * * *" || (!cron && ((min >= 5 && min < 25) || min >= 35));
 
     // 2. Tuyến 2 (match-hf): chạy lúc :10 và :40 (sau sync-realtime 10 phút) để đối chiếu ngay phim/tập vừa nạp.
-    // Mặc định chỉ quét mã mới (hf_checked_at IS NULL); mỗi 6 giờ (:10 giờ % 6 === 0 UTC) quét lại thêm tối đa 300 mã miss quá 7 ngày.
+    // Các lượt thường truyền hot_only="true" (quét mã mới + retry nhanh 2h/6h + bắt no_hf vừa có trong files).
+    // Mỗi 6 giờ (:10 giờ % 6 === 0 UTC) tắt hot_only để quét vét thêm mã miss lạnh (24h / 7 ngày).
     if (isMatchSlot) {
-      const newOnly = (min < 25 && hour % 6 === 0) ? "false" : "true";
-      await dispatch("match-hf.yml", { limit: "300", budget: "1200", new_only: newOnly, dry_run: "false" });
+      const hotOnly = (min < 25 && hour % 6 === 0) ? "false" : "true";
+      await dispatch("match-hf.yml", { limit: "300", budget: "1200", hot_only: hotOnly, new_only: "false", dry_run: "false" });
       return;
     }
 

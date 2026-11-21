@@ -40,6 +40,7 @@ const CONCURRENCY = Math.max(1, Math.min(6, parseInt(getArg("concurrency", "3"),
 const COOLDOWN_MS = Math.max(1, parseInt(getArg("cooldown-hours", "168"), 10) || 168) * 3600 * 1000;
 const DRY_RUN = hasFlag("dry-run");
 const NEW_ONLY = hasFlag("new-only");
+const HOT_ONLY = hasFlag("hot-only");
 const TARGET_TYPE = (() => {
   const t = String(getArg("type", "all") || "all").toLowerCase();
   return t === "movie" || t === "series" ? t : "all";
@@ -102,7 +103,11 @@ async function ensureSchema() {
   const cols = new Set((info.rows || []).map((r) => r.name));
   if (!cols.has("hf_id")) await db.exec("ALTER TABLE episodes_streams ADD COLUMN hf_id TEXT");
   if (!cols.has("hf_checked_at")) await db.exec("ALTER TABLE episodes_streams ADD COLUMN hf_checked_at INTEGER");
+  if (!cols.has("hf_status")) await db.exec("ALTER TABLE episodes_streams ADD COLUMN hf_status TEXT");
+  if (!cols.has("hf_fails")) await db.exec("ALTER TABLE episodes_streams ADD COLUMN hf_fails INTEGER");
+  if (!cols.has("rail_size")) await db.exec("ALTER TABLE episodes_streams ADD COLUMN rail_size INTEGER");
   await db.exec("CREATE INDEX IF NOT EXISTS idx_stream_hf ON episodes_streams(hf_id)");
+  await db.exec("CREATE INDEX IF NOT EXISTS idx_stream_rail_size ON episodes_streams(rail_size)");
   await db.exec("CREATE INDEX IF NOT EXISTS idx_files_size ON files(size)");
 }
 
@@ -199,34 +204,188 @@ async function verifyCandidate(railUrl, totalSize, cand) {
   return hfMid.subarray(0, railMid.buf.length).equals(railMid.buf);
 }
 
+function buildScopeFilters() {
+  const whereExtra = [];
+  const params = [];
+  if (TARGET_TYPE !== "all") {
+    whereExtra.push("AND t.type = ?");
+    params.push(TARGET_TYPE);
+  }
+  if (SHARD.total > 1) {
+    whereExtra.push("AND ((unicode(substr(e.file_id, 1, 1)) * 31 + unicode(substr(e.file_id, 2, 1)) * 17 + unicode(substr(e.file_id, length(e.file_id), 1))) % ?) = ?");
+    params.push(SHARD.total, SHARD.index);
+  }
+  return { whereExtra, params };
+}
+
+/** Ghi trạng thái đối chiếu của một file_id vào episodes_streams (giữ nhất quán backoff & rail_size). */
+async function markResult(fid, { status, hfId = null, railSize = null, now }) {
+  if (DRY_RUN) return;
+  if (status === "ok") {
+    await db.exec(
+      "UPDATE episodes_streams SET hf_id = ?, hf_status = 'ok', hf_fails = 0, rail_size = NULL, hf_checked_at = ? WHERE file_id = ?",
+      [hfId, now, fid]
+    );
+    return;
+  }
+  if (status === "no_hf") {
+    await db.exec(
+      "UPDATE episodes_streams SET hf_status = 'no_hf', hf_fails = 0, rail_size = ?, hf_checked_at = ? WHERE file_id = ?",
+      [railSize, now, fid]
+    );
+    return;
+  }
+  await db.exec(
+    "UPDATE episodes_streams SET hf_status = ?, hf_fails = COALESCE(hf_fails, CASE WHEN hf_checked_at IS NOT NULL THEN 4 ELSE 0 END) + 1, rail_size = COALESCE(?, rail_size), hf_checked_at = ? WHERE file_id = ?",
+    [status, railSize, now, fid]
+  );
+}
+
+/** Resolve Railway link sống và lấy tổng kích thước byte. */
+async function resolveLiveRailway(fid) {
+  const railUrls = await resolveRailwayUrls(fid);
+  if (!railUrls.length) return { resolveFailed: true, liveUrl: null, totalSize: 0, lastStatus: 0 };
+
+  let lastStatus = 0;
+  for (const u of railUrls) {
+    const probe = await fetchRailwayRange(u, 0, 32);
+    lastStatus = probe.status;
+    if (probe.ok && probe.totalSize > 1024) {
+      return { resolveFailed: false, liveUrl: u, totalSize: probe.totalSize, lastStatus };
+    }
+  }
+  return { resolveFailed: false, liveUrl: null, totalSize: 0, lastStatus };
+}
+
+/** Đối chiếu một file Railway đang sống với các ứng viên cùng dung lượng trong bảng files. */
+async function matchAgainstHf(fid, liveUrl, totalSize, now, stats, label) {
+  const hfRes = await db.exec(
+    "SELECT kind, repo_id, path, size FROM files WHERE size IN (?, ?) ORDER BY id DESC LIMIT 12",
+    [totalSize + HEADER_SIZE, totalSize]
+  );
+  const hfRows = hfRes.rows || [];
+  if (!hfRows.length) {
+    stats.noHfCandidate++;
+    await markResult(fid, { status: "no_hf", railSize: totalSize, now });
+    console.log(`  [${label}] ${fid}: Railway sống (${totalSize} B) -> lưu rail_size chờ crawl bắt HF`);
+    return;
+  }
+
+  let matchedRow = null;
+  for (const hr of hfRows) {
+    if (await verifyCandidate(liveUrl, totalSize, hr)) {
+      matchedRow = hr;
+      break;
+    }
+  }
+
+  if (!matchedRow) {
+    stats.mismatch++;
+    await markResult(fid, { status: "mismatch", railSize: totalSize, now });
+    console.log(`  [${label}] ${fid}: Có ${hfRows.length} ứng viên size=${totalSize} nhưng byte giữa file chưa khớp / HF lỗi`);
+    return;
+  }
+
+  const hfBase = baseIdOf(matchedRow.path);
+  stats.matched++;
+  await markResult(fid, { status: "ok", hfId: hfBase, now });
+  console.log(`  [MATCH ${stats.matched} | ${label}] ${fid} -> ${matchedRow.repo_id}/${matchedRow.path} (hf_id=${hfBase}, size=${matchedRow.size})`);
+}
+
+/** Bước 0: Bắt ngay các mã no_hf có rail_size vừa xuất hiện trong files (0 tốn request Railway nếu files chưa có). */
+async function checkReadyNoHf(deadline, stats) {
+  const { whereExtra, params } = buildScopeFilters();
+  const readyRes = await db.exec(
+    `SELECT e.file_id, MAX(e.rail_size) AS rail_size
+     FROM episodes_streams e
+     JOIN titles t ON t.id = e.title_id
+     WHERE e.hf_id IS NULL
+       AND e.hf_status = 'no_hf'
+       AND e.rail_size IS NOT NULL AND e.rail_size > 1024
+       AND EXISTS (SELECT 1 FROM files f WHERE f.size IN (e.rail_size, e.rail_size + ${HEADER_SIZE}))
+       ${whereExtra.join("\n       ")}
+     GROUP BY e.file_id
+     LIMIT 200`,
+    params
+  );
+  const rows = readyRes.rows || [];
+  if (!rows.length) return;
+  console.log(`[NO_HF-READY] Phát hiện ${rows.length} mã no_hf vừa có size tương ứng trong files -> xác minh 32 byte...`);
+
+  let idx = 0;
+  async function runReady() {
+    while (Date.now() < deadline) {
+      const i = idx++;
+      if (i >= rows.length) break;
+      const fid = rows[i].file_id;
+      const savedSize = Number(rows[i].rail_size || 0);
+      stats.noHfRechecked++;
+      try {
+        const rail = await resolveLiveRailway(fid);
+        if (rail.resolveFailed) { stats.resolveFail++; continue; }
+        const now = Date.now();
+        if (!rail.liveUrl) {
+          stats.dead++;
+          await markResult(fid, { status: "dead", now });
+          continue;
+        }
+        await matchAgainstHf(fid, rail.liveUrl, rail.totalSize || savedSize, now, stats, `NO_HF ${i + 1}/${rows.length}`);
+      } catch (e) {
+        console.warn(`  [NO_HF ERR] ${fid}: ${e.message || e}`);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, () => runReady()));
+}
+
 async function main() {
   const t0 = Date.now();
   const deadline = t0 + BUDGET_MS;
-  console.log(`=== MATCH-HF START | type=${TARGET_TYPE} shard=${SHARD.index}/${SHARD.total} dryRun=${DRY_RUN} newOnly=${NEW_ONLY} limit=${LIMIT} conc=${CONCURRENCY} budget=${Math.round(BUDGET_MS / 1000)}s cooldown=${COOLDOWN_MS / 3600000}h ===`);
+  const mode = NEW_ONLY ? "new-only" : (HOT_ONLY ? "hot-only" : "full");
+  console.log(`=== MATCH-HF START | mode=${mode} type=${TARGET_TYPE} shard=${SHARD.index}/${SHARD.total} dryRun=${DRY_RUN} limit=${LIMIT} conc=${CONCURRENCY} budget=${Math.round(BUDGET_MS / 1000)}s cooldown=${COOLDOWN_MS / 3600000}h ===`);
 
   if (!DRY_RUN) await ensureSchema();
+
+  const stats = { total: 0, noHfRechecked: 0, probed: 0, matched: 0, dead: 0, resolveFail: 0, noHfCandidate: 0, mismatch: 0 };
+  if (!TARGET_IDS.length) await checkReadyNoHf(deadline, stats);
 
   let candidates;
   if (TARGET_IDS.length) {
     candidates = TARGET_IDS.map((fid) => ({ file_id: fid }));
   } else {
-    const cutoff = Date.now() - COOLDOWN_MS;
+    const nowMs = Date.now();
+    const hMs = 3600 * 1000;
+    const c2h = nowMs - Math.min(2 * hMs, COOLDOWN_MS);
+    const c6h = nowMs - Math.min(6 * hMs, COOLDOWN_MS);
+    const c24h = nowMs - Math.min(24 * hMs, COOLDOWN_MS);
+    const cCold = nowMs - COOLDOWN_MS;
     const sqlLimit = LIMIT > 0 ? LIMIT : 50000;
-    const whereExtra = [];
+    const scope = buildScopeFilters();
     const params = [];
-    const checkedCond = NEW_ONLY
-      ? "e.hf_checked_at IS NULL"
-      : "(e.hf_checked_at IS NULL OR e.hf_checked_at < ?)";
-    if (!NEW_ONLY) params.push(cutoff);
-    if (TARGET_TYPE !== "all") {
-      whereExtra.push("AND t.type = ?");
-      params.push(TARGET_TYPE);
+
+    let checkedCond;
+    if (NEW_ONLY) {
+      checkedCond = "e.hf_checked_at IS NULL";
+    } else if (HOT_ONLY) {
+      checkedCond = `(e.hf_checked_at IS NULL OR (COALESCE(e.hf_status, 'dead') != 'no_hf' AND ((e.hf_fails = 1 AND e.hf_checked_at < ?) OR (e.hf_fails = 2 AND e.hf_checked_at < ?))))`;
+      params.push(c2h, c6h);
+    } else {
+      checkedCond = `(
+        e.hf_checked_at IS NULL
+        OR (
+          COALESCE(e.hf_status, 'dead') != 'no_hf'
+          AND (
+            (COALESCE(e.hf_fails, 4) <= 1 AND e.hf_checked_at < ?)
+            OR (COALESCE(e.hf_fails, 4) = 2 AND e.hf_checked_at < ?)
+            OR (COALESCE(e.hf_fails, 4) = 3 AND e.hf_checked_at < ?)
+            OR (COALESCE(e.hf_fails, 4) >= 4 AND e.hf_checked_at < ?)
+          )
+        )
+        OR (e.hf_status = 'no_hf' AND e.hf_checked_at < ?)
+      )`;
+      params.push(c2h, c6h, c24h, cCold, cCold);
     }
-    if (SHARD.total > 1) {
-      whereExtra.push("AND ((unicode(substr(e.file_id, 1, 1)) * 31 + unicode(substr(e.file_id, 2, 1)) * 17 + unicode(substr(e.file_id, length(e.file_id), 1))) % ?) = ?");
-      params.push(SHARD.total, SHARD.index);
-    }
-    params.push(sqlLimit);
+    params.push(...scope.params, sqlLimit);
 
     const res = await db.exec(
       `SELECT e.file_id, MAX(e.title_id) AS title_id
@@ -238,14 +397,15 @@ async function main() {
          AND NOT EXISTS (
            SELECT 1 FROM files f WHERE f.name >= e.file_id || '.' AND f.name < e.file_id || '/'
          )
-         ${whereExtra.join("\n         ")}
+         ${scope.whereExtra.join("\n         ")}
        GROUP BY e.file_id
        ORDER BY
          CASE WHEN MAX(e.hf_checked_at) IS NULL THEN 0 ELSE 1 END,
-         CASE WHEN MAX(e.hf_checked_at) IS NULL THEN 0 ELSE COALESCE(MIN(e.hf_checked_at), 0) END ASC,
+         MIN(COALESCE(e.hf_fails, 4)) ASC,
          CASE WHEN length(e.file_id) = 12 THEN 0 ELSE 1 END,
          MIN(CASE WHEN t.type = 'movie' THEN 0 ELSE 1 END),
          MAX(e.created_at) DESC,
+         COALESCE(MIN(e.hf_checked_at), 0) ASC,
          MAX(e.title_id) DESC
        LIMIT ?`,
       params
@@ -253,8 +413,8 @@ async function main() {
     candidates = res.rows || [];
   }
 
+  stats.total = candidates.length;
   console.log(`Đã nạp ${candidates.length} mã file cần đối chiếu.`);
-  const stats = { total: candidates.length, probed: 0, matched: 0, dead: 0, resolveFail: 0, noHfCandidate: 0, mismatch: 0 };
   let idx = 0;
 
   async function worker() {
@@ -269,74 +429,23 @@ async function main() {
       }
 
       try {
-        const railUrls = await resolveRailwayUrls(fid);
-        if (!railUrls.length) {
+        const rail = await resolveLiveRailway(fid);
+        if (rail.resolveFailed) {
           stats.resolveFail++;
           continue;
         }
 
-        let liveUrl = null;
-        let totalSize = 0;
-        let lastStatus = 0;
-        for (const u of railUrls) {
-          const probe = await fetchRailwayRange(u, 0, 32);
-          lastStatus = probe.status;
-          if (probe.ok && probe.totalSize > 1024) {
-            liveUrl = u;
-            totalSize = probe.totalSize;
-            break;
-          }
-        }
-
         const now = Date.now();
-        if (!liveUrl) {
+        if (!rail.liveUrl) {
           stats.dead++;
-          if (!DRY_RUN) {
-            await db.exec("UPDATE episodes_streams SET hf_checked_at = ? WHERE file_id = ?", [now, fid]);
-          }
+          await markResult(fid, { status: "dead", now });
           if (myIdx < 15 || stats.probed % 25 === 0) {
-            console.log(`  [${stats.probed}/${candidates.length}] ${fid}: Railway HTTP ${lastStatus} (bỏ qua cooldown)`);
+            console.log(`  [${stats.probed}/${candidates.length}] ${fid}: Railway HTTP ${rail.lastStatus} (backoff)`);
           }
           continue;
         }
 
-        const hfRes = await db.exec(
-          "SELECT kind, repo_id, path, size FROM files WHERE size IN (?, ?) ORDER BY id DESC LIMIT 12",
-          [totalSize + HEADER_SIZE, totalSize]
-        );
-        const hfRows = hfRes.rows || [];
-        if (!hfRows.length) {
-          stats.noHfCandidate++;
-          if (!DRY_RUN) {
-            await db.exec("UPDATE episodes_streams SET hf_checked_at = ? WHERE file_id = ?", [now, fid]);
-          }
-          console.log(`  [${stats.probed}/${candidates.length}] ${fid}: Railway sống (${totalSize} B) nhưng chưa có size tương ứng trong files`);
-          continue;
-        }
-
-        let matchedRow = null;
-        for (const hr of hfRows) {
-          if (await verifyCandidate(liveUrl, totalSize, hr)) {
-            matchedRow = hr;
-            break;
-          }
-        }
-
-        if (!matchedRow) {
-          stats.mismatch++;
-          if (!DRY_RUN) {
-            await db.exec("UPDATE episodes_streams SET hf_checked_at = ? WHERE file_id = ?", [now, fid]);
-          }
-          console.log(`  [${stats.probed}/${candidates.length}] ${fid}: Có ${hfRows.length} ứng viên size=${totalSize} nhưng byte giữa file chưa khớp / HF lỗi`);
-          continue;
-        }
-
-        const hfBase = baseIdOf(matchedRow.path);
-        stats.matched++;
-        if (!DRY_RUN) {
-          await db.exec("UPDATE episodes_streams SET hf_id = ?, hf_checked_at = ? WHERE file_id = ?", [hfBase, now, fid]);
-        }
-        console.log(`  [MATCH ${stats.matched}] ${fid} -> ${matchedRow.repo_id}/${matchedRow.path} (hf_id=${hfBase}, size=${matchedRow.size})`);
+        await matchAgainstHf(fid, rail.liveUrl, rail.totalSize, now, stats, `${stats.probed}/${candidates.length}`);
       } catch (e) {
         console.warn(`  [ERR] ${fid}: ${e.message || e}`);
       }

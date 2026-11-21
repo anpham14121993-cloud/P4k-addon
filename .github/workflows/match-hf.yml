@@ -28,6 +28,10 @@ on:
         description: "Chỉ đối chiếu mã mới chưa từng check (hf_checked_at IS NULL)"
         default: "false"
         required: false
+      hot_only:
+        description: "Quét mã mới + retry nóng (2h/6h) + kiểm tra no_hf đã có size trong files"
+        default: "false"
+        required: false
       dry_run:
         description: "Chỉ kiểm thử, không ghi DB (true/false)"
         default: "false"
@@ -58,6 +62,9 @@ jobs:
           EXTRA_ARGS=""
           if [ "${{ github.event.inputs.new_only }}" == "true" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --new-only"
+          fi
+          if [ "${{ github.event.inputs.hot_only }}" == "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --hot-only"
           fi
           if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --dry-run"
