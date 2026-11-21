@@ -2002,6 +2002,30 @@ async function diagMint(fileName, mirror, host, secret) {
 }
 async function diagAll(request) {
   const reqUrl = new URL(request.url);
+  if (reqUrl.searchParams.get("fast") === "1") {
+    const fileName = reqUrl.searchParams.get("file") || "JE2TRZGY7TCW99A";
+    const out = { fast: true, file: fileName, direct: null, mint: [] };
+    const host = "https://svpc.cryboiz.workers.dev";
+    const secret = HMAC_SECRETS[host.replace(/^https?:\/\//, "")];
+    try {
+      const signed = await genVideoUrl(fileName, host, secret);
+      const t0 = Date.now();
+      const res = await fetchWithTimeout(signed, { headers: { Accept: "application/json" } }, 6000);
+      const txt = await res.text().catch(() => "");
+      out.direct = { status: res.status, ms: Date.now() - t0, body: txt.slice(0, 300) };
+      if (res.ok && extractMint(txt, host)) return out;
+    } catch (e) { out.direct = { status: "ERR", err: String(e.message || e.name || e).slice(0, 60) }; }
+    out.mint = await Promise.all(EGRESS_MIRRORS.map(async (m) => ({ name: m.name, ...await diagMint(fileName, m, host, secret) })));
+    if (!out.mint.some((m) => m && m.mint)) {
+      const fbHost = "https://svatv.cryboiz.workers.dev";
+      const fbSecret = HMAC_SECRETS["svatv.cryboiz.workers.dev"];
+      if (fbSecret) {
+        const fbRes = await Promise.all(EGRESS_MIRRORS.map(async (m) => ({ name: `${m.name}-svatv`, ...await diagMint(fileName, m, fbHost, fbSecret) })));
+        out.mint.push(...fbRes);
+      }
+    }
+    return out;
+  }
   const out = { colo: null, ip: null, config: null, direct: null, mirrors: [], mint: [] };
   const ray = request.headers.get("cf-ray") || "";
   out.colo = (request.cf && request.cf.colo) || (ray.includes("-") ? ray.slice(ray.indexOf("-") + 1) : null) || null;

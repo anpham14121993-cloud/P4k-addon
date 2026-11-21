@@ -1,32 +1,39 @@
 name: match-hf
 
 on:
-  schedule:
-    # Chạy mỗi 4 giờ vào phút 20 để đối chiếu mã API mới sang file thật trên HF
-    - cron: "20 */4 * * *"
+  # Lịch định kỳ 2 giờ/lần vào phút :30 do Cloudflare Worker Cron Trigger dispatch (tránh kẹt & bỏ nhịp GitHub schedule).
   workflow_dispatch:
     inputs:
       limit:
-        description: "Số lượng file_id miss cần kiểm tra mỗi run"
+        description: "Số lượng file_id miss cần kiểm tra mỗi run (0 = toàn bộ)"
         default: "300"
         required: false
       budget:
         description: "Thời gian chạy tối đa (giây)"
         default: "1200"
         required: false
+      concurrency:
+        description: "Luồng xử lý song song"
+        default: "3"
+        required: false
+      type:
+        description: "Loại phim: all | movie | series"
+        default: "all"
+        required: false
       dry_run:
         description: "Chỉ kiểm thử, không ghi DB (true/false)"
         default: "false"
         required: false
 
+# Nhóm concurrency riêng biệt hoàn toàn với crawl (p4k-db-job) và sync-realtime (p4k-sync-realtime) để không bị kẹt pending.
 concurrency:
-  group: p4k-match-hf
+  group: p4k-match-hf-${{ github.event.inputs.type || 'all' }}
   cancel-in-progress: false
 
 jobs:
   match:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -45,9 +52,10 @@ jobs:
             EXTRA_ARGS="--dry-run"
           fi
           node match-hf.mjs \
+            --type="${{ github.event.inputs.type || 'all' }}" \
             --limit="${{ github.event.inputs.limit || '300' }}" \
             --budget="${{ github.event.inputs.budget || '1200' }}" \
-            --concurrency=3 \
+            --concurrency="${{ github.event.inputs.concurrency || '3' }}" \
             $EXTRA_ARGS 2>&1 | tee match-hf.log
       - name: Báo cáo kết quả
         if: always()

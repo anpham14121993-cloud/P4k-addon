@@ -1,0 +1,84 @@
+name: match-hf-sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: "Thời gian chạy tối đa mỗi shard (giây, mặc định 18000 = 5h)"
+        default: "18000"
+        required: false
+      concurrency:
+        description: "Luồng mỗi shard (mặc định 2 x 7 shard = 14 luồng toàn cụm)"
+        default: "2"
+        required: false
+      dry_run:
+        description: "Chỉ kiểm thử, không ghi DB (true/false)"
+        default: "false"
+        required: false
+
+# Nhóm concurrency độc lập với crawl (p4k-db-job) và sync-realtime (p4k-sync-realtime)
+# để tất cả 7 shard chạy song song ngay lập tức không bị pending.
+concurrency:
+  group: p4k-match-hf-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: movie-all
+            type: movie
+            shard: "0/1"
+          - label: series-0
+            type: series
+            shard: "0/6"
+          - label: series-1
+            type: series
+            shard: "1/6"
+          - label: series-2
+            type: series
+            shard: "2/6"
+          - label: series-3
+            type: series
+            shard: "3/6"
+          - label: series-4
+            type: series
+            shard: "4/6"
+          - label: series-5
+            type: series
+            shard: "5/6"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Quét đối chiếu [${{ matrix.label }}] (${{ matrix.type }} shard ${{ matrix.shard }})
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          set -o pipefail
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            EXTRA_ARGS="--dry-run"
+          fi
+          node match-hf.mjs \
+            --type="${{ matrix.type }}" \
+            --shard="${{ matrix.shard }}" \
+            --limit=0 \
+            --budget="${{ github.event.inputs.budget || '18000' }}" \
+            --concurrency="${{ github.event.inputs.concurrency || '2' }}" \
+            $EXTRA_ARGS 2>&1 | tee match-hf.log
+      - name: Báo cáo kết quả [${{ matrix.label }}]
+        if: always()
+        run: |
+          echo "### Kết quả Tổng Quét Đối Chiếu [${{ matrix.label }}]" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          grep -A 5 "TỔNG KẾT ĐỐI CHIẾU HF" match-hf.log >> "$GITHUB_STEP_SUMMARY" || tail -25 match-hf.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

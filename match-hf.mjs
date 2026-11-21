@@ -39,6 +39,18 @@ const BUDGET_MS = Math.max(30, parseInt(getArg("budget", "1200"), 10) || 1200) *
 const CONCURRENCY = Math.max(1, Math.min(6, parseInt(getArg("concurrency", "3"), 10) || 3));
 const COOLDOWN_MS = Math.max(1, parseInt(getArg("cooldown-hours", "24"), 10) || 24) * 3600 * 1000;
 const DRY_RUN = hasFlag("dry-run");
+const TARGET_TYPE = (() => {
+  const t = String(getArg("type", "all") || "all").toLowerCase();
+  return t === "movie" || t === "series" ? t : "all";
+})();
+const SHARD = (() => {
+  const raw = String(getArg("shard", "0/1") || "0/1");
+  const m = raw.match(/^(\d+)\/(\d+)$/);
+  if (!m) return { index: 0, total: 1 };
+  const total = Math.max(1, parseInt(m[2], 10));
+  const index = Math.max(0, Math.min(total - 1, parseInt(m[1], 10)));
+  return { index, total };
+})();
 const TARGET_IDS = [...new Set(String(getArg("ids", "") || "").split(",").map((s) => s.trim()).filter(Boolean))];
 const DIAG_URL = (process.env.P4K_DIAG_URL || "https://phim4k-addon.notthingp.workers.dev/_diag").replace(/\/$/, "");
 const HF_TOKENS = String(process.env.HF_TOKEN || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -93,24 +105,31 @@ async function ensureSchema() {
   await db.exec("CREATE INDEX IF NOT EXISTS idx_files_size ON files(size)");
 }
 
-/** Lấy danh sách URL node Railway từ endpoint /_diag của Worker (không cần lưu HMAC secret riêng ở CI). */
+/** Lấy danh sách URL node Railway từ endpoint /_diag của Worker (dùng fast=1, có retry 1 lần khi 503 tạm thời). */
 async function resolveRailwayUrls(fid) {
-  const r = await fetch(`${DIAG_URL}?file=${encodeURIComponent(fid)}`, {
-    headers: UA,
-    signal: AbortSignal.timeout(12000),
-  });
-  if (!r.ok) return [];
-  const d = await r.json();
-  const urls = [];
-  const pushJsonUrl = (raw) => {
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const u = JSON.parse(raw || "{}").url;
-      if (u && typeof u === "string" && !/dmm_vo_cc/.test(u) && !urls.includes(u)) urls.push(u);
+      const r = await fetch(`${DIAG_URL}?file=${encodeURIComponent(fid)}&fast=1`, {
+        headers: UA,
+        signal: AbortSignal.timeout(12000),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        const urls = [];
+        const pushJsonUrl = (raw) => {
+          try {
+            const u = JSON.parse(raw || "{}").url;
+            if (u && typeof u === "string" && !/dmm_vo_cc/.test(u) && !urls.includes(u)) urls.push(u);
+          } catch {}
+        };
+        pushJsonUrl(d.direct && d.direct.body);
+        for (const m of d.mint || []) pushJsonUrl(m && m.raw);
+        if (urls.length) return urls;
+      }
     } catch {}
-  };
-  pushJsonUrl(d.direct && d.direct.body);
-  for (const m of d.mint || []) pushJsonUrl(m && m.raw);
-  return urls;
+    if (attempt === 0) await new Promise((res) => setTimeout(res, 1200));
+  }
+  return [];
 }
 
 /** Đọc một dải byte từ Railway (tránh follow redirect ngầm) và trích tổng kích thước stream. */
@@ -182,7 +201,7 @@ async function verifyCandidate(railUrl, totalSize, cand) {
 async function main() {
   const t0 = Date.now();
   const deadline = t0 + BUDGET_MS;
-  console.log(`=== MATCH-HF START | dryRun=${DRY_RUN} limit=${LIMIT} conc=${CONCURRENCY} cooldown=${COOLDOWN_MS / 3600000}h ===`);
+  console.log(`=== MATCH-HF START | type=${TARGET_TYPE} shard=${SHARD.index}/${SHARD.total} dryRun=${DRY_RUN} limit=${LIMIT} conc=${CONCURRENCY} budget=${Math.round(BUDGET_MS / 1000)}s cooldown=${COOLDOWN_MS / 3600000}h ===`);
 
   if (!DRY_RUN) await ensureSchema();
 
@@ -191,7 +210,19 @@ async function main() {
     candidates = TARGET_IDS.map((fid) => ({ file_id: fid }));
   } else {
     const cutoff = Date.now() - COOLDOWN_MS;
-    const sqlLimit = LIMIT > 0 ? LIMIT : 2000;
+    const sqlLimit = LIMIT > 0 ? LIMIT : 50000;
+    const whereExtra = [];
+    const params = [cutoff];
+    if (TARGET_TYPE !== "all") {
+      whereExtra.push("AND t.type = ?");
+      params.push(TARGET_TYPE);
+    }
+    if (SHARD.total > 1) {
+      whereExtra.push("AND ((unicode(substr(e.file_id, 1, 1)) * 31 + unicode(substr(e.file_id, 2, 1)) * 17 + unicode(substr(e.file_id, length(e.file_id), 1))) % ?) = ?");
+      params.push(SHARD.total, SHARD.index);
+    }
+    params.push(sqlLimit);
+
     const res = await db.exec(
       `SELECT e.file_id, MAX(e.title_id) AS title_id
        FROM episodes_streams e
@@ -202,6 +233,7 @@ async function main() {
          AND NOT EXISTS (
            SELECT 1 FROM files f WHERE f.name >= e.file_id || '.' AND f.name < e.file_id || '/'
          )
+         ${whereExtra.join("\n         ")}
        GROUP BY e.file_id
        ORDER BY
          CASE WHEN length(e.file_id) = 12 THEN 0 ELSE 1 END,
@@ -209,7 +241,7 @@ async function main() {
          MAX(e.created_at) DESC,
          MAX(e.title_id) DESC
        LIMIT ?`,
-      [cutoff, sqlLimit]
+      params
     );
     candidates = res.rows || [];
   }
@@ -223,7 +255,11 @@ async function main() {
       const myIdx = idx++;
       if (myIdx >= candidates.length) break;
       const fid = candidates[myIdx].file_id;
-      stats.probed++;
+      const probedNo = ++stats.probed;
+      if (probedNo % 100 === 0) {
+        const sec = Math.round((Date.now() - t0) / 1000);
+        console.log(`  [PROGRESS ${probedNo}/${candidates.length} | ${sec}s] matched=${stats.matched} dead=${stats.dead} resolveFail=${stats.resolveFail} noHf=${stats.noHfCandidate} mismatch=${stats.mismatch}`);
+      }
 
       try {
         const railUrls = await resolveRailwayUrls(fid);

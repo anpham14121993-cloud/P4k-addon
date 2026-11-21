@@ -587,11 +587,18 @@ export default {
     // 0. Tuyến 0 (sync-realtime): chạy mỗi 30 phút một lần (quét 5 trang cập nhật + trang 1 ID mới)
     await dispatch("sync-realtime.yml", { pages: "5" });
 
-    const min = new Date().getUTCMinutes();
+    const now = new Date(event && event.scheduledTime ? event.scheduledTime : Date.now());
+    const min = now.getUTCMinutes();
+    const hour = now.getUTCHours();
 
     // 1. Tuyến 1 (crawl): chạy mỗi giờ một lần (vào đầu giờ :00)
     if (min < 15) {
       await dispatch("crawl.yml", { budget: "3200", feed_pages: "25" });
+    }
+
+    // 2. Tuyến 2 (match-hf): chạy mỗi 2 giờ một lần vào phút :30 (tránh trùng giờ :00 với crawl)
+    if (min >= 15 && hour % 2 === 0) {
+      await dispatch("match-hf.yml", { limit: "300", budget: "1200", dry_run: "false" });
     }
   },
 };
