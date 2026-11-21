@@ -4,7 +4,7 @@ import { tursoClient } from "./turso-http.mjs";
 const TTL_MS = 30 * 60 * 1000;
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 const MAX_MEM = 5000;
-const CACHE_VER = "v9";
+const CACHE_VER = "v10";
 const baseOf = (id) => (id.includes(".") ? id.slice(0, id.lastIndexOf(".")) : id);
 
 function normalizeText(v) {
@@ -87,15 +87,31 @@ export function tursoDb(env) {
     return fileRow;
   }
 
-  async function variants(id) {
-    const hit = await cacheGet("vars", id);
-    if (hit && hit.vars) return hit.vars;
-    const b = baseOf(id);
-    const r = await c.exec(
+  async function queryFilesByBase(b) {
+    return c.exec(
       "SELECT kind, repo_id, path, size FROM files WHERE name >= ? AND name < ? " +
         "AND rowid IN (SELECT MIN(rowid) FROM files WHERE name >= ? AND name < ? GROUP BY size) ORDER BY size DESC LIMIT 50",
       [b + ".", b + "/", b + ".", b + "/"]
     );
+  }
+
+  async function variants(id) {
+    const hit = await cacheGet("vars", id);
+    if (hit && hit.vars) return hit.vars;
+    const b = baseOf(id);
+    let r = await queryFilesByBase(b);
+    if (!r.rows || r.rows.length === 0) {
+      try {
+        const aliasRes = await c.exec(
+          "SELECT hf_id FROM episodes_streams WHERE file_id = ? AND hf_id IS NOT NULL AND hf_id != '' LIMIT 1",
+          [b]
+        );
+        const alias = aliasRes.rows && aliasRes.rows[0] && aliasRes.rows[0].hf_id;
+        if (alias) {
+          r = await queryFilesByBase(baseOf(alias));
+        }
+      } catch {}
+    }
     await cachePut("vars", id, { at: Date.now(), vars: r.rows });
     return r.rows;
   }
@@ -213,7 +229,7 @@ export function tursoDb(env) {
     const hit = await cacheGet("stream", cacheKey);
     if (hit && hit.rows) return hit.rows;
     const r = await c.exec(
-      "SELECT s.id, s.title_id, s.season, s.episode, s.file_id, s.label, s.container, s.quality, s.subtitles, t.title, t.quality as release_quality " +
+      "SELECT s.id, s.title_id, s.season, s.episode, s.file_id, s.hf_id, s.label, s.container, s.quality, s.subtitles, t.title, t.quality as release_quality " +
         "FROM episodes_streams s JOIN titles t ON s.title_id = t.id " +
         "WHERE s.title_id = ? AND (t.type = 'movie' OR (s.season = ? AND s.episode = ?)) ORDER BY s.id ASC",
       [numId, s, e]

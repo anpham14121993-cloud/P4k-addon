@@ -55,6 +55,15 @@ const BATCH_SIZE = Math.max(10, parseInt(getArg("batch-size", "50"), 10) || 50);
 const DRY_RUN = hasFlag("dry-run");
 const FORCE = hasFlag("force");
 
+const UPSERT_STREAM_SQL = `INSERT INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ON CONFLICT(title_id, season, episode, file_id) DO UPDATE SET
+                        label = COALESCE(excluded.label, episodes_streams.label),
+                        container = COALESCE(excluded.container, episodes_streams.container),
+                        quality = COALESCE(excluded.quality, episodes_streams.quality),
+                        subtitles = COALESCE(excluded.subtitles, episodes_streams.subtitles),
+                        created_at = excluded.created_at`;
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const startTime = Date.now();
 
@@ -428,8 +437,7 @@ async function main() {
               const fid = fileNameFrom(v.file_url);
               if (!fid) continue;
               await collector.add({
-                sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                sql: UPSERT_STREAM_SQL,
                 args: [
                   vId, 1, 1, fid,
                   cleanText(v.label),
@@ -588,8 +596,7 @@ async function main() {
           // Nạp các tập mới
           for (const pe of pendingEpisodes) {
             await collector.add({
-              sql: `INSERT OR REPLACE INTO episodes_streams (title_id, season, episode, file_id, label, container, quality, subtitles, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              sql: UPSERT_STREAM_SQL,
               args: [
                 vId,
                 pe.season,

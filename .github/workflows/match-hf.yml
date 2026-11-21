@@ -1,0 +1,58 @@
+name: match-hf
+
+on:
+  schedule:
+    # Chạy mỗi 4 giờ vào phút 20 để đối chiếu mã API mới sang file thật trên HF
+    - cron: "20 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Số lượng file_id miss cần kiểm tra mỗi run"
+        default: "300"
+        required: false
+      budget:
+        description: "Thời gian chạy tối đa (giây)"
+        default: "1200"
+        required: false
+      dry_run:
+        description: "Chỉ kiểm thử, không ghi DB (true/false)"
+        default: "false"
+        required: false
+
+concurrency:
+  group: p4k-match-hf
+  cancel-in-progress: false
+
+jobs:
+  match:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Đối chiếu mã API -> link Hugging Face (Size + 32-byte verify)
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          set -o pipefail
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            EXTRA_ARGS="--dry-run"
+          fi
+          node match-hf.mjs \
+            --limit="${{ github.event.inputs.limit || '300' }}" \
+            --budget="${{ github.event.inputs.budget || '1200' }}" \
+            --concurrency=3 \
+            $EXTRA_ARGS 2>&1 | tee match-hf.log
+      - name: Báo cáo kết quả
+        if: always()
+        run: |
+          echo "### Kết quả Đối chiếu Hugging Face" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          grep -A 5 "TỔNG KẾT ĐỐI CHIẾU HF" match-hf.log >> "$GITHUB_STEP_SUMMARY" || tail -25 match-hf.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

@@ -849,30 +849,10 @@ async function mapLimit(arr, limit, fn) {
 const FALLBACK_CONCURRENCY = 3;
 
 async function resolveMediaSet(items, cfg, opts = {}) {
-  const out = [];
-
-  // 1. Mặc định ưu tiên luồng CDN Dự Phòng (Railway) trước
-  if (items.length) {
-    const settled = await mapLimit(items, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
-    settled.forEach((r, idx) => {
-      if (!r || r.status !== "fulfilled" || !r.value) return;
-      const it = items[idx];
-      let title = it.label;
-      try { if (typeof title === "string") title = title + "\n📁 Dự Phòng (Railway - Tua Mượt)"; } catch {}
-      const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
-      attachSubtitles(stream, it);
-      out.push(stream);
-    });
-  }
-
-  if (out.length > 0) {
-    return out;
-  }
-
-  // 2. Dự phòng khi không có luồng Railway: tra DB Turso -> luồng Hugging Face qua Worker XOR decoder
+  // 1. Ưu tiên stream trực tiếp từ DB (Hugging Face qua Worker XOR decoder) trước
   const dbCandidates = []; // { item, vars }
   for (const it of items) {
-    const id = fileNameFrom(it.fileUrl);
+    const id = it.hfId || fileNameFrom(it.fileUrl);
     const vars = id ? await dbVariants(id) : [];
     if (vars.length) {
       dbCandidates.push({ item: it, vars });
@@ -895,6 +875,7 @@ async function resolveMediaSet(items, cfg, opts = {}) {
     }
   }
 
+  const out = [];
   for (const u of dbUnits) {
     let title = u.item.label;
     try {
@@ -909,8 +890,26 @@ async function resolveMediaSet(items, cfg, opts = {}) {
     out.push(stream);
   }
 
+  if (out.length > 0) {
+    return out;
+  }
+
+  // 2. Không có luồng sống từ DB (HF) mới fallback qua CDN Dự Phòng (Railway)
+  if (items.length) {
+    const settled = await mapLimit(items, FALLBACK_CONCURRENCY, (it) => resolveCdnUrl(it.fileUrl, cfg, opts));
+    settled.forEach((r, idx) => {
+      if (!r || r.status !== "fulfilled" || !r.value) return;
+      const it = items[idx];
+      let title = it.label;
+      try { if (typeof title === "string") title = title + "\n📁 Dự Phòng (Railway - Tua Mượt)"; } catch {}
+      const stream = { name: "⚡ " + ADDON_NAME, url: r.value, title: title || undefined };
+      attachSubtitles(stream, it);
+      out.push(stream);
+    });
+  }
+
   if (out.length) return out;
-  throw new HttpError(404, "không có luồng (resolve & DB miss)");
+  throw new HttpError(404, "không có luồng (DB & resolve miss)");
 }
 
 /* ═══════════════════════ 6. TMDB / ID MAPPING ═══════════════════════ */
@@ -1888,6 +1887,7 @@ async function handleStream(type, id, cfg, ms, opts) {
             };
             return {
               fileUrl: "https://cdn.phim4k.lol/" + item.file_id,
+              hfId: item.hf_id || null,
               label: buildStreamTitle(srcObj),
               subtitles: subs,
               w: streamTierScore(item.label, srcObj),
