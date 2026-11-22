@@ -52,8 +52,34 @@ const DEFAULT_TABLES = buildKeyTables(DEFAULT_KEY);
 const metaCache = new Map();
 const inFlightMeta = new Map();
 
+function xor32Blocks(src32, dst32, k32, n32) {
+  let i = 0;
+  for (; i + 16 <= n32; i += 16) {
+    const o = i & 63;
+    dst32[i] = src32[i] ^ k32[o];
+    dst32[i + 1] = src32[i + 1] ^ k32[o + 1];
+    dst32[i + 2] = src32[i + 2] ^ k32[o + 2];
+    dst32[i + 3] = src32[i + 3] ^ k32[o + 3];
+    dst32[i + 4] = src32[i + 4] ^ k32[o + 4];
+    dst32[i + 5] = src32[i + 5] ^ k32[o + 5];
+    dst32[i + 6] = src32[i + 6] ^ k32[o + 6];
+    dst32[i + 7] = src32[i + 7] ^ k32[o + 7];
+    dst32[i + 8] = src32[i + 8] ^ k32[o + 8];
+    dst32[i + 9] = src32[i + 9] ^ k32[o + 9];
+    dst32[i + 10] = src32[i + 10] ^ k32[o + 10];
+    dst32[i + 11] = src32[i + 11] ^ k32[o + 11];
+    dst32[i + 12] = src32[i + 12] ^ k32[o + 12];
+    dst32[i + 13] = src32[i + 13] ^ k32[o + 13];
+    dst32[i + 14] = src32[i + 14] ^ k32[o + 14];
+    dst32[i + 15] = src32[i + 15] ^ k32[o + 15];
+  }
+  for (; i < n32; i++) {
+    dst32[i] = src32[i] ^ k32[i & 63];
+  }
+}
+
 /**
- * Giải mã XOR 32-bit trực tiếp trên chunk (In-place, 0 allocation, unrolled 16 từ 32-bit)
+ * Giải mã XOR 32-bit không làm biến đổi buffer đầu vào của runtime (tránh xung đột buffer trong workerd)
  */
 function xorChunkFast(chunk, rotOffset, tables) {
   const len = chunk.byteLength;
@@ -61,46 +87,24 @@ function xorChunkFast(chunk, rotOffset, tables) {
 
   const k8 = tables.u8[rotOffset];
   const k32 = tables.u32[rotOffset];
-
-  let target = chunk;
-  if ((chunk.byteOffset & 3) !== 0) {
-    target = new Uint8Array(len);
-    target.set(chunk);
-  }
-
+  const out = new Uint8Array(len);
   const n32 = len >>> 2;
+
   if (n32 > 0) {
-    const u32 = new Uint32Array(target.buffer, target.byteOffset, n32);
-    let i = 0;
-    for (; i + 16 <= n32; i += 16) {
-      const o = i & 63;
-      u32[i] ^= k32[o];
-      u32[i + 1] ^= k32[o + 1];
-      u32[i + 2] ^= k32[o + 2];
-      u32[i + 3] ^= k32[o + 3];
-      u32[i + 4] ^= k32[o + 4];
-      u32[i + 5] ^= k32[o + 5];
-      u32[i + 6] ^= k32[o + 6];
-      u32[i + 7] ^= k32[o + 7];
-      u32[i + 8] ^= k32[o + 8];
-      u32[i + 9] ^= k32[o + 9];
-      u32[i + 10] ^= k32[o + 10];
-      u32[i + 11] ^= k32[o + 11];
-      u32[i + 12] ^= k32[o + 12];
-      u32[i + 13] ^= k32[o + 13];
-      u32[i + 14] ^= k32[o + 14];
-      u32[i + 15] ^= k32[o + 15];
-    }
-    for (; i < n32; i++) {
-      u32[i] ^= k32[i & 63];
+    const out32 = new Uint32Array(out.buffer, 0, n32);
+    if ((chunk.byteOffset & 3) === 0) {
+      xor32Blocks(new Uint32Array(chunk.buffer, chunk.byteOffset, n32), out32, k32, n32);
+    } else {
+      out.set(chunk);
+      xor32Blocks(out32, out32, k32, n32);
     }
   }
 
   for (let b = n32 << 2; b < len; b++) {
-    target[b] ^= k8[b & 255];
+    out[b] = chunk[b] ^ k8[b & 255];
   }
 
-  return target;
+  return out;
 }
 
 /**
@@ -472,32 +476,87 @@ async function handleHfStream(request, url, hfUrl, ctx) {
     });
   }
 
-  // 4. File mã hóa: Dùng TransformStream + FixedLengthStream
+  // 4. File mã hóa: Giải mã trực tiếp từ reader vào FixedLengthStream (hoặc ReadableStream) — bỏ pipeThrough kép tránh reset HTTP/2
   let rotOffset = ((start % 256) + 256) % 256;
   const tables = meta.tables || DEFAULT_TABLES;
+  const reader = bodyStream.getReader();
 
-  const ts = new TransformStream({
-    transform(chunk, controller) {
+  let fls = null;
+  if (typeof FixedLengthStream !== "undefined") {
+    try {
+      fls = new FixedLengthStream(contentLength);
+    } catch {}
+  }
+
+  if (fls) {
+    const writer = fls.writable.getWriter();
+    let remaining = contentLength;
+    const onAbort = () => {
+      reader.cancel("client abort").catch(() => {});
+      writer.abort("client abort").catch(() => {});
+    };
+    if (request.signal) {
+      request.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const pump = (async () => {
       try {
-        const dec = xorChunkFast(chunk, rotOffset, tables);
-        rotOffset = (rotOffset + chunk.byteLength) & 255;
+        while (remaining > 0) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value || value.byteLength === 0) continue;
+          const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+          const dec = xorChunkFast(slice, rotOffset, tables);
+          rotOffset = (rotOffset + slice.byteLength) & 255;
+          remaining -= slice.byteLength;
+          await writer.ready;
+          await writer.write(dec);
+        }
+        if (remaining === 0) {
+          await writer.close();
+        } else {
+          await writer.abort(new Error(`upstream truncated (${remaining}B short)`));
+        }
+      } catch (err) {
+        await reader.cancel(err).catch(() => {});
+        await writer.abort(err).catch(() => {});
+      } finally {
+        if (request.signal) {
+          try { request.signal.removeEventListener("abort", onAbort); } catch {}
+        }
+      }
+    })();
+
+    if (ctx && ctx.waitUntil) ctx.waitUntil(pump);
+    else pump.catch(() => {});
+
+    return new Response(fls.readable, {
+      status: isPartial ? 206 : 200,
+      headers: respHeaders
+    });
+  }
+
+  const fallbackStream = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        const dec = xorChunkFast(value, rotOffset, tables);
+        rotOffset = (rotOffset + value.byteLength) & 255;
         controller.enqueue(dec);
       } catch (err) {
         controller.error(err);
       }
+    },
+    cancel(reason) {
+      return reader.cancel(reason).catch(() => {});
     }
   });
 
-  bodyStream = bodyStream.pipeThrough(ts);
-
-  if (typeof FixedLengthStream !== "undefined") {
-    try {
-      const fls = new FixedLengthStream(contentLength);
-      bodyStream = bodyStream.pipeThrough(fls);
-    } catch {}
-  }
-
-  return new Response(bodyStream, {
+  return new Response(fallbackStream, {
     status: isPartial ? 206 : 200,
     headers: respHeaders
   });
