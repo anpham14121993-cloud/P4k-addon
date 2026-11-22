@@ -387,6 +387,23 @@ async function main() {
     }
     params.push(...scope.params, sqlLimit);
 
+    // Khi quét vét định kỳ (!HOT_ONLY), ưu tiên mã quá hạn kiểm tra lâu nhất trước để fails>=3 / 7d không bị kẹt.
+    const orderBy =
+      !HOT_ONLY && !NEW_ONLY
+        ? `CASE WHEN MAX(e.hf_checked_at) IS NULL THEN 0 ELSE 1 END,
+           COALESCE(MIN(e.hf_checked_at), 0) ASC,
+           MIN(COALESCE(e.hf_fails, 4)) ASC,
+           CASE WHEN length(e.file_id) = 12 THEN 0 ELSE 1 END,
+           MIN(CASE WHEN t.type = 'movie' THEN 0 ELSE 1 END),
+           MAX(e.title_id) DESC`
+        : `CASE WHEN MAX(e.hf_checked_at) IS NULL THEN 0 ELSE 1 END,
+           MIN(COALESCE(e.hf_fails, 4)) ASC,
+           CASE WHEN length(e.file_id) = 12 THEN 0 ELSE 1 END,
+           MIN(CASE WHEN t.type = 'movie' THEN 0 ELSE 1 END),
+           MAX(e.created_at) DESC,
+           COALESCE(MIN(e.hf_checked_at), 0) ASC,
+           MAX(e.title_id) DESC`;
+
     const res = await db.exec(
       `SELECT e.file_id, MAX(e.title_id) AS title_id
        FROM episodes_streams e
@@ -400,13 +417,7 @@ async function main() {
          ${scope.whereExtra.join("\n         ")}
        GROUP BY e.file_id
        ORDER BY
-         CASE WHEN MAX(e.hf_checked_at) IS NULL THEN 0 ELSE 1 END,
-         MIN(COALESCE(e.hf_fails, 4)) ASC,
-         CASE WHEN length(e.file_id) = 12 THEN 0 ELSE 1 END,
-         MIN(CASE WHEN t.type = 'movie' THEN 0 ELSE 1 END),
-         MAX(e.created_at) DESC,
-         COALESCE(MIN(e.hf_checked_at), 0) ASC,
-         MAX(e.title_id) DESC
+         ${orderBy}
        LIMIT ?`,
       params
     );

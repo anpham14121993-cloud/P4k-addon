@@ -6,15 +6,15 @@ on:
     inputs:
       limit:
         description: "Số lượng file_id miss cần kiểm tra mỗi run (0 = toàn bộ)"
-        default: "300"
+        default: "800"
         required: false
       budget:
         description: "Thời gian chạy tối đa (giây)"
-        default: "1200"
+        default: "1500"
         required: false
       concurrency:
         description: "Luồng xử lý song song"
-        default: "3"
+        default: "4"
         required: false
       type:
         description: "Loại phim: all | movie | series"
@@ -71,9 +71,9 @@ jobs:
           fi
           node match-hf.mjs \
             --type="${{ github.event.inputs.type || 'all' }}" \
-            --limit="${{ github.event.inputs.limit || '300' }}" \
-            --budget="${{ github.event.inputs.budget || '1200' }}" \
-            --concurrency="${{ github.event.inputs.concurrency || '3' }}" \
+            --limit="${{ github.event.inputs.limit || '800' }}" \
+            --budget="${{ github.event.inputs.budget || '1500' }}" \
+            --concurrency="${{ github.event.inputs.concurrency || '4' }}" \
             --cooldown-hours="${{ github.event.inputs.cooldown_hours || '168' }}" \
             $EXTRA_ARGS 2>&1 | tee match-hf.log
       - name: Báo cáo kết quả
