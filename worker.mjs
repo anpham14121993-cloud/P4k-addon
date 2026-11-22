@@ -51,6 +51,12 @@ const DEFAULT_TABLES = buildKeyTables(DEFAULT_KEY);
 // Cache lưu CDN URL trực tiếp & metadata theo từng file HF (TTL 15 phút)
 const metaCache = new Map();
 const inFlightMeta = new Map();
+const streamDiag = [];
+
+function recordStreamDiag(entry) {
+  streamDiag.push({ t: new Date().toISOString(), ...entry });
+  if (streamDiag.length > 40) streamDiag.shift();
+}
 
 function xor32Blocks(src32, dst32, k32, n32) {
   let i = 0;
@@ -460,7 +466,31 @@ async function handleHfStream(request, url, hfUrl, ctx) {
     respHeaders.set("Content-Range", `bytes ${start}-${end}/${mediaSize}`);
   }
 
+  const diagMode = url.searchParams.get("__diag") || "";
+  const diagFile = hfUrl.split("/").pop() || "";
+  const diagRange = `${start}-${end}/${mediaSize}`;
+  const tStart = Date.now();
   let bodyStream = upstreamResp.body;
+
+  if (diagMode === "rawbody") {
+    return new Response(bodyStream, {
+      status: isPartial ? 206 : 200,
+      headers: respHeaders
+    });
+  }
+
+  if (diagMode === "pipefls") {
+    if (typeof FixedLengthStream !== "undefined") {
+      try {
+        const fls = new FixedLengthStream(contentLength);
+        bodyStream = bodyStream.pipeThrough(fls);
+      } catch {}
+    }
+    return new Response(bodyStream, {
+      status: isPartial ? 206 : 200,
+      headers: respHeaders
+    });
+  }
 
   // File raw nguyên bản -> truyền trực tiếp body (kèm FixedLengthStream nếu có để đảm bảo Content-Length)
   if (meta.isRaw) {
@@ -476,10 +506,59 @@ async function handleHfStream(request, url, hfUrl, ctx) {
     });
   }
 
-  // 4. File mã hóa: Giải mã trực tiếp từ reader vào FixedLengthStream (hoặc ReadableStream) — bỏ pipeThrough kép tránh reset HTTP/2
+  // 4. File mã hóa: Giải mã XOR
   let rotOffset = ((start % 256) + 256) % 256;
   const tables = meta.tables || DEFAULT_TABLES;
   const reader = bodyStream.getReader();
+
+  if (diagMode === "pull") {
+    let remaining = contentLength;
+    let readBytes = 0;
+    let chunks = 0;
+    const pullStream = new ReadableStream({
+      async pull(controller) {
+        try {
+          while (remaining > 0) {
+            const { done, value } = await reader.read();
+            if (done) {
+              recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "trunc", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart });
+              controller.error(new Error(`upstream truncated (${remaining}B short)`));
+              return;
+            }
+            if (!value || value.byteLength === 0) continue;
+            const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+            const dec = xorChunkFast(slice, rotOffset, tables);
+            rotOffset = (rotOffset + slice.byteLength) & 255;
+            remaining -= slice.byteLength;
+            readBytes += slice.byteLength;
+            chunks++;
+            controller.enqueue(dec);
+            if (remaining === 0) {
+              recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "ok", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart });
+              reader.cancel().catch(() => {});
+              controller.close();
+            }
+            return;
+          }
+          controller.close();
+        } catch (err) {
+          recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "err", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: err?.message || String(err) });
+          await reader.cancel(err).catch(() => {});
+          controller.error(err);
+        }
+      },
+      cancel(reason) {
+        if (remaining > 0) {
+          recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "cancel", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: String(reason || "") });
+        }
+        return reader.cancel(reason).catch(() => {});
+      }
+    });
+    return new Response(pullStream, {
+      status: isPartial ? 206 : 200,
+      headers: respHeaders
+    });
+  }
 
   let fls = null;
   if (typeof FixedLengthStream !== "undefined") {
@@ -491,7 +570,11 @@ async function handleHfStream(request, url, hfUrl, ctx) {
   if (fls) {
     const writer = fls.writable.getWriter();
     let remaining = contentLength;
+    let readBytes = 0;
+    let chunks = 0;
+    const modeName = diagMode || "fls";
     const onAbort = () => {
+      recordStreamDiag({ mode: modeName, file: diagFile, range: diagRange, status: "client_abort", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart });
       reader.cancel("client abort").catch(() => {});
       writer.abort("client abort").catch(() => {});
     };
@@ -506,18 +589,23 @@ async function handleHfStream(request, url, hfUrl, ctx) {
           if (done) break;
           if (!value || value.byteLength === 0) continue;
           const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value;
-          const dec = xorChunkFast(slice, rotOffset, tables);
+          const out = diagMode === "pass" ? slice : xorChunkFast(slice, rotOffset, tables);
           rotOffset = (rotOffset + slice.byteLength) & 255;
           remaining -= slice.byteLength;
+          readBytes += slice.byteLength;
+          chunks++;
           await writer.ready;
-          await writer.write(dec);
+          await writer.write(out);
         }
         if (remaining === 0) {
+          recordStreamDiag({ mode: modeName, file: diagFile, range: diagRange, status: "ok", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart });
           await writer.close();
         } else {
+          recordStreamDiag({ mode: modeName, file: diagFile, range: diagRange, status: "trunc", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: `short ${remaining}B` });
           await writer.abort(new Error(`upstream truncated (${remaining}B short)`));
         }
       } catch (err) {
+        recordStreamDiag({ mode: modeName, file: diagFile, range: diagRange, status: "err", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: err?.message || String(err) });
         await reader.cancel(err).catch(() => {});
         await writer.abort(err).catch(() => {});
       } finally {
@@ -605,6 +693,12 @@ export default {
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 502, headers: { "Content-Type": "application/json" } });
       }
+    }
+
+    if (url.pathname === "/__stream_diag") {
+      return new Response(JSON.stringify({ count: streamDiag.length, logs: streamDiag }, null, 2), {
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
+      });
     }
 
     // 2. Giải mã & Stream trực tiếp file video từ Hugging Face (/hf/... hoặc /<user>/<repo>/<file> hoặc /?url=...)
