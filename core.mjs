@@ -75,7 +75,7 @@ function hfDirectUrl(row) {
   return base + "/hf/datasets/" + repo + "/resolve/main/" + p;
 }
 
-const VERSION = "2.2.0-oracle-xor";
+const VERSION = "2.3.0-worker-xor";
 
 /* ═══════════════════════ 1. CẤU HÌNH ═══════════════════════ */
 

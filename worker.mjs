@@ -342,8 +342,6 @@ function resolveHfUrl(urlObj) {
   return null;
 }
 
-const DEFAULT_OCI_STREAM_BASE = "https://129.221.156.239.sslip.io";
-
 function pipeFixedLength(stream, contentLength) {
   if (typeof FixedLengthStream !== "undefined") {
     try {
@@ -353,7 +351,7 @@ function pipeFixedLength(stream, contentLength) {
   return stream;
 }
 
-async function handleHfStream(request, url, hfUrl, ctx, env) {
+async function handleHfStream(request, url, hfUrl, ctx) {
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -450,28 +448,7 @@ async function handleHfStream(request, url, hfUrl, ctx, env) {
     respHeaders.set("Content-Range", `bytes ${start}-${end}/${mediaSize}`);
   }
 
-  // 3a. File mã hóa -> chuyển về nothingp-sever (ARM64) giải mã XOR và pass-through zero-JS trên Worker
-  if (!meta.isRaw) {
-    const ociBase = (env && env.OCI_STREAM_BASE) || DEFAULT_OCI_STREAM_BASE;
-    const hfPath = new URL(hfUrl).pathname;
-    const ociUrl = new URL("/hf" + hfPath, ociBase);
-    if (autoKey) ociUrl.searchParams.set("autokey", "1");
-
-    try {
-      const ociResp = await fetch(ociUrl.toString(), {
-        headers: isPartial ? { Range: `bytes=${start}-${end}` } : {}
-      });
-      if (ociResp.ok || ociResp.status === 206) {
-        return new Response(pipeFixedLength(ociResp.body, contentLength), {
-          status: isPartial ? 206 : 200,
-          headers: respHeaders
-        });
-      }
-      try { await ociResp.body?.cancel(); } catch {}
-    } catch {}
-  }
-
-  // 3b. File raw (hoặc fallback nếu OCI tạm gián đoạn) -> gọi trực tiếp CDN HF
+  // 3. Gọi trực tiếp CDN Hugging Face (không proxy qua Oracle server)
   const hfStart = start + meta.headerSize;
   const hfEnd = end + meta.headerSize;
 
@@ -506,7 +483,7 @@ async function handleHfStream(request, url, hfUrl, ctx, env) {
     });
   }
 
-  // Fallback giải mã XOR trên Worker chỉ chạy khi OCI upstream lỗi kết nối
+  // Giải mã XOR trực tiếp trên Cloudflare Worker (dành cho client không dùng Local Proxy trên app)
   let rotOffset = ((start % 256) + 256) % 256;
   let remaining = contentLength;
   const tables = meta.tables || DEFAULT_TABLES;
@@ -575,7 +552,7 @@ export default {
     // 2. Giải mã & Stream trực tiếp file video từ Hugging Face (/hf/... hoặc /<user>/<repo>/<file> hoặc /?url=...)
     const hfUrl = resolveHfUrl(url);
     if (hfUrl) {
-      return handleHfStream(request, url, hfUrl, ctx, env);
+      return handleHfStream(request, url, hfUrl, ctx);
     }
 
     // 3. Stremio Addon Router
