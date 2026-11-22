@@ -127,7 +127,10 @@ async function getFileMeta(hfUrl, autoKey = false, ctx = null) {
         const edgeHit = await caches.default.match(cacheKey);
         if (edgeHit) {
           const edgeMeta = await edgeHit.json();
-          if (edgeMeta && edgeMeta.cdnUrl) {
+          if (edgeMeta && edgeMeta.cdnUrl && typeof edgeMeta.time === "number" && now - edgeMeta.time < 25 * 60 * 1000) {
+            if (!edgeMeta.isRaw && Array.isArray(edgeMeta.keyBytes) && edgeMeta.keyBytes.length === 256) {
+              edgeMeta.tables = buildKeyTables(Uint8Array.from(edgeMeta.keyBytes));
+            }
             metaCache.set(hfUrl, edgeMeta);
             return edgeMeta;
           }
@@ -156,6 +159,7 @@ async function getFileMeta(hfUrl, autoKey = false, ctx = null) {
         totalH5Size = parseInt(cr.split("/")[1], 10);
       }
     }
+    try { await probeResp.body?.cancel(); } catch {}
 
     // Bước 2: Lấy mẫu 128 byte đầu từ CDN để phân loại chính xác Raw (không mã hóa) vs Disguised (mã hóa)
     const sampleResp = await fetch(cdnUrl, { headers: { Range: "bytes=0-127" } });
@@ -221,6 +225,7 @@ async function getFileMeta(hfUrl, autoKey = false, ctx = null) {
 
     // 2. File ngụy trang (có header 64 byte + XOR 256-byte)
     let tables = DEFAULT_TABLES;
+    let customKeyBytes = null;
     if (autoKey) {
       const keySampleResp = await fetch(cdnUrl, {
         headers: { Range: `bytes=${HEADER_SIZE}-${HEADER_SIZE + 65535}` }
@@ -251,6 +256,7 @@ async function getFileMeta(hfUrl, autoKey = false, ctx = null) {
           recovered[col] = bestB;
         }
         tables = buildKeyTables(recovered);
+        customKeyBytes = Array.from(recovered);
       }
     }
 
@@ -261,6 +267,7 @@ async function getFileMeta(hfUrl, autoKey = false, ctx = null) {
       totalSize: totalH5Size,
       mediaSize: Math.max(0, totalH5Size - HEADER_SIZE),
       tables,
+      keyBytes: customKeyBytes,
       contentType: isDisguisedMp4 ? "video/mp4" : "video/x-matroska",
       time: now
     };
@@ -268,7 +275,7 @@ async function getFileMeta(hfUrl, autoKey = false, ctx = null) {
     if (typeof caches !== "undefined" && caches.default) {
       try {
         const saveResp = new Response(JSON.stringify({ ...meta, tables: null }), {
-          headers: { "Cache-Control": "max-age=2400" }
+          headers: { "Cache-Control": "max-age=1500" }
         });
         if (ctx && ctx.waitUntil) ctx.waitUntil(caches.default.put(cacheKey, saveResp));
         else caches.default.put(cacheKey, saveResp).catch(() => {});
@@ -338,7 +345,7 @@ async function handleHfStream(request, url, hfUrl, ctx) {
   }
 
   const autoKey = url.searchParams.get("autokey") === "1";
-  const meta = await getFileMeta(hfUrl, autoKey, ctx);
+  let meta = await getFileMeta(hfUrl, autoKey, ctx);
   const mediaSize = meta.mediaSize;
 
   // 1. HEAD request
@@ -358,13 +365,11 @@ async function handleHfStream(request, url, hfUrl, ctx) {
     });
   }
 
-  // 2. Hỗ trợ đầy đủ các dạng Range (START-END, START-, suffix -SUFFIX)
+  // 2. Hỗ trợ chuẩn HTTP Range (START-END, START- liên tục không cắt 16MB, -SUFFIX) và GET không Range -> 200 OK
   const rangeHeader = request.headers.get("Range");
   let start = 0;
   let end = mediaSize - 1;
   let isPartial = false;
-
-  const MAX_CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB chunk cap để tua mượt, giữ kết nối ổn định và giải phóng RAM/CPU
 
   if (rangeHeader && rangeHeader.startsWith("bytes=")) {
     isPartial = true;
@@ -373,32 +378,29 @@ async function handleHfStream(request, url, hfUrl, ctx) {
 
     if (dashIdx === 0) {
       const suffixLen = parseInt(rangeSpec.slice(1), 10);
-      if (suffixLen > 0) {
+      if (!Number.isFinite(suffixLen) || suffixLen <= 0) {
+        start = mediaSize;
+      } else {
         start = Math.max(0, mediaSize - suffixLen);
         end = mediaSize - 1;
       }
     } else if (dashIdx > 0) {
-      const sStr = rangeSpec.slice(0, dashIdx);
-      const eStr = rangeSpec.slice(dashIdx + 1);
-      start = parseInt(sStr, 10) || 0;
+      const sStr = rangeSpec.slice(0, dashIdx).trim();
+      const eStr = rangeSpec.slice(dashIdx + 1).trim();
+      const parsedStart = sStr.length > 0 ? parseInt(sStr, 10) : 0;
+      start = Number.isFinite(parsedStart) && parsedStart >= 0 ? parsedStart : mediaSize;
       if (eStr.length > 0) {
-        end = Math.min(mediaSize - 1, parseInt(eStr, 10));
+        const parsedEnd = parseInt(eStr, 10);
+        end = Number.isFinite(parsedEnd) ? Math.min(mediaSize - 1, parsedEnd) : mediaSize - 1;
       } else {
-        end = Math.min(mediaSize - 1, start + MAX_CHUNK_SIZE - 1);
+        end = mediaSize - 1;
       }
+    } else {
+      start = mediaSize;
     }
-  } else {
-    isPartial = true;
-    start = 0;
-    end = Math.min(mediaSize - 1, MAX_CHUNK_SIZE - 1);
   }
 
-  // Cắt giới hạn chunk tối đa 16MB nếu client yêu cầu khoảng quá dài (tránh timeout worker khi player pause)
-  if (isPartial && (end - start + 1 > MAX_CHUNK_SIZE)) {
-    end = start + MAX_CHUNK_SIZE - 1;
-  }
-
-  if (start >= mediaSize || start > end) {
+  if (mediaSize <= 0 || start < 0 || start >= mediaSize || start > end) {
     return new Response(null, {
       status: 416,
       headers: {
@@ -417,18 +419,20 @@ async function handleHfStream(request, url, hfUrl, ctx) {
   });
 
   if (upstreamResp.status === 401 || upstreamResp.status === 403) {
+    try { await upstreamResp.body?.cancel(); } catch {}
     metaCache.delete(hfUrl);
     if (typeof caches !== "undefined" && caches.default) {
       const cacheKey = new Request("https://meta-cache.internal/" + encodeURIComponent(hfUrl));
       try { await caches.default.delete(cacheKey); } catch {}
     }
-    const freshMeta = await getFileMeta(hfUrl, autoKey, ctx);
-    upstreamResp = await fetch(freshMeta.cdnUrl, {
+    meta = await getFileMeta(hfUrl, autoKey, ctx);
+    upstreamResp = await fetch(meta.cdnUrl, {
       headers: { Range: `bytes=${hfStart}-${hfEnd}` }
     });
   }
 
   if (!upstreamResp.ok && upstreamResp.status !== 206) {
+    try { await upstreamResp.body?.cancel(); } catch {}
     return new Response(`Upstream CDN error: ${upstreamResp.status}`, {
       status: upstreamResp.status
     });
