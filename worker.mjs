@@ -51,22 +51,6 @@ const DEFAULT_TABLES = buildKeyTables(DEFAULT_KEY);
 // Cache lưu CDN URL trực tiếp & metadata theo từng file HF (TTL 15 phút)
 const metaCache = new Map();
 const inFlightMeta = new Map();
-const streamDiag = [];
-const ISOLATE_ID = Math.random().toString(36).slice(2, 8);
-const BOOT_TS = Date.now();
-
-function recordStreamDiag(entry, diagId = "", ctx = null) {
-  const rec = { t: new Date().toISOString(), isolate: ISOLATE_ID, upMs: Date.now() - BOOT_TS, ...entry };
-  streamDiag.push(rec);
-  if (streamDiag.length > 40) streamDiag.shift();
-  if (diagId && typeof caches !== "undefined" && caches.default) {
-    const p = caches.default.put(
-      new Request("https://diag-log.internal/" + encodeURIComponent(diagId)),
-      new Response(JSON.stringify(rec), { headers: { "Cache-Control": "max-age=300" } })
-    ).catch(() => {});
-    if (ctx && ctx.waitUntil) ctx.waitUntil(p);
-  }
-}
 
 function xor32Blocks(src32, dst32, k32, n32) {
   let i = 0;
@@ -318,7 +302,14 @@ async function getFileMeta(hfUrl, autoKey = false, ctx = null) {
 function resolveHfUrl(urlObj) {
   const paramUrl = urlObj.searchParams.get("url");
   if (paramUrl) {
-    return paramUrl.replace("/blob/", "/resolve/");
+    try {
+      const parsed = new URL(paramUrl.replace("/blob/", "/resolve/"));
+      if (parsed.origin === "https://huggingface.co" &&
+          (parsed.pathname.startsWith("/datasets/") || parsed.pathname.startsWith("/buckets/"))) {
+        return parsed.toString();
+      }
+    } catch {}
+    return null;
   }
 
   let path = urlObj.pathname.replace(/^\/+/, "");
@@ -351,7 +342,18 @@ function resolveHfUrl(urlObj) {
   return null;
 }
 
-async function handleHfStream(request, url, hfUrl, ctx) {
+const DEFAULT_OCI_STREAM_BASE = "https://129.221.156.239.sslip.io";
+
+function pipeFixedLength(stream, contentLength) {
+  if (typeof FixedLengthStream !== "undefined") {
+    try {
+      return stream.pipeThrough(new FixedLengthStream(contentLength));
+    } catch {}
+  }
+  return stream;
+}
+
+async function handleHfStream(request, url, hfUrl, ctx, env) {
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -430,7 +432,46 @@ async function handleHfStream(request, url, hfUrl, ctx) {
     });
   }
 
-  // 3. Gọi trực tiếp CDN qua link và vị trí thực tế
+  const contentLength = end - start + 1;
+  const respHeaders = new Headers({
+    "Content-Type": meta.contentType || "video/x-matroska",
+    "Accept-Ranges": "bytes",
+    "Content-Length": String(contentLength),
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "Range, Content-Type, Accept",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+    "Content-Disposition": "inline"
+  });
+
+  if (isPartial) {
+    respHeaders.set("Content-Range", `bytes ${start}-${end}/${mediaSize}`);
+  }
+
+  // 3a. File mã hóa -> chuyển về nothingp-sever (ARM64) giải mã XOR và pass-through zero-JS trên Worker
+  if (!meta.isRaw) {
+    const ociBase = (env && env.OCI_STREAM_BASE) || DEFAULT_OCI_STREAM_BASE;
+    const hfPath = new URL(hfUrl).pathname;
+    const ociUrl = new URL("/hf" + hfPath, ociBase);
+    if (autoKey) ociUrl.searchParams.set("autokey", "1");
+
+    try {
+      const ociResp = await fetch(ociUrl.toString(), {
+        headers: isPartial ? { Range: `bytes=${start}-${end}` } : {}
+      });
+      if (ociResp.ok || ociResp.status === 206) {
+        return new Response(pipeFixedLength(ociResp.body, contentLength), {
+          status: isPartial ? 206 : 200,
+          headers: respHeaders
+        });
+      }
+      try { await ociResp.body?.cancel(); } catch {}
+    } catch {}
+  }
+
+  // 3b. File raw (hoặc fallback nếu OCI tạm gián đoạn) -> gọi trực tiếp CDN HF
   const hfStart = start + meta.headerSize;
   const hfEnd = end + meta.headerSize;
 
@@ -458,307 +499,29 @@ async function handleHfStream(request, url, hfUrl, ctx) {
     });
   }
 
-  const contentLength = end - start + 1;
-  const respHeaders = new Headers({
-    "Content-Type": meta.contentType || "video/x-matroska",
-    "Accept-Ranges": "bytes",
-    "Content-Length": String(contentLength),
-    "Cache-Control": "no-store, no-cache, must-revalidate",
-    "Pragma": "no-cache",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-    "Access-Control-Allow-Headers": "Range, Content-Type, Accept",
-    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
-    "Content-Disposition": "inline"
-  });
-
-  if (isPartial) {
-    respHeaders.set("Content-Range", `bytes ${start}-${end}/${mediaSize}`);
-  }
-
-  const diagMode = url.searchParams.get("__diag") || "";
-  const diagId = url.searchParams.get("__diag_id") || "";
-  const diagFile = hfUrl.split("/").pop() || "";
-  const diagRange = `${start}-${end}/${mediaSize}`;
-  const tStart = Date.now();
-  let bodyStream = upstreamResp.body;
-  if (diagMode || diagId) {
-    respHeaders.set("X-Isolate", ISOLATE_ID);
-    respHeaders.set("X-Uptime", String(Date.now() - BOOT_TS));
-    recordStreamDiag({ stage: "start", mode: diagMode || "fls", file: diagFile, range: diagRange, expected: contentLength }, diagId ? diagId + ":start" : "", ctx);
-  }
-
-  if (diagMode === "rawbody") {
-    return new Response(bodyStream, {
-      status: isPartial ? 206 : 200,
-      headers: respHeaders
-    });
-  }
-
-  if (diagMode === "pipefls") {
-    if (typeof FixedLengthStream !== "undefined") {
-      try {
-        const fls = new FixedLengthStream(contentLength);
-        bodyStream = bodyStream.pipeThrough(fls);
-      } catch {}
-    }
-    return new Response(bodyStream, {
-      status: isPartial ? 206 : 200,
-      headers: respHeaders
-    });
-  }
-
-  // File raw nguyên bản -> truyền trực tiếp body (kèm FixedLengthStream nếu có để đảm bảo Content-Length)
   if (meta.isRaw) {
-    if (typeof FixedLengthStream !== "undefined") {
-      try {
-        const fls = new FixedLengthStream(contentLength);
-        bodyStream = bodyStream.pipeThrough(fls);
-      } catch {}
-    }
-    return new Response(bodyStream, {
+    return new Response(pipeFixedLength(upstreamResp.body, contentLength), {
       status: isPartial ? 206 : 200,
       headers: respHeaders
     });
   }
 
-  // 4. File mã hóa: Giải mã XOR
+  // Fallback giải mã XOR trên Worker chỉ chạy khi OCI upstream lỗi kết nối
   let rotOffset = ((start % 256) + 256) % 256;
+  let remaining = contentLength;
   const tables = meta.tables || DEFAULT_TABLES;
-
-  if (diagMode === "ts_only" || diagMode === "ts_xor" || diagMode === "ts_xor_fls") {
-    let remaining = contentLength;
-    let readBytes = 0;
-    let chunks = 0;
-    const doXor = diagMode !== "ts_only";
-    const ts = new TransformStream({
-      transform(chunk, controller) {
-        if (remaining <= 0 || !chunk || chunk.byteLength === 0) return;
-        const slice = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
-        const out = doXor ? xorChunkFast(slice, rotOffset, tables) : slice;
-        rotOffset = (rotOffset + slice.byteLength) & 255;
-        remaining -= slice.byteLength;
-        readBytes += slice.byteLength;
-        chunks++;
-        controller.enqueue(out);
-      },
-      flush() {
-        recordStreamDiag({ stage: "end", mode: diagMode, file: diagFile, range: diagRange, status: remaining === 0 ? "ok" : "trunc", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart }, diagId, ctx);
-      }
-    });
-    let outStream = bodyStream.pipeThrough(ts);
-    if (diagMode === "ts_xor_fls" && typeof FixedLengthStream !== "undefined") {
-      outStream = outStream.pipeThrough(new FixedLengthStream(contentLength));
-    }
-    return new Response(outStream, {
-      status: isPartial ? 206 : 200,
-      headers: respHeaders
-    });
-  }
-
-  if (diagMode === "stitch8" || diagMode === "stitch8_fls") {
-    try { await bodyStream?.cancel(); } catch {}
-    const CHUNK_UP = 8 * 1024 * 1024;
-    let cursor = start;
-    let curReader = null;
-    let readBytes = 0;
-    let chunks = 0;
-    let subReqs = 0;
-    const stitchStream = new ReadableStream({
-      async pull(controller) {
-        try {
-          while (cursor <= end) {
-            if (!curReader) {
-              const partEnd = Math.min(end, cursor + CHUNK_UP - 1);
-              subReqs++;
-              const sr = await fetch(meta.cdnUrl, {
-                headers: { Range: `bytes=${cursor + meta.headerSize}-${partEnd + meta.headerSize}` }
-              });
-              if (!sr.ok && sr.status !== 206) {
-                throw new Error(`stitch upstream ${sr.status}`);
-              }
-              curReader = sr.body.getReader();
-            }
-            const { done, value } = await curReader.read();
-            if (done) {
-              curReader = null;
-              continue;
-            }
-            if (!value || value.byteLength === 0) continue;
-            const left = end - cursor + 1;
-            const slice = value.byteLength > left ? value.subarray(0, left) : value;
-            const dec = xorChunkFast(slice, rotOffset, tables);
-            rotOffset = (rotOffset + slice.byteLength) & 255;
-            cursor += slice.byteLength;
-            readBytes += slice.byteLength;
-            chunks++;
-            controller.enqueue(dec);
-            if (cursor > end) {
-              recordStreamDiag({ stage: "end", mode: diagMode, status: "ok", readBytes, expected: contentLength, chunks, subReqs, ms: Date.now() - tStart }, diagId, ctx);
-              await curReader.cancel().catch(() => {});
-              curReader = null;
-              controller.close();
-            }
-            return;
-          }
-          controller.close();
-        } catch (err) {
-          recordStreamDiag({ stage: "end", mode: diagMode, status: "err", readBytes, expected: contentLength, chunks, subReqs, ms: Date.now() - tStart, msg: err?.message || String(err) }, diagId, ctx);
-          if (curReader) await curReader.cancel(err).catch(() => {});
-          controller.error(err);
-        }
-      },
-      cancel(reason) {
-        recordStreamDiag({ stage: "end", mode: diagMode, status: "cancel", readBytes, expected: contentLength, chunks, subReqs, ms: Date.now() - tStart, msg: String(reason || "") }, diagId, ctx);
-        return curReader ? curReader.cancel(reason).catch(() => {}) : Promise.resolve();
-      }
-    });
-    let finalOut = stitchStream;
-    if (diagMode === "stitch8_fls" && typeof FixedLengthStream !== "undefined") {
-      finalOut = finalOut.pipeThrough(new FixedLengthStream(contentLength));
-    }
-    return new Response(finalOut, {
-      status: isPartial ? 206 : 200,
-      headers: respHeaders
-    });
-  }
-
-  const reader = bodyStream.getReader();
-
-  if (diagMode === "pull") {
-    let remaining = contentLength;
-    let readBytes = 0;
-    let chunks = 0;
-    const pullStream = new ReadableStream({
-      async pull(controller) {
-        try {
-          while (remaining > 0) {
-            const { done, value } = await reader.read();
-            if (done) {
-              recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "trunc", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart }, diagId, ctx);
-              controller.error(new Error(`upstream truncated (${remaining}B short)`));
-              return;
-            }
-            if (!value || value.byteLength === 0) continue;
-            const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value;
-            const dec = xorChunkFast(slice, rotOffset, tables);
-            rotOffset = (rotOffset + slice.byteLength) & 255;
-            remaining -= slice.byteLength;
-            readBytes += slice.byteLength;
-            chunks++;
-            controller.enqueue(dec);
-            if (remaining === 0) {
-              recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "ok", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart }, diagId, ctx);
-              reader.cancel().catch(() => {});
-              controller.close();
-            }
-            return;
-          }
-          controller.close();
-        } catch (err) {
-          recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "err", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: err?.message || String(err) }, diagId, ctx);
-          await reader.cancel(err).catch(() => {});
-          controller.error(err);
-        }
-      },
-      cancel(reason) {
-        if (remaining > 0) {
-          recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "cancel", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: String(reason || "") }, diagId, ctx);
-        }
-        return reader.cancel(reason).catch(() => {});
-      }
-    });
-    return new Response(pullStream, {
-      status: isPartial ? 206 : 200,
-      headers: respHeaders
-    });
-  }
-
-  let fls = null;
-  if (typeof FixedLengthStream !== "undefined") {
-    try {
-      fls = new FixedLengthStream(contentLength);
-    } catch {}
-  }
-
-  if (fls) {
-    const writer = fls.writable.getWriter();
-    let remaining = contentLength;
-    let readBytes = 0;
-    let chunks = 0;
-    const modeName = diagMode || "fls";
-    const onAbort = () => {
-      recordStreamDiag({ mode: modeName, file: diagFile, range: diagRange, status: "client_abort", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart });
-      reader.cancel("client abort").catch(() => {});
-      writer.abort("client abort").catch(() => {});
-    };
-    if (request.signal) {
-      request.signal.addEventListener("abort", onAbort, { once: true });
-    }
-
-    const pump = (async () => {
-      try {
-        while (remaining > 0) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!value || value.byteLength === 0) continue;
-          const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value;
-          const out = diagMode === "pass" ? slice : xorChunkFast(slice, rotOffset, tables);
-          rotOffset = (rotOffset + slice.byteLength) & 255;
-          remaining -= slice.byteLength;
-          readBytes += slice.byteLength;
-          chunks++;
-          await writer.ready;
-          await writer.write(out);
-        }
-        if (remaining === 0) {
-          recordStreamDiag({ mode: modeName, file: diagFile, range: diagRange, status: "ok", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart });
-          await writer.close();
-        } else {
-          recordStreamDiag({ mode: modeName, file: diagFile, range: diagRange, status: "trunc", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: `short ${remaining}B` });
-          await writer.abort(new Error(`upstream truncated (${remaining}B short)`));
-        }
-      } catch (err) {
-        recordStreamDiag({ mode: modeName, file: diagFile, range: diagRange, status: "err", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: err?.message || String(err) });
-        await reader.cancel(err).catch(() => {});
-        await writer.abort(err).catch(() => {});
-      } finally {
-        if (request.signal) {
-          try { request.signal.removeEventListener("abort", onAbort); } catch {}
-        }
-      }
-    })();
-
-    if (ctx && ctx.waitUntil) ctx.waitUntil(pump);
-    else pump.catch(() => {});
-
-    return new Response(fls.readable, {
-      status: isPartial ? 206 : 200,
-      headers: respHeaders
-    });
-  }
-
-  const fallbackStream = new ReadableStream({
-    async pull(controller) {
-      try {
-        const { done, value } = await reader.read();
-        if (done) {
-          controller.close();
-          return;
-        }
-        const dec = xorChunkFast(value, rotOffset, tables);
-        rotOffset = (rotOffset + value.byteLength) & 255;
-        controller.enqueue(dec);
-      } catch (err) {
-        controller.error(err);
-      }
-    },
-    cancel(reason) {
-      return reader.cancel(reason).catch(() => {});
+  const ts = new TransformStream({
+    transform(chunk, controller) {
+      if (remaining <= 0 || !chunk || chunk.byteLength === 0) return;
+      const slice = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
+      const dec = xorChunkFast(slice, rotOffset, tables);
+      rotOffset = (rotOffset + slice.byteLength) & 255;
+      remaining -= slice.byteLength;
+      controller.enqueue(dec);
     }
   });
 
-  return new Response(fallbackStream, {
+  return new Response(pipeFixedLength(upstreamResp.body.pipeThrough(ts), contentLength), {
     status: isPartial ? 206 : 200,
     headers: respHeaders
   });
@@ -809,27 +572,10 @@ export default {
       }
     }
 
-    if (url.pathname === "/__stream_diag") {
-      const id = url.searchParams.get("id");
-      let startRec = null;
-      let endRec = null;
-      if (id && typeof caches !== "undefined" && caches.default) {
-        try {
-          const r1 = await caches.default.match(new Request("https://diag-log.internal/" + encodeURIComponent(id + ":start")));
-          if (r1) startRec = await r1.json();
-          const r2 = await caches.default.match(new Request("https://diag-log.internal/" + encodeURIComponent(id)));
-          if (r2) endRec = await r2.json();
-        } catch {}
-      }
-      return new Response(JSON.stringify({ isolate: ISOLATE_ID, upMs: Date.now() - BOOT_TS, startRec, endRec, count: streamDiag.length, logs: streamDiag }, null, 2), {
-        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
-      });
-    }
-
     // 2. Giải mã & Stream trực tiếp file video từ Hugging Face (/hf/... hoặc /<user>/<repo>/<file> hoặc /?url=...)
     const hfUrl = resolveHfUrl(url);
     if (hfUrl) {
-      return handleHfStream(request, url, hfUrl, ctx);
+      return handleHfStream(request, url, hfUrl, ctx, env);
     }
 
     // 3. Stremio Addon Router
