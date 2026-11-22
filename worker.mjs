@@ -52,10 +52,20 @@ const DEFAULT_TABLES = buildKeyTables(DEFAULT_KEY);
 const metaCache = new Map();
 const inFlightMeta = new Map();
 const streamDiag = [];
+const ISOLATE_ID = Math.random().toString(36).slice(2, 8);
+const BOOT_TS = Date.now();
 
-function recordStreamDiag(entry) {
-  streamDiag.push({ t: new Date().toISOString(), ...entry });
+function recordStreamDiag(entry, diagId = "", ctx = null) {
+  const rec = { t: new Date().toISOString(), isolate: ISOLATE_ID, upMs: Date.now() - BOOT_TS, ...entry };
+  streamDiag.push(rec);
   if (streamDiag.length > 40) streamDiag.shift();
+  if (diagId && typeof caches !== "undefined" && caches.default) {
+    const p = caches.default.put(
+      new Request("https://diag-log.internal/" + encodeURIComponent(diagId)),
+      new Response(JSON.stringify(rec), { headers: { "Cache-Control": "max-age=300" } })
+    ).catch(() => {});
+    if (ctx && ctx.waitUntil) ctx.waitUntil(p);
+  }
 }
 
 function xor32Blocks(src32, dst32, k32, n32) {
@@ -467,10 +477,16 @@ async function handleHfStream(request, url, hfUrl, ctx) {
   }
 
   const diagMode = url.searchParams.get("__diag") || "";
+  const diagId = url.searchParams.get("__diag_id") || "";
   const diagFile = hfUrl.split("/").pop() || "";
   const diagRange = `${start}-${end}/${mediaSize}`;
   const tStart = Date.now();
   let bodyStream = upstreamResp.body;
+  if (diagMode || diagId) {
+    respHeaders.set("X-Isolate", ISOLATE_ID);
+    respHeaders.set("X-Uptime", String(Date.now() - BOOT_TS));
+    recordStreamDiag({ stage: "start", mode: diagMode || "fls", file: diagFile, range: diagRange, expected: contentLength }, diagId ? diagId + ":start" : "", ctx);
+  }
 
   if (diagMode === "rawbody") {
     return new Response(bodyStream, {
@@ -509,6 +525,104 @@ async function handleHfStream(request, url, hfUrl, ctx) {
   // 4. File mã hóa: Giải mã XOR
   let rotOffset = ((start % 256) + 256) % 256;
   const tables = meta.tables || DEFAULT_TABLES;
+
+  if (diagMode === "ts_only" || diagMode === "ts_xor" || diagMode === "ts_xor_fls") {
+    let remaining = contentLength;
+    let readBytes = 0;
+    let chunks = 0;
+    const doXor = diagMode !== "ts_only";
+    const ts = new TransformStream({
+      transform(chunk, controller) {
+        if (remaining <= 0 || !chunk || chunk.byteLength === 0) return;
+        const slice = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
+        const out = doXor ? xorChunkFast(slice, rotOffset, tables) : slice;
+        rotOffset = (rotOffset + slice.byteLength) & 255;
+        remaining -= slice.byteLength;
+        readBytes += slice.byteLength;
+        chunks++;
+        controller.enqueue(out);
+      },
+      flush() {
+        recordStreamDiag({ stage: "end", mode: diagMode, file: diagFile, range: diagRange, status: remaining === 0 ? "ok" : "trunc", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart }, diagId, ctx);
+      }
+    });
+    let outStream = bodyStream.pipeThrough(ts);
+    if (diagMode === "ts_xor_fls" && typeof FixedLengthStream !== "undefined") {
+      outStream = outStream.pipeThrough(new FixedLengthStream(contentLength));
+    }
+    return new Response(outStream, {
+      status: isPartial ? 206 : 200,
+      headers: respHeaders
+    });
+  }
+
+  if (diagMode === "stitch8" || diagMode === "stitch8_fls") {
+    try { await bodyStream?.cancel(); } catch {}
+    const CHUNK_UP = 8 * 1024 * 1024;
+    let cursor = start;
+    let curReader = null;
+    let readBytes = 0;
+    let chunks = 0;
+    let subReqs = 0;
+    const stitchStream = new ReadableStream({
+      async pull(controller) {
+        try {
+          while (cursor <= end) {
+            if (!curReader) {
+              const partEnd = Math.min(end, cursor + CHUNK_UP - 1);
+              subReqs++;
+              const sr = await fetch(meta.cdnUrl, {
+                headers: { Range: `bytes=${cursor + meta.headerSize}-${partEnd + meta.headerSize}` }
+              });
+              if (!sr.ok && sr.status !== 206) {
+                throw new Error(`stitch upstream ${sr.status}`);
+              }
+              curReader = sr.body.getReader();
+            }
+            const { done, value } = await curReader.read();
+            if (done) {
+              curReader = null;
+              continue;
+            }
+            if (!value || value.byteLength === 0) continue;
+            const left = end - cursor + 1;
+            const slice = value.byteLength > left ? value.subarray(0, left) : value;
+            const dec = xorChunkFast(slice, rotOffset, tables);
+            rotOffset = (rotOffset + slice.byteLength) & 255;
+            cursor += slice.byteLength;
+            readBytes += slice.byteLength;
+            chunks++;
+            controller.enqueue(dec);
+            if (cursor > end) {
+              recordStreamDiag({ stage: "end", mode: diagMode, status: "ok", readBytes, expected: contentLength, chunks, subReqs, ms: Date.now() - tStart }, diagId, ctx);
+              await curReader.cancel().catch(() => {});
+              curReader = null;
+              controller.close();
+            }
+            return;
+          }
+          controller.close();
+        } catch (err) {
+          recordStreamDiag({ stage: "end", mode: diagMode, status: "err", readBytes, expected: contentLength, chunks, subReqs, ms: Date.now() - tStart, msg: err?.message || String(err) }, diagId, ctx);
+          if (curReader) await curReader.cancel(err).catch(() => {});
+          controller.error(err);
+        }
+      },
+      cancel(reason) {
+        recordStreamDiag({ stage: "end", mode: diagMode, status: "cancel", readBytes, expected: contentLength, chunks, subReqs, ms: Date.now() - tStart, msg: String(reason || "") }, diagId, ctx);
+        return curReader ? curReader.cancel(reason).catch(() => {}) : Promise.resolve();
+      }
+    });
+    let finalOut = stitchStream;
+    if (diagMode === "stitch8_fls" && typeof FixedLengthStream !== "undefined") {
+      finalOut = finalOut.pipeThrough(new FixedLengthStream(contentLength));
+    }
+    return new Response(finalOut, {
+      status: isPartial ? 206 : 200,
+      headers: respHeaders
+    });
+  }
+
   const reader = bodyStream.getReader();
 
   if (diagMode === "pull") {
@@ -521,7 +635,7 @@ async function handleHfStream(request, url, hfUrl, ctx) {
           while (remaining > 0) {
             const { done, value } = await reader.read();
             if (done) {
-              recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "trunc", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart });
+              recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "trunc", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart }, diagId, ctx);
               controller.error(new Error(`upstream truncated (${remaining}B short)`));
               return;
             }
@@ -534,7 +648,7 @@ async function handleHfStream(request, url, hfUrl, ctx) {
             chunks++;
             controller.enqueue(dec);
             if (remaining === 0) {
-              recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "ok", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart });
+              recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "ok", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart }, diagId, ctx);
               reader.cancel().catch(() => {});
               controller.close();
             }
@@ -542,14 +656,14 @@ async function handleHfStream(request, url, hfUrl, ctx) {
           }
           controller.close();
         } catch (err) {
-          recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "err", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: err?.message || String(err) });
+          recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "err", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: err?.message || String(err) }, diagId, ctx);
           await reader.cancel(err).catch(() => {});
           controller.error(err);
         }
       },
       cancel(reason) {
         if (remaining > 0) {
-          recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "cancel", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: String(reason || "") });
+          recordStreamDiag({ mode: "pull", file: diagFile, range: diagRange, status: "cancel", readBytes, expected: contentLength, chunks, ms: Date.now() - tStart, msg: String(reason || "") }, diagId, ctx);
         }
         return reader.cancel(reason).catch(() => {});
       }
@@ -696,7 +810,18 @@ export default {
     }
 
     if (url.pathname === "/__stream_diag") {
-      return new Response(JSON.stringify({ count: streamDiag.length, logs: streamDiag }, null, 2), {
+      const id = url.searchParams.get("id");
+      let startRec = null;
+      let endRec = null;
+      if (id && typeof caches !== "undefined" && caches.default) {
+        try {
+          const r1 = await caches.default.match(new Request("https://diag-log.internal/" + encodeURIComponent(id + ":start")));
+          if (r1) startRec = await r1.json();
+          const r2 = await caches.default.match(new Request("https://diag-log.internal/" + encodeURIComponent(id)));
+          if (r2) endRec = await r2.json();
+        } catch {}
+      }
+      return new Response(JSON.stringify({ isolate: ISOLATE_ID, upMs: Date.now() - BOOT_TS, startRec, endRec, count: streamDiag.length, logs: streamDiag }, null, 2), {
         headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
       });
     }
