@@ -599,7 +599,13 @@ export default {
       return;
     }
 
-    // 0. Tuyến 0 (sync-realtime): chạy mỗi 30 phút một lần vào :00 và :30 (quét 5 trang cập nhật + trang 1 ID mới)
+    // 0. Tuyến 0 hàng ngày (19:30 UTC = 02:30 VN): đối soát toàn bộ danh mục 100% API <-> DB (sau đó :40 match-hf sẽ tự đối chiếu HF).
+    if (hour === 19 && min >= 20) {
+      await dispatch("reconcile-api.yml", { delay: "180", batch_size: "50", dry_run: "false" });
+      return;
+    }
+
+    // Tuyến 0 (sync-realtime): chạy mỗi 30 phút một lần vào :00 và :30 (quét 5 trang cập nhật + trang 1 ID mới)
     await dispatch("sync-realtime.yml", { pages: "5" });
 
     // 1. Tuyến 1 (crawl): chạy mỗi giờ một lần (vào đầu giờ :00)

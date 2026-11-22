@@ -1,0 +1,64 @@
+name: reconcile-api
+
+on:
+  # Chạy 1 lần/ngày vào 19:30 UTC (02:30 sáng VN) do Cloudflare Worker Cron Trigger dispatch.
+  workflow_dispatch:
+    inputs:
+      delay:
+        description: "Độ trễ giữa mỗi lượt gọi single_details (ms)"
+        default: "180"
+        required: false
+      batch_size:
+        description: "Số câu lệnh SQL mỗi batch"
+        default: "50"
+        required: false
+      dry_run:
+        description: "Chỉ kiểm thử, không ghi DB (true/false)"
+        default: "false"
+        required: false
+      allow_large_prune:
+        description: "Cho phép xóa nếu tỷ lệ > 45% DB"
+        default: "false"
+        required: false
+
+# Dùng chung concurrency group với sync-realtime để không bao giờ ghi/xóa titles song song.
+concurrency:
+  group: p4k-sync-realtime
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Đối soát 100% API Phim4K <-> Turso DB
+        shell: bash
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TURSO_TIMEOUT: "90000"
+          TURSO_MAX_CONCURRENT: "2"
+        run: |
+          set -o pipefail
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --dry-run"
+          fi
+          if [ "${{ github.event.inputs.allow_large_prune }}" == "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --allow-large-prune"
+          fi
+          node reconcile-api.mjs \
+            --delay "${{ github.event.inputs.delay || '180' }}" \
+            --batch-size "${{ github.event.inputs.batch_size || '50' }}" \
+            $EXTRA_ARGS 2>&1 | tee reconcile.log
+      - name: Báo cáo kết quả
+        if: always()
+        run: |
+          echo "### Kết quả Đối soát 100% API Phim4K" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          grep -A 12 "TỔNG KẾT ĐỐI SOÁT" reconcile.log >> "$GITHUB_STEP_SUMMARY" || tail -25 reconcile.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
