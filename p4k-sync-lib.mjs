@@ -258,6 +258,7 @@ export class BatchCollector {
     this.dryRun = dryRun;
     this.queue = [];
     this.totalFlushed = 0;
+    this.flushChain = Promise.resolve();
   }
 
   async add(stmt) {
@@ -269,23 +270,28 @@ export class BatchCollector {
   }
 
   async flush() {
-    if (this.dryRun || this.queue.length === 0) return;
-    const batch = [...this.queue];
-    this.queue = [];
-    try {
-      await this.client.batch(batch);
-      this.totalFlushed += batch.length;
-    } catch (e) {
-      console.error(`Lỗi thực thi batch ${batch.length} câu lệnh:`, e.message);
-      for (const s of batch) {
+    if (this.dryRun) return;
+    const run = this.flushChain.then(async () => {
+      while (this.queue.length > 0) {
+        const batch = this.queue.splice(0, this.batchSize);
         try {
-          await this.client.exec(s.sql, s.args || []);
-          this.totalFlushed++;
-        } catch (singleErr) {
-          console.error(`Lỗi câu lệnh đơn: ${s.sql}`, singleErr.message);
+          await this.client.batch(batch);
+          this.totalFlushed += batch.length;
+        } catch (e) {
+          console.error(`Lỗi thực thi batch ${batch.length} câu lệnh:`, e.message);
+          for (const s of batch) {
+            try {
+              await this.client.exec(s.sql, s.args || []);
+              this.totalFlushed++;
+            } catch (singleErr) {
+              console.error(`Lỗi câu lệnh đơn: ${s.sql}`, singleErr.message);
+            }
+          }
         }
       }
-    }
+    });
+    this.flushChain = run.catch(() => {});
+    await run;
   }
 }
 

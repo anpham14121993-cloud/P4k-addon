@@ -12,6 +12,14 @@ on:
         description: "Số câu lệnh SQL mỗi batch"
         default: "50"
         required: false
+      concurrency:
+        description: "Số luồng gọi single_details song song"
+        default: "4"
+        required: false
+      type:
+        description: "Phạm vi refresh: all | movie | series"
+        default: "all"
+        required: false
       dry_run:
         description: "Chỉ kiểm thử, không ghi DB (true/false)"
         default: "false"
@@ -49,7 +57,7 @@ jobs:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           TURSO_TIMEOUT: "90000"
-          TURSO_MAX_CONCURRENT: "2"
+          TURSO_MAX_CONCURRENT: "4"
         run: |
           set -o pipefail
           EXTRA_ARGS=""
@@ -68,6 +76,8 @@ jobs:
           node reconcile-api.mjs \
             --delay "${{ github.event.inputs.delay || '180' }}" \
             --batch-size "${{ github.event.inputs.batch_size || '50' }}" \
+            --concurrency "${{ github.event.inputs.concurrency || '4' }}" \
+            --type "${{ github.event.inputs.type || 'all' }}" \
             $EXTRA_ARGS 2>&1 | tee reconcile.log
       - name: Báo cáo kết quả
         if: always()

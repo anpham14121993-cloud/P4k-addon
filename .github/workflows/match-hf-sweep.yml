@@ -11,6 +11,14 @@ on:
         description: "Luồng mỗi shard (mặc định 2 x 7 shard = 14 luồng toàn cụm)"
         default: "2"
         required: false
+      cooldown_hours:
+        description: "Số giờ chờ trước khi kiểm tra lại mã từng miss (mặc định 168 = 7 ngày)"
+        default: "168"
+        required: false
+      scope:
+        description: "Phạm vi: all | series | movie"
+        default: "all"
+        required: false
       dry_run:
         description: "Chỉ kiểm thử, không ghi DB (true/false)"
         default: "false"
@@ -52,11 +60,14 @@ jobs:
             type: series
             shard: "5/6"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - if: ${{ (github.event.inputs.scope || 'all') == 'all' || (github.event.inputs.scope || 'all') == matrix.type }}
+        uses: actions/checkout@v4
+      - if: ${{ (github.event.inputs.scope || 'all') == 'all' || (github.event.inputs.scope || 'all') == matrix.type }}
+        uses: actions/setup-node@v4
         with:
           node-version: "24"
       - name: Quét đối chiếu [${{ matrix.label }}] (${{ matrix.type }} shard ${{ matrix.shard }})
+        if: ${{ (github.event.inputs.scope || 'all') == 'all' || (github.event.inputs.scope || 'all') == matrix.type }}
         shell: bash
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -74,9 +85,10 @@ jobs:
             --limit=0 \
             --budget="${{ github.event.inputs.budget || '18000' }}" \
             --concurrency="${{ github.event.inputs.concurrency || '2' }}" \
+            --cooldown-hours="${{ github.event.inputs.cooldown_hours || '168' }}" \
             $EXTRA_ARGS 2>&1 | tee match-hf.log
       - name: Báo cáo kết quả [${{ matrix.label }}]
-        if: always()
+        if: ${{ always() && ((github.event.inputs.scope || 'all') == 'all' || (github.event.inputs.scope || 'all') == matrix.type) }}
         run: |
           echo "### Kết quả Tổng Quét Đối Chiếu [${{ matrix.label }}]" >> "$GITHUB_STEP_SUMMARY"
           echo '```text' >> "$GITHUB_STEP_SUMMARY"

@@ -20,6 +20,11 @@ const api = createP4kApi();
 
 const DELAY_MS = Math.max(50, parseInt(cli.get("delay", "180"), 10) || 180);
 const BATCH_SIZE = Math.max(10, parseInt(cli.get("batch-size", "50"), 10) || 50);
+const CONCURRENCY = Math.max(1, Math.min(8, parseInt(cli.get("concurrency", "4"), 10) || 4));
+const TARGET_TYPE = (() => {
+  const t = String(cli.get("type", "all") || "all").toLowerCase();
+  return t === "movie" || t === "series" ? t : "all";
+})();
 const DRY_RUN = cli.has("dry-run");
 const ALLOW_LARGE_PRUNE = cli.has("allow-large-prune");
 const REFRESH_ALL = cli.has("refresh-all");
@@ -137,7 +142,7 @@ async function collectPreservedData(clientRef, deleteIds, dbMap) {
 async function main() {
   console.log("=============================================================================");
   console.log(">>> ĐỐI SOÁT 100% DANH MỤC API PHIM4K <-> ORACLE/TURSO DB (LỰA CHỌN A) <<<");
-  console.log(`Chế độ: ${DRY_RUN ? "DRY-RUN (Chỉ đọc)" : "GHI DATABASE"} | Delay: ${DELAY_MS}ms`);
+  console.log(`Chế độ: ${DRY_RUN ? "DRY-RUN (Chỉ đọc)" : "GHI DATABASE"} | Type: ${TARGET_TYPE} | Conc: ${CONCURRENCY} | Delay: ${DELAY_MS}ms`);
   console.log("=============================================================================\n");
 
   const { liveMap, movieCount, seriesCount } = await fetchLiveCatalogSnapshot();
@@ -165,9 +170,10 @@ async function main() {
   const toSync = [];
   for (const entry of liveMap.values()) {
     const dbRow = dbMap.get(entry.id);
-    if (REFRESH_ALL || !dbRow || dbRow.type !== entry.type || (REFRESH_DEAD && deadTitleIds.has(entry.id))) {
-      toSync.push(entry);
-    }
+    const needsSync = REFRESH_ALL || !dbRow || dbRow.type !== entry.type || (REFRESH_DEAD && deadTitleIds.has(entry.id));
+    if (!needsSync) continue;
+    if (TARGET_TYPE !== "all" && dbRow && dbRow.type === entry.type && entry.type !== TARGET_TYPE) continue;
+    toSync.push(entry);
   }
 
   const pruneRatio = dbMap.size > 0 ? toDeleteIds.length / dbMap.size : 0;
@@ -197,38 +203,46 @@ async function main() {
 
   const isDeadOldIdFn = async (oldId) => !liveMap.has(Number(oldId));
 
-  for (let i = 0; i < toSync.length; i++) {
-    const entry = toSync[i];
-    const detailType = entry.type === "series" ? "tvseries" : "movie";
-    const d = await api.fetchWithRetry(`${P4K_API_BASE}single_details?type=${detailType}&id=${entry.id}`, 3);
-    if (!d || !d.videos_id) {
-      stats.detailNotFound++;
-      console.warn(`  [${i + 1}/${toSync.length}] [${entry.id}] single_details rỗng/không tồn tại (${d && d.message ? d.message : "null"}).`);
-    } else {
-      const k = `${entry.type}|${normalizeText(d.title)}|${parseInt(String(d.release || "").slice(0, 4), 10) || ""}`;
-      const fallbackImdbId = preservedImdbByNorm.get(k) || null;
-      const itemUpdatedAt = startTime - entry.pos * 10000;
-      const res = await syncTitleRecord({
-        client,
-        collector,
-        item: entry.item,
-        detail: d,
-        type: entry.type,
-        itemUpdatedAt,
-        force: Boolean(dbMap.has(entry.id) && dbMap.get(entry.id).type !== entry.type),
-        isDeadOldIdFn,
-        preservedHfMap: preservedHfByFileId,
-        fallbackImdbId,
-        stats,
-      });
-      if ((i + 1) % 50 === 0 || i === toSync.length - 1 || res.status === "synced") {
-        if ((i + 1) % 25 === 0 || i === toSync.length - 1) {
-          console.log(`  [${i + 1}/${toSync.length}] Đã xử lý [${entry.type}] [${entry.id}] ${d.title}`);
+  let syncIdx = 0;
+  let processed = 0;
+  async function syncWorker() {
+    while (syncIdx < toSync.length) {
+      const i = syncIdx++;
+      const entry = toSync[i];
+      const detailType = entry.type === "series" ? "tvseries" : "movie";
+      const d = await api.fetchWithRetry(`${P4K_API_BASE}single_details?type=${detailType}&id=${entry.id}`, 3);
+      if (!d || !d.videos_id) {
+        stats.detailNotFound++;
+        console.warn(`  [${i + 1}/${toSync.length}] [${entry.id}] single_details rỗng/không tồn tại (${d && d.message ? d.message : "null"}).`);
+      } else {
+        const k = `${entry.type}|${normalizeText(d.title)}|${parseInt(String(d.release || "").slice(0, 4), 10) || ""}`;
+        const fallbackImdbId = preservedImdbByNorm.get(k) || null;
+        const itemUpdatedAt = startTime - entry.pos * 10000;
+        const res = await syncTitleRecord({
+          client,
+          collector,
+          item: entry.item,
+          detail: d,
+          type: entry.type,
+          itemUpdatedAt,
+          force: Boolean(dbMap.has(entry.id) && dbMap.get(entry.id).type !== entry.type),
+          isDeadOldIdFn,
+          preservedHfMap: preservedHfByFileId,
+          fallbackImdbId,
+          stats,
+        });
+        const doneNo = ++processed;
+        if (doneNo % 25 === 0 || doneNo === toSync.length || res.status === "synced") {
+          if (doneNo % 25 === 0 || doneNo === toSync.length) {
+            console.log(`  [${doneNo}/${toSync.length}] Đã xử lý [${entry.type}] [${entry.id}] ${d.title} (synced=${stats.titlesSynced} skip=${stats.titlesSkipped} +stream=${stats.streamsInserted} -stream=${stats.streamsDeleted})`);
+          }
         }
       }
+      if (DELAY_MS > 0) await sleep(DELAY_MS);
     }
-    if (i < toSync.length - 1 && DELAY_MS > 0) await sleep(DELAY_MS);
   }
+
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, Math.max(1, toSync.length)) }, () => syncWorker()));
 
   await collector.flush();
 
