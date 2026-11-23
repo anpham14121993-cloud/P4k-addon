@@ -606,9 +606,9 @@ export default {
       return;
     }
 
-    // 0. Tuyến 0 hàng ngày (19:30 UTC = 02:30 VN): đối soát toàn bộ danh mục 100% API <-> DB (sau đó :40 match-hf sẽ tự đối chiếu HF).
+    // 0. Tuyến 0 hàng ngày (19:30 UTC = 02:30 VN): đối soát toàn bộ danh mục 100% API <-> DB + quét lại chi tiết toàn bộ phim (--refresh-all) để bắt cả file mới thêm ngầm trên phim cũ.
     if (hour === 19 && min >= 20) {
-      await dispatch("reconcile-api.yml", { delay: "180", batch_size: "50", dry_run: "false" });
+      await dispatch("reconcile-api.yml", { delay: "120", batch_size: "50", concurrency: "5", type: "all", refresh_all: "true", dry_run: "false" });
       return;
     }
 
