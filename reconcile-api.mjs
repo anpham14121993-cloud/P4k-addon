@@ -23,6 +23,7 @@ const BATCH_SIZE = Math.max(10, parseInt(cli.get("batch-size", "50"), 10) || 50)
 const DRY_RUN = cli.has("dry-run");
 const ALLOW_LARGE_PRUNE = cli.has("allow-large-prune");
 const REFRESH_ALL = cli.has("refresh-all");
+const REFRESH_DEAD = cli.has("refresh-dead");
 
 const MIN_EXPECTED_MOVIES = 1000;
 const MIN_EXPECTED_SERIES = 1000;
@@ -154,10 +155,17 @@ async function main() {
     if (!liveMap.has(id)) toDeleteIds.push(id);
   }
 
+  const deadTitleIds = new Set();
+  if (REFRESH_DEAD && !REFRESH_ALL) {
+    const deadRes = await client.exec("SELECT DISTINCT title_id FROM episodes_streams WHERE hf_status = 'dead'");
+    for (const r of deadRes.rows || []) deadTitleIds.add(Number(r.title_id));
+    console.log(`[REFRESH-DEAD] Sẽ kiểm tra lại ${deadTitleIds.size} phim đang có luồng dead.`);
+  }
+
   const toSync = [];
   for (const entry of liveMap.values()) {
     const dbRow = dbMap.get(entry.id);
-    if (REFRESH_ALL || !dbRow || dbRow.type !== entry.type) {
+    if (REFRESH_ALL || !dbRow || dbRow.type !== entry.type || (REFRESH_DEAD && deadTitleIds.has(entry.id))) {
       toSync.push(entry);
     }
   }
@@ -182,6 +190,7 @@ async function main() {
     titlesSkipped: 0,
     duplicatesCleaned: 0,
     streamsInserted: 0,
+    streamsDeleted: 0,
     detailNotFound: 0,
     deletedIds: new Set(),
   };
@@ -206,7 +215,7 @@ async function main() {
         detail: d,
         type: entry.type,
         itemUpdatedAt,
-        force: REFRESH_ALL || Boolean(dbMap.has(entry.id) && dbMap.get(entry.id).type !== entry.type),
+        force: Boolean(dbMap.has(entry.id) && dbMap.get(entry.id).type !== entry.type),
         isDeadOldIdFn,
         preservedHfMap: preservedHfByFileId,
         fallbackImdbId,
@@ -266,7 +275,7 @@ async function main() {
   console.log(`Phim đã nạp/cập nhật: ${stats.titlesSynced} (detail rỗng: ${stats.detailNotFound})`);
   console.log(`Phim đã bỏ qua (không đổi): ${stats.titlesSkipped}`);
   console.log(`Smart Merge khi đối soát: ${stats.duplicatesCleaned}`);
-  console.log(`Stream mới nạp: ${stats.streamsInserted}`);
+  console.log(`Stream mới nạp: ${stats.streamsInserted} | Stream cũ đã dọn: ${stats.streamsDeleted}`);
   console.log(`ID đã xóa khỏi DB: ${DRY_RUN ? `${toDeleteIds.length} (dry-run)` : toDeleteIds.length}`);
   if (postDbCounts) {
     console.log(

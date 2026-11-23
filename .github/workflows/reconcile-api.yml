@@ -20,6 +20,14 @@ on:
         description: "Cho phép xóa nếu tỷ lệ > 45% DB"
         default: "false"
         required: false
+      refresh_dead:
+        description: "Quét lại các phim có luồng dead để nhận file_id mới từ API"
+        default: "true"
+        required: false
+      refresh_all:
+        description: "Quét lại chi tiết toàn bộ phim trong DB"
+        default: "false"
+        required: false
 
 # Dùng chung concurrency group với sync-realtime để không bao giờ ghi/xóa titles song song.
 concurrency:
@@ -50,6 +58,12 @@ jobs:
           fi
           if [ "${{ github.event.inputs.allow_large_prune }}" == "true" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --allow-large-prune"
+          fi
+          if [ "${{ github.event.inputs.refresh_dead }}" != "false" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --refresh-dead"
+          fi
+          if [ "${{ github.event.inputs.refresh_all }}" == "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --refresh-all"
           fi
           node reconcile-api.mjs \
             --delay "${{ github.event.inputs.delay || '180' }}" \

@@ -343,6 +343,18 @@ function buildStreamStmt({ vId, season, episode, fid, label, container, quality,
   };
 }
 
+async function preserveTitleHfData(client, titleId, targetMap) {
+  const hfRows = await client.exec(
+    "SELECT file_id, hf_id, hf_checked_at, hf_status, hf_fails, rail_size FROM episodes_streams WHERE title_id = ? AND (hf_id IS NOT NULL OR hf_checked_at IS NOT NULL OR hf_status IS NOT NULL)",
+    [titleId]
+  );
+  for (const hr of hfRows.rows || []) {
+    if (hr.file_id && (!targetMap.has(hr.file_id) || (!targetMap.get(hr.file_id).hf_id && hr.hf_id))) {
+      targetMap.set(hr.file_id, hr);
+    }
+  }
+}
+
 /**
  * Đồng bộ 1 phim từ dữ liệu single_details vào bảng titles + episodes_streams.
  * Smart Dedup an toàn: chỉ gộp/xóa ID trùng trong DB khi xác nhận ID cũ đó đã chết trên API.
@@ -361,6 +373,7 @@ export async function syncTitleRecord({
   stats,
   nowMs = Date.now(),
 }) {
+  const effectivePreservedHfMap = preservedHfMap || new Map();
   const vId = Number(detail.videos_id);
   const cleanTitle = normalizeText(detail.title);
   const year = parseInt(String(detail.release || "").slice(0, 4), 10) || null;
@@ -380,17 +393,7 @@ export async function syncTitleRecord({
       const oldId = Number(oldRow.id);
       if (!(await isDeadOldIdFn(oldId, type, oldRow))) continue;
       if (!imdbId && oldRow.imdb_id) imdbId = oldRow.imdb_id;
-      if (preservedHfMap) {
-        const hfRows = await client.exec(
-          "SELECT file_id, hf_id, hf_checked_at, hf_status, hf_fails, rail_size FROM episodes_streams WHERE title_id = ? AND (hf_id IS NOT NULL OR hf_checked_at IS NOT NULL OR hf_status IS NOT NULL)",
-          [oldId]
-        );
-        for (const hr of hfRows.rows || []) {
-          if (hr.file_id && (!preservedHfMap.has(hr.file_id) || (!preservedHfMap.get(hr.file_id).hf_id && hr.hf_id))) {
-            preservedHfMap.set(hr.file_id, hr);
-          }
-        }
-      }
+      await preserveTitleHfData(client, oldId, effectivePreservedHfMap);
       console.log(`  [SMART MERGE] "${detail.title}" -> Xóa ID cũ đã chết trên API (${oldId}), chuyển sang ID sống ${vId}`);
       await collector.add({ sql: "DELETE FROM episodes_streams WHERE title_id = ?", args: [oldId] });
       await collector.add({ sql: "DELETE FROM titles WHERE id = ?", args: [oldId] });
@@ -459,6 +462,7 @@ export async function syncTitleRecord({
 
     if (!existingTitle || hadMerge || typeChanged || force) {
       if (existingTitle) {
+        await preserveTitleHfData(client, vId, effectivePreservedHfMap);
         await collector.add({ sql: "DELETE FROM episodes_streams WHERE title_id = ?", args: [vId] });
       }
       for (const v of apiVideos) {
@@ -475,7 +479,7 @@ export async function syncTitleRecord({
             quality: cleanText(detail.video_quality),
             subtitles: Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
             nowMs,
-            preservedHfMap,
+            preservedHfMap: effectivePreservedHfMap,
           })
         );
         stats.streamsInserted++;
@@ -483,6 +487,7 @@ export async function syncTitleRecord({
     } else {
       for (const sId of staleIds) {
         await collector.add({ sql: "DELETE FROM episodes_streams WHERE id = ?", args: [sId] });
+        stats.streamsDeleted = (stats.streamsDeleted || 0) + 1;
       }
       for (const v of newVideos) {
         const fid = fileNameFrom(v.file_url);
@@ -498,7 +503,7 @@ export async function syncTitleRecord({
             quality: cleanText(detail.video_quality),
             subtitles: Array.isArray(v.subtitle) && v.subtitle.length ? JSON.stringify(v.subtitle) : null,
             nowMs,
-            preservedHfMap,
+            preservedHfMap: effectivePreservedHfMap,
           })
         );
         stats.streamsInserted++;
@@ -554,7 +559,7 @@ export async function syncTitleRecord({
   }
 
   const staleIds = [];
-  if (!typeChanged && !force) {
+  if (!typeChanged && !force && validFids.size > 0) {
     for (const r of existingRows) {
       if (!validFids.has(r.file_id) || !validEpKeys.has(`${r.season}:${r.episode}:${r.file_id}`)) {
         staleIds.push(r.id);
@@ -568,10 +573,14 @@ export async function syncTitleRecord({
   }
 
   if (typeChanged || force) {
+    if (existingTitle) {
+      await preserveTitleHfData(client, vId, effectivePreservedHfMap);
+    }
     await collector.add({ sql: "DELETE FROM episodes_streams WHERE title_id = ?", args: [vId] });
   }
   for (const sId of staleIds) {
     await collector.add({ sql: "DELETE FROM episodes_streams WHERE id = ?", args: [sId] });
+    stats.streamsDeleted = (stats.streamsDeleted || 0) + 1;
   }
 
   await collector.add({ sql: UPSERT_TITLE_SQL, args: titleArgs });
@@ -589,7 +598,7 @@ export async function syncTitleRecord({
         quality: cleanText(detail.video_quality),
         subtitles: pe.subtitles,
         nowMs,
-        preservedHfMap,
+        preservedHfMap: effectivePreservedHfMap,
       })
     );
     stats.streamsInserted++;
