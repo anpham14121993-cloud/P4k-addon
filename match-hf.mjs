@@ -275,17 +275,41 @@ async function markResult(fid, { status, hfId = null, railSize = null, now }) {
 /** Resolve Railway link sống và lấy tổng kích thước byte. */
 async function resolveLiveRailway(fid) {
   const { urls: railUrls, errors } = await resolveRailwayUrls(fid);
-  if (!railUrls.length) return { resolveFailed: true, liveUrl: null, totalSize: 0, lastStatus: 0, mintErrors: errors };
+  if (!railUrls.length) return { resolveFailed: true, liveUrl: null, totalSize: 0, lastStatus: 0, forbidden: false, mintErrors: errors };
 
   let lastStatus = 0;
+  let saw403 = false;
   for (const u of railUrls) {
     const probe = await fetchRailwayRange(u, 0, 32);
     lastStatus = probe.status;
+    if (probe.status === 403) saw403 = true;
     if (probe.ok && probe.totalSize > 1024) {
-      return { resolveFailed: false, liveUrl: u, totalSize: probe.totalSize, lastStatus };
+      return { resolveFailed: false, liveUrl: u, totalSize: probe.totalSize, lastStatus, forbidden: false };
     }
   }
-  return { resolveFailed: false, liveUrl: null, totalSize: 0, lastStatus };
+  return { resolveFailed: false, liveUrl: null, totalSize: 0, lastStatus, forbidden: saw403 };
+}
+
+/** Resolve Railway; cập nhật thống kê lỗi và tuyệt đối không ghi dead khi Railway trả HTTP 403. */
+async function resolveOrRecordFailure(fid, stats, { prefix = "", shouldLog = false, logLabel = "" } = {}) {
+  const rail = await resolveLiveRailway(fid);
+  if (rail.resolveFailed) {
+    stats.resolveFail++;
+    if (stats.resolveFail <= 10) console.warn(`  [${prefix}RESOLVE-FAIL] ${fid}: ${(rail.mintErrors || []).join(", ") || "empty"}`);
+    return null;
+  }
+  if (!rail.liveUrl) {
+    if (rail.forbidden || rail.lastStatus === 403) {
+      stats.forbidden++;
+      if (shouldLog) console.log(`  [${logLabel}] ${fid}: Railway HTTP 403 (bỏ qua, không ghi dead)`);
+      return null;
+    }
+    stats.dead++;
+    await markResult(fid, { status: "dead", now: Date.now() });
+    if (shouldLog) console.log(`  [${logLabel}] ${fid}: Railway HTTP ${rail.lastStatus} (backoff)`);
+    return null;
+  }
+  return rail;
 }
 
 /** Đối chiếu một file Railway đang sống với các ứng viên cùng dung lượng trong bảng files. */
@@ -352,19 +376,9 @@ async function checkReadyNoHf(deadline, stats) {
       const savedSize = Number(rows[i].rail_size || 0);
       stats.noHfRechecked++;
       try {
-        const rail = await resolveLiveRailway(fid);
-        if (rail.resolveFailed) {
-          stats.resolveFail++;
-          if (stats.resolveFail <= 10) console.warn(`  [NO_HF RESOLVE-FAIL] ${fid}: ${(rail.mintErrors || []).join(", ") || "empty"}`);
-          continue;
-        }
-        const now = Date.now();
-        if (!rail.liveUrl) {
-          stats.dead++;
-          await markResult(fid, { status: "dead", now });
-          continue;
-        }
-        await matchAgainstHf(fid, rail.liveUrl, rail.totalSize || savedSize, now, stats, `NO_HF ${i + 1}/${rows.length}`);
+        const rail = await resolveOrRecordFailure(fid, stats, { prefix: "NO_HF " });
+        if (!rail) continue;
+        await matchAgainstHf(fid, rail.liveUrl, rail.totalSize || savedSize, Date.now(), stats, `NO_HF ${i + 1}/${rows.length}`);
       } catch (e) {
         console.warn(`  [NO_HF ERR] ${fid}: ${e.message || e}`);
       }
@@ -386,7 +400,7 @@ async function main() {
 
   if (!DRY_RUN) await ensureSchema();
 
-  const stats = { total: 0, noHfRechecked: 0, probed: 0, matched: 0, dead: 0, resolveFail: 0, noHfCandidate: 0, mismatch: 0 };
+  const stats = { total: 0, noHfRechecked: 0, probed: 0, matched: 0, dead: 0, forbidden: 0, resolveFail: 0, noHfCandidate: 0, mismatch: 0 };
   if (!TARGET_IDS.length) await checkReadyNoHf(deadline, stats);
 
   let candidates;
@@ -476,28 +490,17 @@ async function main() {
       const probedNo = ++stats.probed;
       if (probedNo % 100 === 0) {
         const sec = Math.round((Date.now() - t0) / 1000);
-        console.log(`  [PROGRESS ${probedNo}/${candidates.length} | ${sec}s] matched=${stats.matched} dead=${stats.dead} resolveFail=${stats.resolveFail} noHf=${stats.noHfCandidate} mismatch=${stats.mismatch}`);
+        console.log(`  [PROGRESS ${probedNo}/${candidates.length} | ${sec}s] matched=${stats.matched} dead=${stats.dead} forbidden=${stats.forbidden} resolveFail=${stats.resolveFail} noHf=${stats.noHfCandidate} mismatch=${stats.mismatch}`);
       }
 
       try {
-        const rail = await resolveLiveRailway(fid);
-        if (rail.resolveFailed) {
-          stats.resolveFail++;
-          if (stats.resolveFail <= 10) console.warn(`  [RESOLVE-FAIL] ${fid}: ${(rail.mintErrors || []).join(", ") || "empty"}`);
-          continue;
-        }
+        const rail = await resolveOrRecordFailure(fid, stats, {
+          shouldLog: myIdx < 15 || stats.probed % 25 === 0,
+          logLabel: `${stats.probed}/${candidates.length}`,
+        });
+        if (!rail) continue;
 
-        const now = Date.now();
-        if (!rail.liveUrl) {
-          stats.dead++;
-          await markResult(fid, { status: "dead", now });
-          if (myIdx < 15 || stats.probed % 25 === 0) {
-            console.log(`  [${stats.probed}/${candidates.length}] ${fid}: Railway HTTP ${rail.lastStatus} (backoff)`);
-          }
-          continue;
-        }
-
-        await matchAgainstHf(fid, rail.liveUrl, rail.totalSize, now, stats, `${stats.probed}/${candidates.length}`);
+        await matchAgainstHf(fid, rail.liveUrl, rail.totalSize, Date.now(), stats, `${stats.probed}/${candidates.length}`);
       } catch (e) {
         console.warn(`  [ERR] ${fid}: ${e.message || e}`);
       }
