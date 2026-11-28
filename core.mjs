@@ -328,6 +328,10 @@ function b64urlToBytes(s) {
 async function fetchDynamicConfig() {
   if (Date.now() - dynamicCache.at < DYNAMIC_TTL_MS) return dynamicCache.value;
   const fallback = { ...FALLBACK_CFG };
+  if (!CONFIG_SECRET) {
+    dynamicCache = { at: Date.now(), value: fallback };
+    return fallback;
+  }
   const build = (data, fallback, source) => {
     const url = (v) => (v ? "https://" + v : "");
     return {
@@ -445,10 +449,12 @@ async function genVideoUrl(fileName, host, secret) {
 }
 
 // Secret theo host resolver; host có thể có/không có scheme.
+// Không fallback sang HMAC_SECRET nếu host đã nằm trong HMAC_SECRETS nhưng chưa cấp secret.
 function secretForResolver(host) {
   let h = "";
   try { h = new URL(host).hostname; } catch { h = host; }
-  return HMAC_SECRETS[h] || HMAC_SECRET;
+  if (Object.prototype.hasOwnProperty.call(HMAC_SECRETS, h)) return HMAC_SECRETS[h];
+  return HMAC_SECRET;
 }
 
 // Danh sách resolver theo thứ tự ưu tiên:
@@ -2110,4 +2116,44 @@ export const addon = {
     }
   },
 };
+
+/** Liệt kê danh sách host resolver đã được nạp HMAC secret (không lộ secret). */
+export function configuredResolvers() {
+  return Object.entries(HMAC_SECRETS)
+    .filter(([, secret]) => Boolean(secret))
+    .map(([host]) => host);
+}
+
+/**
+ * Ký HMAC và gọi resolver trực tiếp từ runtime hiện tại (dùng cho GitHub Actions mint vé,
+ * không phụ thuộc endpoint /_diag hay egress mirror của Cloudflare Worker).
+ */
+export async function resolveDirectUrls(fileName, { timeoutMs = RESOLVE_TIMEOUT_MS } = {}) {
+  const cfg = await fetchDynamicConfig();
+  const hosts = resolverList(cfg);
+  const urls = [];
+  const errors = [];
+  for (const host of hosts) {
+    const secret = secretForResolver(host);
+    if (!secret) continue;
+    try {
+      const signed = await genVideoUrl(fileName, host, secret);
+      const res = await fetchWithTimeout(signed, { headers: { Accept: "application/json" } }, timeoutMs);
+      const txt = await res.text().catch(() => "");
+      if (!res.ok) {
+        errors.push(`${hostName(host)}:HTTP${res.status}`);
+        continue;
+      }
+      const minted = extractMint(txt, host);
+      if (minted && minted.url && !urls.includes(minted.url)) {
+        urls.push(minted.url);
+        break;
+      }
+      errors.push(`${hostName(host)}:no-mint`);
+    } catch (e) {
+      errors.push(`${hostName(host)}:${String((e && e.message) || e).slice(0, 40)}`);
+    }
+  }
+  return { urls, errors };
+}
 

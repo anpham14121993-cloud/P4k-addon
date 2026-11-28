@@ -73,6 +73,9 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          P4K_HMAC_SVPC: ${{ secrets.P4K_HMAC_SVPC }}
+          P4K_HMAC_SVATV: ${{ secrets.P4K_HMAC_SVATV }}
+          CONFIG_SECRET: ${{ secrets.CONFIG_SECRET }}
         run: |
           set -o pipefail
           EXTRA_ARGS=""

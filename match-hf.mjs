@@ -4,6 +4,7 @@
 
 import fs from "node:fs";
 import { tursoClient } from "./turso-http.mjs";
+import { setEnv, configuredResolvers, resolveDirectUrls } from "./core.mjs";
 
 if (!process.env.GITHUB_ACTIONS && fs.existsSync("/sdcard/Download/P4k/.env.turso")) {
   for (const line of fs.readFileSync("/sdcard/Download/P4k/.env.turso", "utf8").split(/\r?\n/)) {
@@ -14,6 +15,7 @@ if (!process.env.GITHUB_ACTIONS && fs.existsSync("/sdcard/Download/P4k/.env.turs
     if (k && v && !k.startsWith("#")) process.env[k] = v;
   }
 }
+setEnv(process.env);
 
 const DB_URL = process.env.TURSO_DATABASE_URL || "";
 const DB_TOKEN = process.env.TURSO_AUTH_TOKEN || "";
@@ -55,6 +57,9 @@ const SHARD = (() => {
 })();
 const TARGET_IDS = [...new Set(String(getArg("ids", "") || "").split(",").map((s) => s.trim()).filter(Boolean))];
 const DIAG_URL = (process.env.P4K_DIAG_URL || "https://phim4k-addon.notthingp.workers.dev/_diag").replace(/\/$/, "");
+const ACTIVE_RESOLVERS = configuredResolvers();
+const USE_DIRECT_MINT = ACTIVE_RESOLVERS.length > 0;
+const ALLOW_DIAG_FALLBACK = hasFlag("diag-fallback") || !USE_DIRECT_MINT;
 const HF_TOKENS = String(process.env.HF_TOKEN || "").split(",").map((s) => s.trim()).filter(Boolean);
 const HEADER_SIZE = 64;
 
@@ -111,8 +116,8 @@ async function ensureSchema() {
   await db.exec("CREATE INDEX IF NOT EXISTS idx_files_size ON files(size)");
 }
 
-/** Lấy danh sách URL node Railway từ endpoint /_diag của Worker (dùng fast=1, có retry 1 lần khi 503 tạm thời). */
-async function resolveRailwayUrls(fid) {
+/** Lấy danh sách URL node Railway từ endpoint /_diag của Worker (dùng khi thiếu HMAC secret cục bộ hoặc bật --diag-fallback). */
+async function resolveViaDiag(fid) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await fetch(`${DIAG_URL}?file=${encodeURIComponent(fid)}&fast=1`, {
@@ -130,12 +135,28 @@ async function resolveRailwayUrls(fid) {
         };
         pushJsonUrl(d.direct && d.direct.body);
         for (const m of d.mint || []) pushJsonUrl(m && m.raw);
-        if (urls.length) return urls;
+        if (urls.length) return { urls, errors: [] };
       }
     } catch {}
     if (attempt === 0) await new Promise((res) => setTimeout(res, 1200));
   }
-  return [];
+  return { urls: [], errors: ["diag-empty"] };
+}
+
+/** Mint vé link dự phòng qua resolve trực tiếp từ GitHub/local (hoặc fallback /_diag nếu thiếu secret / bật --diag-fallback). */
+async function resolveRailwayUrls(fid) {
+  let errors = [];
+  if (USE_DIRECT_MINT) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await resolveDirectUrls(fid, { timeoutMs: 10000 });
+      if (res.urls.length) return { urls: res.urls, errors: [] };
+      errors = res.errors;
+      if (attempt === 0) await new Promise((r) => setTimeout(r, 1200));
+    }
+    if (!ALLOW_DIAG_FALLBACK) return { urls: [], errors };
+  }
+  const fb = await resolveViaDiag(fid);
+  return { urls: fb.urls, errors: fb.urls.length ? [] : [...errors, ...fb.errors] };
 }
 
 /** Đọc một dải byte từ Railway (tránh follow redirect ngầm) và trích tổng kích thước stream. */
@@ -243,8 +264,8 @@ async function markResult(fid, { status, hfId = null, railSize = null, now }) {
 
 /** Resolve Railway link sống và lấy tổng kích thước byte. */
 async function resolveLiveRailway(fid) {
-  const railUrls = await resolveRailwayUrls(fid);
-  if (!railUrls.length) return { resolveFailed: true, liveUrl: null, totalSize: 0, lastStatus: 0 };
+  const { urls: railUrls, errors } = await resolveRailwayUrls(fid);
+  if (!railUrls.length) return { resolveFailed: true, liveUrl: null, totalSize: 0, lastStatus: 0, mintErrors: errors };
 
   let lastStatus = 0;
   for (const u of railUrls) {
@@ -322,7 +343,11 @@ async function checkReadyNoHf(deadline, stats) {
       stats.noHfRechecked++;
       try {
         const rail = await resolveLiveRailway(fid);
-        if (rail.resolveFailed) { stats.resolveFail++; continue; }
+        if (rail.resolveFailed) {
+          stats.resolveFail++;
+          if (stats.resolveFail <= 10) console.warn(`  [NO_HF RESOLVE-FAIL] ${fid}: ${(rail.mintErrors || []).join(", ") || "empty"}`);
+          continue;
+        }
         const now = Date.now();
         if (!rail.liveUrl) {
           stats.dead++;
@@ -343,6 +368,11 @@ async function main() {
   const deadline = t0 + BUDGET_MS;
   const mode = NEW_ONLY ? "new-only" : (HOT_ONLY ? "hot-only" : "full");
   console.log(`=== MATCH-HF START | mode=${mode} type=${TARGET_TYPE} shard=${SHARD.index}/${SHARD.total} dryRun=${DRY_RUN} limit=${LIMIT} conc=${CONCURRENCY} budget=${Math.round(BUDGET_MS / 1000)}s cooldown=${COOLDOWN_MS / 3600000}h ===`);
+  console.log(
+    USE_DIRECT_MINT
+      ? `[MINT] mode=github-direct resolvers=${ACTIVE_RESOLVERS.join(",")} diagFallback=${ALLOW_DIAG_FALLBACK}`
+      : `[MINT] mode=cf-worker-diag (thiếu P4K_HMAC_SVPC/P4K_HMAC_SVATV)`
+  );
 
   if (!DRY_RUN) await ensureSchema();
 
@@ -443,6 +473,7 @@ async function main() {
         const rail = await resolveLiveRailway(fid);
         if (rail.resolveFailed) {
           stats.resolveFail++;
+          if (stats.resolveFail <= 10) console.warn(`  [RESOLVE-FAIL] ${fid}: ${(rail.mintErrors || []).join(", ") || "empty"}`);
           continue;
         }
 
