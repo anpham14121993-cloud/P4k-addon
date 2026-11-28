@@ -59,7 +59,9 @@ const TARGET_IDS = [...new Set(String(getArg("ids", "") || "").split(",").map((s
 const DIAG_URL = (process.env.P4K_DIAG_URL || "https://phim4k-addon.notthingp.workers.dev/_diag").replace(/\/$/, "");
 const ACTIVE_RESOLVERS = configuredResolvers();
 const USE_DIRECT_MINT = ACTIVE_RESOLVERS.length > 0;
-const ALLOW_DIAG_FALLBACK = hasFlag("diag-fallback") || !USE_DIRECT_MINT;
+const ALLOW_DIAG_FALLBACK = !hasFlag("no-diag-fallback");
+let directBlockedUntil = 0;
+let loggedDirectFallback = false;
 const HF_TOKENS = String(process.env.HF_TOKEN || "").split(",").map((s) => s.trim()).filter(Boolean);
 const HEADER_SIZE = 64;
 
@@ -143,17 +145,25 @@ async function resolveViaDiag(fid) {
   return { urls: [], errors: ["diag-empty"] };
 }
 
-/** Mint vé link dự phòng qua resolve trực tiếp từ GitHub/local (hoặc fallback /_diag nếu thiếu secret / bật --diag-fallback). */
+/** Mint vé link dự phòng qua resolve trực tiếp từ GitHub/local (tự fallback /_diag khi bị 503 hoặc thiếu secret, tắt bằng --no-diag-fallback). */
 async function resolveRailwayUrls(fid) {
   let errors = [];
-  if (USE_DIRECT_MINT) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+  if (USE_DIRECT_MINT && Date.now() >= directBlockedUntil) {
+    const attempts = ALLOW_DIAG_FALLBACK ? 1 : 2;
+    for (let attempt = 0; attempt < attempts; attempt++) {
       const res = await resolveDirectUrls(fid, { timeoutMs: 10000 });
       if (res.urls.length) return { urls: res.urls, errors: [] };
       errors = res.errors;
-      if (attempt === 0) await new Promise((r) => setTimeout(r, 1200));
+      if (attempt + 1 < attempts) await new Promise((r) => setTimeout(r, 1200));
     }
     if (!ALLOW_DIAG_FALLBACK) return { urls: [], errors };
+    if (errors.some((e) => /HTTP503/.test(e))) {
+      directBlockedUntil = Date.now() + 120_000;
+      if (!loggedDirectFallback) {
+        loggedDirectFallback = true;
+        console.warn(`[MINT] Direct từ runner bị từ chối (${errors.join(", ")}) -> tạm fallback qua /_diag`);
+      }
+    }
   }
   const fb = await resolveViaDiag(fid);
   return { urls: fb.urls, errors: fb.urls.length ? [] : [...errors, ...fb.errors] };
