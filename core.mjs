@@ -2125,23 +2125,25 @@ export function configuredResolvers() {
 }
 
 /**
- * Ký HMAC và gọi resolver trực tiếp từ runtime hiện tại (dùng cho GitHub Actions mint vé,
- * không phụ thuộc endpoint /_diag hay egress mirror của Cloudflare Worker).
+ * Ký HMAC và gọi resolver trực tiếp (hoặc qua p4k-relay nếu viaRelay=true) để mint URL node.
  */
-export async function resolveDirectUrls(fileName, { timeoutMs = RESOLVE_TIMEOUT_MS } = {}) {
+export async function resolveDirectUrls(fileName, { timeoutMs = RESOLVE_TIMEOUT_MS, viaRelay = false } = {}) {
   const cfg = await fetchDynamicConfig();
   const hosts = resolverList(cfg);
   const urls = [];
   const errors = [];
+  const relay = viaRelay ? EGRESS_MIRRORS[0] : null;
   for (const host of hosts) {
     const secret = secretForResolver(host);
     if (!secret) continue;
     try {
       const signed = await genVideoUrl(fileName, host, secret);
-      const res = await fetchWithTimeout(signed, { headers: { Accept: "application/json" } }, timeoutMs);
+      const res = relay
+        ? await fetchMirror(relay, signed, timeoutMs)
+        : await fetchWithTimeout(signed, { headers: { Accept: "application/json" } }, timeoutMs);
       const txt = await res.text().catch(() => "");
       if (!res.ok) {
-        errors.push(`${hostName(host)}:HTTP${res.status}`);
+        errors.push(`${hostName(host)}${relay ? "/relay" : ""}:HTTP${res.status}`);
         continue;
       }
       const minted = extractMint(txt, host);
@@ -2149,9 +2151,9 @@ export async function resolveDirectUrls(fileName, { timeoutMs = RESOLVE_TIMEOUT_
         urls.push(minted.url);
         break;
       }
-      errors.push(`${hostName(host)}:no-mint`);
+      errors.push(`${hostName(host)}${relay ? "/relay" : ""}:no-mint`);
     } catch (e) {
-      errors.push(`${hostName(host)}:${String((e && e.message) || e).slice(0, 40)}`);
+      errors.push(`${hostName(host)}${relay ? "/relay" : ""}:${String((e && e.message) || e).slice(0, 40)}`);
     }
   }
   return { urls, errors };

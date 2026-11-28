@@ -145,25 +145,29 @@ async function resolveViaDiag(fid) {
   return { urls: [], errors: ["diag-empty"] };
 }
 
-/** Mint vé link dự phòng qua resolve trực tiếp từ GitHub/local (tự fallback /_diag khi bị 503 hoặc thiếu secret, tắt bằng --no-diag-fallback). */
+/** Mint vé link dự phòng qua resolve bằng HMAC đã cấu hình (thử direct trước, bị 503 thì relay qua p4k-relay, rồi mới /_diag nếu thiếu secret). */
 async function resolveRailwayUrls(fid) {
   let errors = [];
-  if (USE_DIRECT_MINT && Date.now() >= directBlockedUntil) {
-    const attempts = ALLOW_DIAG_FALLBACK ? 1 : 2;
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      const res = await resolveDirectUrls(fid, { timeoutMs: 10000 });
+  if (USE_DIRECT_MINT) {
+    if (Date.now() >= directBlockedUntil) {
+      const res = await resolveDirectUrls(fid, { timeoutMs: 10000, viaRelay: false });
       if (res.urls.length) return { urls: res.urls, errors: [] };
       errors = res.errors;
-      if (attempt + 1 < attempts) await new Promise((r) => setTimeout(r, 1200));
-    }
-    if (!ALLOW_DIAG_FALLBACK) return { urls: [], errors };
-    if (errors.some((e) => /HTTP503/.test(e))) {
-      directBlockedUntil = Date.now() + 120_000;
-      if (!loggedDirectFallback) {
-        loggedDirectFallback = true;
-        console.warn(`[MINT] Direct từ runner bị từ chối (${errors.join(", ")}) -> tạm fallback qua /_diag`);
+      if (errors.some((e) => /HTTP503/.test(e))) {
+        directBlockedUntil = Date.now() + 120_000;
+        if (!loggedDirectFallback) {
+          loggedDirectFallback = true;
+          console.warn(`[MINT] Direct từ runner bị từ chối (${errors.join(", ")}) -> chuyển sang p4k-relay (${ACTIVE_RESOLVERS.join(",")})`);
+        }
       }
     }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const relayed = await resolveDirectUrls(fid, { timeoutMs: 10000, viaRelay: true });
+      if (relayed.urls.length) return { urls: relayed.urls, errors: [] };
+      errors = [...errors, ...relayed.errors];
+      if (attempt === 0) await new Promise((r) => setTimeout(r, 1200));
+    }
+    if (!ALLOW_DIAG_FALLBACK) return { urls: [], errors };
   }
   const fb = await resolveViaDiag(fid);
   return { urls: fb.urls, errors: fb.urls.length ? [] : [...errors, ...fb.errors] };
